@@ -3295,6 +3295,192 @@ describe("SettingsView Apps catalog", () => {
     });
   });
 
+  it("restores the provider API type after disabling OpenAI web search", async () => {
+    const base = settingsPayload();
+    const payload: SettingsPayload = {
+      ...base,
+      providers: [{
+        name: "openai",
+        label: "OpenAI",
+        configured: true,
+        api_key_required: true,
+        api_key_hint: "sk-••••test",
+        api_base: "https://chat-only.example/v1",
+        api_type: "chat_completions",
+        advanced_fields: ["api_type", "extra_body"],
+        extra_body: null,
+      }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/settings") return jsonResponse(payload);
+      if (url.startsWith("/api/settings/provider/update?")) return jsonResponse(payload);
+      if (url === "/api/settings/cli-apps") {
+        return jsonResponse({ apps: [], installed_count: 0 });
+      }
+      if (url === "/api/settings/mcp-presets") {
+        return jsonResponse({ presets: [], installed_count: 0 });
+      }
+      return jsonResponse({});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderSettingsView({ initialSection: "models", initialSettings: payload });
+
+    fireEvent.click(await screen.findByRole("button", { name: /^OpenAI https:/ }));
+    const searchSwitch = screen.getByRole("switch", { name: "OpenAI web search" });
+    fireEvent.click(searchSwitch);
+    expect(searchSwitch).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(searchSwitch);
+    expect(searchSwitch).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+
+    await waitFor(() => {
+      const updateCall = fetchMock.mock.calls.find(
+        ([input]) => String(input).startsWith("/api/settings/provider/update?"),
+      );
+      expect(updateCall).toBeTruthy();
+      const headers = updateCall?.[1]?.headers as Record<string, string>;
+      const values = JSON.parse(decodeURIComponent(
+        headers["X-Nanobot-Provider-Values"],
+      )) as { apiType: string; extraBody: string };
+      expect(values.apiType).toBe("chat_completions");
+      expect(values.extraBody).toBe("");
+    });
+  });
+
+  it("keeps a configured non-Responses API type when disabling web search", async () => {
+    const base = settingsPayload();
+    const payload: SettingsPayload = {
+      ...base,
+      providers: [{
+        name: "openai",
+        label: "OpenAI",
+        configured: true,
+        api_key_required: true,
+        api_key_hint: "sk-••••test",
+        api_base: "https://chat-only.example/v1",
+        api_type: "chat_completions",
+        advanced_fields: ["api_type", "extra_body"],
+        extra_body: { tools: [{ type: "web_search" }] },
+      }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/settings") return jsonResponse(payload);
+      if (url.startsWith("/api/settings/provider/update?")) return jsonResponse(payload);
+      if (url === "/api/settings/cli-apps") {
+        return jsonResponse({ apps: [], installed_count: 0 });
+      }
+      if (url === "/api/settings/mcp-presets") {
+        return jsonResponse({ presets: [], installed_count: 0 });
+      }
+      return jsonResponse({});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderSettingsView({ initialSection: "models", initialSettings: payload });
+
+    fireEvent.click(await screen.findByRole("button", { name: /^OpenAI https:/ }));
+    const searchSwitch = screen.getByRole("switch", { name: "OpenAI web search" });
+    expect(searchSwitch).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(searchSwitch);
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+
+    await waitFor(() => {
+      const updateCall = fetchMock.mock.calls.find(
+        ([input]) => String(input).startsWith("/api/settings/provider/update?"),
+      );
+      expect(updateCall).toBeTruthy();
+      const headers = updateCall?.[1]?.headers as Record<string, string>;
+      const values = JSON.parse(decodeURIComponent(
+        headers["X-Nanobot-Provider-Values"],
+      )) as { apiType: string; extraBody: string };
+      expect(values.apiType).toBe("chat_completions");
+      expect(values.extraBody).toBe("");
+    });
+  });
+
+  it("does not reuse a temporary API type after saving and reopening web search", async () => {
+    const base = settingsPayload();
+    let payload: SettingsPayload = {
+      ...base,
+      providers: [{
+        name: "openai",
+        label: "OpenAI",
+        configured: true,
+        api_key_required: true,
+        api_key_hint: "sk-••••test",
+        api_base: "https://chat-only.example/v1",
+        api_type: "chat_completions",
+        advanced_fields: ["api_type", "extra_body"],
+        extra_body: null,
+      }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/settings") return jsonResponse(payload);
+      if (url.startsWith("/api/settings/provider/update?")) {
+        const headers = init?.headers as Record<string, string>;
+        const values = JSON.parse(decodeURIComponent(
+          headers["X-Nanobot-Provider-Values"],
+        )) as { apiType?: string; extraBody?: string };
+        payload = {
+          ...payload,
+          providers: payload.providers.map((provider) =>
+            provider.name === "openai"
+              ? {
+                  ...provider,
+                  api_type: values.apiType ?? provider.api_type,
+                  extra_body: values.extraBody ? JSON.parse(values.extraBody) : null,
+                }
+              : provider,
+          ),
+        };
+        return jsonResponse(payload);
+      }
+      if (url === "/api/settings/cli-apps") {
+        return jsonResponse({ apps: [], installed_count: 0 });
+      }
+      if (url === "/api/settings/mcp-presets") {
+        return jsonResponse({ presets: [], installed_count: 0 });
+      }
+      return jsonResponse({});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderSettingsView({ initialSection: "models", initialSettings: payload });
+
+    const updateCalls = () => fetchMock.mock.calls.filter(
+      ([input]) => String(input).startsWith("/api/settings/provider/update?"),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /^OpenAI https:/ }));
+    fireEvent.click(screen.getByRole("switch", { name: "OpenAI web search" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+
+    await waitFor(() => expect(updateCalls()).toHaveLength(1));
+    await waitFor(() => expect(
+      screen.queryByRole("switch", { name: "OpenAI web search" }),
+    ).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /^OpenAI https:/ }));
+    const searchSwitch = screen.getByRole("switch", { name: "OpenAI web search" });
+    expect(searchSwitch).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(searchSwitch);
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+
+    await waitFor(() => {
+      const secondCall = updateCalls()[1];
+      expect(secondCall).toBeTruthy();
+      const headers = secondCall?.[1]?.headers as Record<string, string>;
+      const values = JSON.parse(decodeURIComponent(
+        headers["X-Nanobot-Provider-Values"],
+      )) as { apiType: string; extraBody: string };
+      expect(values.apiType).toBe("auto");
+      expect(values.extraBody).toBe("");
+    });
+  });
+
   it("creates a custom provider with folded advanced request settings", async () => {
     const base = settingsPayload();
     let payload: SettingsPayload = {

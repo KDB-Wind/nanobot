@@ -1582,17 +1582,17 @@ export function SettingsView({
     }
   };
 
-  const saveProvider = async (providerName: string) => {
-    if (providerSaving) return;
+  const saveProvider = async (providerName: string): Promise<boolean> => {
+    if (providerSaving) return false;
     const provider = settings?.providers.find((item) => item.name === providerName);
-    if (!provider) return;
+    if (!provider) return false;
     const isOauthProvider = provider.auth_type === "oauth";
     const providerForm = providerForms[providerName] ?? providerFormFromRow(provider);
     const apiKey = providerForm.apiKey.trim();
     const apiKeyRequired = provider.api_key_required ?? true;
     if (!isOauthProvider && !provider.configured && apiKeyRequired && !apiKey) {
       setError(t("settings.byok.apiKeyRequired"));
-      return;
+      return false;
     }
     setProviderSaving(providerName);
     try {
@@ -1601,7 +1601,7 @@ export function SettingsView({
         : providerName === "azure_openai"
           ? "azure"
           : null;
-      if (supportName && !(await installCapabilities([supportName]))) return;
+      if (supportName && !(await installCapabilities([supportName]))) return false;
       const update: ProviderSettingsUpdate = { provider: providerName };
       if (!isOauthProvider) {
         update.apiKey = apiKey || undefined;
@@ -1645,8 +1645,10 @@ export function SettingsView({
       setEditingProviderKeys((prev) => ({ ...prev, [providerName]: false }));
       if (!isOauthProvider) setExpandedProvider(null);
       setError(null);
+      return true;
     } catch (err) {
       setError((err as Error).message);
+      return false;
     } finally {
       setProviderSaving(null);
     }
@@ -3969,7 +3971,11 @@ function ProviderRequestOptions({
 }: {
   providerName: string;
   form: ProviderForm;
-  onChange: (value: Partial<ProviderForm>) => void;
+  onChange: (
+    value: Partial<ProviderForm>,
+    option: ProviderRequestOption,
+    enabled: boolean,
+  ) => void;
 }) {
   const { t } = useTranslation();
   const options = PROVIDER_REQUEST_OPTIONS[providerName] ?? [];
@@ -4007,6 +4013,8 @@ function ProviderRequestOptions({
               checked={checked}
               onChange={(enabled) => onChange(
                 updateProviderRequestOption(option, enabled, form),
+                option,
+                enabled,
               )}
               ariaLabel={title}
               label={checked ? tx("settings.values.on", "On") : tx("settings.values.off", "Off")}
@@ -4281,7 +4289,7 @@ function ProvidersSettings({
   onToggleProviderKey: (provider: string) => void;
   onToggleProviderKeyEditing: (provider: string) => void;
   onChangeProviderForm: (provider: string, value: Partial<ProviderForm>) => void;
-  onSaveProvider: (provider: string) => void;
+  onSaveProvider: (provider: string) => Promise<boolean>;
   onCreateCustomProvider: (draft: CustomProviderDraft) => Promise<boolean>;
   onProviderOAuthLogin: (provider: string) => void;
   onProviderOAuthLogout: (provider: string) => void;
@@ -4296,6 +4304,7 @@ function ProvidersSettings({
   const [customProviderDraft, setCustomProviderDraft] = useState<CustomProviderDraft>(
     emptyCustomProviderDraft,
   );
+  const providerApiTypesBeforeResponsesRef = useRef<Record<string, ProviderApiType>>({});
   const configuredProviders = settings.providers.filter((provider) => provider.configured);
   const unconfiguredProviders = useMemo(
     () =>
@@ -4311,10 +4320,49 @@ function ProvidersSettings({
   const customProviderSaving = providerSaving === CUSTOM_PROVIDER_CREATION_KEY;
   const toggleProvider = (providerName: string) => {
     setCreatingCustomProvider(false);
+    if (expandedProvider) {
+      delete providerApiTypesBeforeResponsesRef.current[expandedProvider];
+    }
     onToggleProvider(providerName);
   };
+  const handleProviderFormChange = (providerName: string, value: Partial<ProviderForm>) => {
+    if (Object.prototype.hasOwnProperty.call(value, "apiType")) {
+      delete providerApiTypesBeforeResponsesRef.current[providerName];
+    }
+    onChangeProviderForm(providerName, value);
+  };
+  const handleSaveProvider = async (providerName: string) => {
+    if (await onSaveProvider(providerName)) {
+      delete providerApiTypesBeforeResponsesRef.current[providerName];
+    }
+  };
+  const handleProviderRequestOptionChange = (
+    providerName: string,
+    form: ProviderForm,
+    option: ProviderRequestOption,
+    enabled: boolean,
+    value: Partial<ProviderForm>,
+  ) => {
+    let nextValue = value;
+    if (option.forceResponses) {
+      if (enabled) {
+        if (!Object.prototype.hasOwnProperty.call(
+          providerApiTypesBeforeResponsesRef.current,
+          providerName,
+        )) {
+          providerApiTypesBeforeResponsesRef.current[providerName] = form.apiType;
+        }
+      } else {
+        const previousApiType = providerApiTypesBeforeResponsesRef.current[providerName]
+          ?? (form.apiType === "responses" ? "auto" : form.apiType);
+        delete providerApiTypesBeforeResponsesRef.current[providerName];
+        nextValue = { ...value, apiType: previousApiType };
+      }
+    }
+    onChangeProviderForm(providerName, nextValue);
+  };
   const beginCustomProviderCreation = () => {
-    if (expandedProvider) onToggleProvider(expandedProvider);
+    if (expandedProvider) toggleProvider(expandedProvider);
     setCustomProviderDraft(emptyCustomProviderDraft());
     setCustomProviderKeyVisible(false);
     setCreatingCustomProvider(true);
@@ -4489,13 +4537,20 @@ function ProvidersSettings({
                 <ProviderRequestOptions
                   providerName={provider.name}
                   form={form}
-                  onChange={(value) => onChangeProviderForm(provider.name, value)}
+                  onChange={(value, option, enabled) =>
+                    handleProviderRequestOptionChange(
+                      provider.name,
+                      form,
+                      option,
+                      enabled,
+                      value,
+                    )}
                 />
                 {supportsOauthAdvancedSettings ? (
                   <ProviderAdvancedOptions
                     fields={advancedFields}
                     form={form}
-                    onChange={(value) => onChangeProviderForm(provider.name, value)}
+                    onChange={(value) => handleProviderFormChange(provider.name, value)}
                     footer={
                       <>
                         <Button
@@ -4510,7 +4565,7 @@ function ProvidersSettings({
                         <Button
                           size="sm"
                           variant="outline"
-                          onClick={() => onSaveProvider(provider.name)}
+                          onClick={() => handleSaveProvider(provider.name)}
                           disabled={saving || !oauthSettingsDirty}
                           className="rounded-full"
                         >
@@ -4619,12 +4674,19 @@ function ProvidersSettings({
                 <ProviderRequestOptions
                   providerName={provider.name}
                   form={form}
-                  onChange={(value) => onChangeProviderForm(provider.name, value)}
+                  onChange={(value, option, enabled) =>
+                    handleProviderRequestOptionChange(
+                      provider.name,
+                      form,
+                      option,
+                      enabled,
+                      value,
+                    )}
                 />
                 <ProviderAdvancedOptions
                   fields={advancedFields}
                   form={form}
-                  onChange={(value) => onChangeProviderForm(provider.name, value)}
+                  onChange={(value) => handleProviderFormChange(provider.name, value)}
                 />
                 <div className="flex items-center justify-end gap-2">
                   <Button
@@ -4638,7 +4700,7 @@ function ProvidersSettings({
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => onSaveProvider(provider.name)}
+                    onClick={() => handleSaveProvider(provider.name)}
                     disabled={
                       saving
                       || missingRequiredApiKey
@@ -4876,7 +4938,7 @@ function ProvidersSettings({
                     onSelect={() => {
                       setCreatingCustomProvider(false);
                       if (expandedProvider !== provider.name) {
-                        onToggleProvider(provider.name);
+                        toggleProvider(provider.name);
                       }
                     }}
                     className="flex min-h-[54px] cursor-default items-center gap-3 px-2.5 py-2 focus:bg-muted/85 focus:text-foreground"
