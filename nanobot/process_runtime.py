@@ -12,10 +12,11 @@ import tempfile
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, Literal, TypeVar, cast
 
 from filelock import FileLock
 
@@ -63,7 +64,10 @@ class ProcessRuntimePaths:
     log_path: Path
 
 
-class ManagedProcessRuntime:
+_StartOptionsT = TypeVar("_StartOptionsT", bound=ProcessStartOptions)
+
+
+class ManagedProcessRuntime(Generic[_StartOptionsT]):
     """Manage a detached child process without service-specific policy."""
 
     service_name = "process"
@@ -84,6 +88,10 @@ class ManagedProcessRuntime:
         self._popen = popen
         self._subprocess_run = subprocess_run
         self._sleep = sleep
+        # Keep the handle for children spawned by this runtime. On POSIX an
+        # exited child remains visible to kill(pid, 0) until its parent reaps
+        # it; poll() both reaps it and reports the real lifecycle state.
+        self._owned_process: Any | None = None
 
     @classmethod
     def refresh_state_pid(cls, *, paths: ProcessRuntimePaths) -> None:
@@ -100,12 +108,12 @@ class ManagedProcessRuntime:
         state["started_at"] = _utc_now()
         runtime._write_state(state)
 
-    def start_background(self, options: ProcessStartOptions) -> ProcessResult:
+    def start_background(self, options: _StartOptionsT) -> ProcessResult:
         """Start the configured command as a detached process."""
         with self._lifecycle_lock():
             return self._start_background(options)
 
-    def _start_background(self, options: ProcessStartOptions) -> ProcessResult:
+    def _start_background(self, options: _StartOptionsT) -> ProcessResult:
         current = self.status()
         if current.running:
             return ProcessResult(False, self._message("already_running"), current)
@@ -120,8 +128,10 @@ class ManagedProcessRuntime:
                 stdin=subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
                 **self._popen_platform_kwargs(),
             )
+        self._owned_process = process
 
         pid = int(process.pid)
         self._sleep(0.2)
@@ -154,7 +164,14 @@ class ManagedProcessRuntime:
             return ProcessResult(False, self._message("not_running"), status)
 
         state = self._read_state()
-        if not self._record_matches_process(state, status.pid):
+        identity_match = self._process_identity_match(state, status.pid)
+        if identity_match == "unknown":
+            return ProcessResult(
+                False,
+                self._message("identity_unavailable"),
+                status,
+            )
+        if identity_match == "mismatch":
             self._clear_state()
             return ProcessResult(
                 False,
@@ -174,7 +191,7 @@ class ManagedProcessRuntime:
         self._clear_state()
         return ProcessResult(True, self._message("stopped"), self.status(reason="stopped"))
 
-    def restart(self, options: ProcessStartOptions, *, timeout_s: int = 20) -> ProcessResult:
+    def restart(self, options: _StartOptionsT, *, timeout_s: int = 20) -> ProcessResult:
         """Restart the managed process."""
         with self._lifecycle_lock():
             stop_result = self._stop(timeout_s=timeout_s)
@@ -195,8 +212,10 @@ class ManagedProcessRuntime:
                 log_path=self.paths.log_path,
                 reason=reason or "not_started",
             )
+        assert state is not None
 
-        if not self._is_pid_running(pid) or not self._record_matches_process(state, pid):
+        identity_match = self._process_identity_match(state, pid)
+        if not self._is_pid_running(pid) or identity_match == "mismatch":
             self._clear_state()
             return ProcessStatus(
                 running=False,
@@ -214,8 +233,10 @@ class ManagedProcessRuntime:
             log_path=self.paths.log_path,
             started_at=_as_str(state.get("started_at")),
             port=_as_int(state.get("port")),
-            command=tuple(command) if isinstance(command, list) else (),
-            reason=reason or "running",
+            command=tuple(cast(list[str], command)) if isinstance(command, list) else (),
+            reason=reason or (
+                "identity_unavailable" if identity_match == "unknown" else "running"
+            ),
         )
 
     def read_log_tail(self, *, tail: int = 200) -> list[str]:
@@ -246,6 +267,14 @@ class ManagedProcessRuntime:
         except KeyboardInterrupt:
             return 130
 
+    def process_identity(self, pid: int) -> str | int | None:
+        """Return an identity that changes when an operating-system PID is reused."""
+        return self._process_identity(pid)
+
+    def process_is_running(self, pid: int) -> bool:
+        """Return whether the recorded operating-system process is still live."""
+        return self._is_pid_running(pid)
+
     def _message(self, event: str) -> str:
         return f"{self.service_name}_{event}"
 
@@ -253,7 +282,7 @@ class ManagedProcessRuntime:
         lock_path = self.paths.state_path.with_name(f"{self.paths.state_path.name}.lock")
         return FileLock(str(lock_path))
 
-    def _build_child_command(self, options: ProcessStartOptions) -> list[str]:
+    def _build_child_command(self, options: _StartOptionsT) -> list[str]:
         raise NotImplementedError
 
     def _popen_platform_kwargs(self) -> dict[str, Any]:
@@ -291,26 +320,18 @@ class ManagedProcessRuntime:
         return self._wait_for_exit(pid, 2)
 
     def _terminate_windows(self, pid: int, *, timeout_s: int) -> bool:
-        ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
-        if ctrl_break is not None:
-            ctrl_break_sent = False
-            try:
-                os.kill(pid, ctrl_break)
-            except ProcessLookupError:
-                return True
-            except OSError:
-                pass
-            else:
-                ctrl_break_sent = True
-            if ctrl_break_sent and self._wait_for_exit(pid, timeout_s):
-                return True
+        # ``os.kill(pid, CTRL_BREAK_EVENT)`` delegates to
+        # GenerateConsoleCtrlEvent.  That API targets a console process group,
+        # not an individual process, and can interrupt the caller when a
+        # detached/no-window child has no addressable console group.  Keep
+        # termination scoped to the recorded PID tree instead.
         self._subprocess_run(
             ["taskkill", "/PID", str(pid), "/T"],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        if self._wait_for_exit(pid, 2):
+        if self._wait_for_exit(pid, timeout_s):
             return True
         self._subprocess_run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -331,33 +352,80 @@ class ManagedProcessRuntime:
     def _is_pid_running(self, pid: int) -> bool:
         if pid <= 0:
             return False
-        if self.platform_name == "Windows":
-            return _windows_process_identity(pid) is not None
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
+        owned_process = self._owned_process
+        if owned_process is not None and getattr(owned_process, "pid", None) == pid:
+            poll = getattr(owned_process, "poll", None)
+            if callable(poll):
+                try:
+                    return poll() is None
+                except OSError:
+                    pass
+        return process_is_running(pid, platform_name=self.platform_name)
 
     def _process_identity(self, pid: int) -> str | int | None:
-        if self.platform_name == "Windows":
+        # Process inspection must follow the host API even when tests inject a
+        # target platform.  On Windows, falling through to POSIX calls is not
+        # merely unsupported: ``os.kill(pid, 0)`` broadcasts CTRL_C_EVENT.
+        if _platform_name() == "Windows" or self.platform_name == "Windows":
             return _windows_process_identity(pid)
         try:
-            return os.getpgid(pid)
+            process_group = os.getpgid(pid)
         except OSError:
             return None
+        started_at = self._posix_process_started_at(pid)
+        return f"{process_group}:{started_at}" if started_at else process_group
+
+    def _posix_process_started_at(self, pid: int) -> str | None:
+        if self.platform_name == "Linux":
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            except OSError:
+                return None
+            closing_paren = stat.rfind(")")
+            fields = stat[closing_paren + 2 :].split() if closing_paren >= 0 else []
+            # /proc/<pid>/stat fields after comm begin at field 3; starttime is field 22.
+            return fields[19] if len(fields) > 19 else None
+        if self.platform_name == "Darwin":
+            try:
+                result = self._subprocess_run(
+                    ["ps", "-o", "lstart=", "-p", str(pid)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            started_at = getattr(result, "stdout", "").strip()
+            return started_at or None
+        return None
 
     def _record_matches_process(self, state: dict[str, Any] | None, pid: int) -> bool:
+        return self._process_identity_match(state, pid) == "match"
+
+    def _process_identity_match(
+        self,
+        state: dict[str, Any] | None,
+        pid: int,
+    ) -> Literal["match", "mismatch", "unknown"]:
         if not state:
-            return False
+            return "mismatch"
         recorded = state.get("identity")
         if recorded is None:
-            return True
-        return recorded == self._process_identity(pid)
+            return "match"
+        current = self._process_identity(pid)
+        if current is None:
+            return "unknown"
+        if recorded == current:
+            return "match"
+        # Older POSIX state files stored only the process group id.
+        if (
+            isinstance(recorded, int)
+            and isinstance(current, str)
+            and current.startswith(f"{recorded}:")
+        ):
+            return "match"
+        return "mismatch"
 
     def _read_state(self) -> dict[str, Any] | None:
         try:
@@ -365,7 +433,7 @@ class ManagedProcessRuntime:
                 payload = json.load(handle)
         except (OSError, json.JSONDecodeError, ValueError):
             return None
-        return payload if isinstance(payload, dict) else None
+        return cast(dict[str, Any], payload) if isinstance(payload, dict) else None
 
     def _write_state(self, payload: dict[str, Any]) -> None:
         self.paths.run_dir.mkdir(parents=True, exist_ok=True)
@@ -395,6 +463,52 @@ def _platform_name() -> str:
     if sys.platform == "darwin":
         return "Darwin"
     return "Linux"
+
+
+def process_is_running(pid: int, *, platform_name: str | None = None) -> bool:
+    """Probe a PID without delivering a control event on Windows."""
+    if pid <= 0:
+        return False
+    host_platform = _platform_name()
+    if host_platform == "Windows" or platform_name == "Windows":
+        # On Windows ``os.kill(pid, 0)`` sends CTRL_C_EVENT (whose value is 0)
+        # instead of performing the harmless POSIX existence probe.
+        return _windows_process_identity(pid) is not None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return _posix_process_state(pid, platform_name=host_platform) != "Z"
+
+
+def _posix_process_state(pid: int, *, platform_name: str) -> str | None:
+    """Return the host process state when available; zombies are not live clients."""
+    if platform_name == "Linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        closing_paren = stat.rfind(")")
+        fields = stat[closing_paren + 2 :].split() if closing_paren >= 0 else []
+        return fields[0] if fields else None
+    if platform_name == "Darwin":
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        value = getattr(result, "stdout", "").strip()
+        return value[:1].upper() or None
+    return None
 
 
 def _utc_now() -> str:
@@ -428,7 +542,21 @@ def _windows_process_identity(pid: int) -> str | None:
             return (int(self.high) << 32) | int(self.low)
 
     process_query_limited_information = 0x1000
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
     handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
     if not handle:
         return None
@@ -446,7 +574,7 @@ def _windows_process_identity(pid: int) -> str | None:
         )
         if not ok:
             return None
-        exit_code = ctypes.c_uint32()
+        exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
             return None
         if exit_code.value != 259:

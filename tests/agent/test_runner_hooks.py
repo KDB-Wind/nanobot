@@ -3,7 +3,7 @@ cached-token propagation, and hook context."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -140,6 +140,102 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
     assert result.final_content == "hello"
     assert streamed == ["he", "llo"]
     assert endings == [False]
+    provider.chat_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runner_measures_stream_generation_without_time_to_first_token():
+    from nanobot.agent.hook import AgentHook
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        await on_content_delta("he")
+        await on_content_delta("llo")
+        return LLMResponse(
+            content="hello",
+            usage={"prompt_tokens": 100, "completion_tokens": 12},
+        )
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    provider.chat_with_retry = AsyncMock()
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+    with patch(
+        "nanobot.agent.runner.time.perf_counter",
+        side_effect=[10.0, 10.2, 10.4, 10.8],
+    ):
+        result = await AgentRunner().run(make_run_spec(
+            provider,
+            initial_messages=[],
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            hook=StreamingHook(),
+        ))
+
+    assert result.usage["generation_ms"] == 600
+    assert result.usage["measured_completion_tokens"] == 12
+    assert result.usage["ttft_ms"] == 200
+    assert result.usage["timed_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_length_recovery_streams_segments_once_and_returns_all_content():
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+    streamed: list[str] = []
+    endings: list[bool] = []
+    merge_next: list[bool] = []
+    responses = iter([
+        LLMResponse(content="first ", finish_reason="length"),
+        LLMResponse(content="second", finish_reason="stop"),
+    ])
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        response = next(responses)
+        await on_content_delta(response.content or "")
+        return response
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    provider.chat_with_retry = AsyncMock()
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+        async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+            streamed.append(delta)
+
+        async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+            endings.append(resuming)
+            merge_next.append(context.stream_continues_current_message)
+
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "give a long answer"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        hook=StreamingHook(),
+    ))
+
+    assert result.final_content == "first second"
+    assert streamed == ["first ", "second"]
+    assert endings == [True, False]
+    assert merge_next == [True, False]
     provider.chat_with_retry.assert_not_awaited()
 
 

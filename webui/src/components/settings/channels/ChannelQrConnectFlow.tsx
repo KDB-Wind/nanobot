@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import QRCode from "qrcode";
 import { Check, Loader2, Network, RotateCcw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
+import { usePageVisibility } from "@/hooks/usePageVisibility";
 import {
   cancelChannelConnect,
   pollChannelConnect,
@@ -13,6 +14,7 @@ import type {
   ChannelConnectPayload,
   NanobotFeaturesPayload,
 } from "@/lib/types";
+import { useClient } from "@/providers/ClientProvider";
 
 export type ChannelQrConnectLabels = {
   qrAlt: string;
@@ -26,28 +28,49 @@ export type ChannelQrConnectLabels = {
   connect: string;
 };
 
+export type ChannelConnectStartOptions = {
+  domain?: string;
+  instanceId?: string;
+  mode?: "replace" | "create";
+  force?: boolean;
+};
+
+export type ChannelQrConnectPendingContext = {
+  connect: ChannelConnectPayload;
+  busy: boolean;
+  poll: (
+    params?: Readonly<Record<string, string>>,
+  ) => Promise<ChannelConnectPayload | null>;
+};
+
 export function ChannelQrConnectFlow({
-  token,
   channelName,
   startOptions = {},
   idleLabel,
   connectRequestId,
+  forceOnRepeat = false,
   labels,
   onFeaturesUpdate,
+  pausePolling,
+  renderPending,
+  resolveMessage,
+  suppressSucceeded = false,
 }: {
   token: string;
-  channelName: "feishu" | "weixin";
-  startOptions?: {
-    domain?: "feishu" | "lark";
-    instanceId?: string;
-    mode?: "replace" | "create";
-    force?: boolean;
-  };
+  channelName: string;
+  startOptions?: ChannelConnectStartOptions;
   idleLabel?: string;
   connectRequestId?: number;
+  forceOnRepeat?: boolean;
   labels: ChannelQrConnectLabels;
   onFeaturesUpdate: (payload: NanobotFeaturesPayload) => void;
+  pausePolling?: (payload: ChannelConnectPayload) => boolean;
+  renderPending?: (context: ChannelQrConnectPendingContext) => ReactNode;
+  resolveMessage?: (payload: ChannelConnectPayload) => string | undefined;
+  suppressSucceeded?: boolean;
 }) {
+  const { client } = useClient();
+  const pageVisible = usePageVisibility();
   const { t } = useTranslation();
   const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
   const [connect, setConnect] = useState<ChannelConnectPayload | null>(null);
@@ -64,6 +87,10 @@ export function ChannelQrConnectFlow({
   const pending = connect?.status === "pending";
   const succeeded = connect?.status === "succeeded";
   const canStart = !pending && !busy;
+  const pollingPaused = Boolean(connect && pausePolling?.(connect));
+  const displayMessage = connect
+    ? resolveMessage?.(connect) ?? connect.message
+    : undefined;
 
   useEffect(() => {
     if (!connect?.qr_url) {
@@ -88,13 +115,23 @@ export function ChannelQrConnectFlow({
   }, [connect?.qr_url]);
 
   useEffect(() => {
-    if (!connect?.session_id || connect.status !== "pending") return;
+    if (
+      !connect?.session_id
+      || connect.status !== "pending"
+      || pollingPaused
+      || !pageVisible
+    ) return;
     let cancelled = false;
+    const sessionId = connect.session_id;
     const poll = async () => {
       if (pollInFlight.current) return;
       pollInFlight.current = true;
       try {
-        const payload = await pollChannelConnect(token, channelName, connect.session_id);
+        const payload = await pollChannelConnect(
+          client,
+          channelName,
+          sessionId,
+        );
         if (cancelled) return;
         setConnect((current) => ({
           ...(current ?? payload),
@@ -123,13 +160,22 @@ export function ChannelQrConnectFlow({
       window.clearTimeout(initial);
       window.clearInterval(interval);
     };
-  }, [channelName, connect?.interval_ms, connect?.session_id, connect?.status, onFeaturesUpdate, token]);
+  }, [
+    channelName,
+    client,
+    connect?.interval_ms,
+    connect?.session_id,
+    connect?.status,
+    onFeaturesUpdate,
+    pageVisible,
+    pollingPaused,
+  ]);
 
   const start = useCallback(async (force = false) => {
     setBusy(true);
     setError(null);
     try {
-      const payload = await startChannelConnect(token, channelName, {
+      const payload = await startChannelConnect(client, channelName, {
         domain: startDomain,
         instanceId: startInstanceId,
         mode: startMode,
@@ -141,7 +187,7 @@ export function ChannelQrConnectFlow({
     } finally {
       setBusy(false);
     }
-  }, [channelName, startDomain, startForce, startInstanceId, startMode, token]);
+  }, [channelName, client, startDomain, startForce, startInstanceId, startMode]);
 
   useEffect(() => {
     if (!connectRequestId || connectRequestId === handledRequestId) return;
@@ -156,7 +202,11 @@ export function ChannelQrConnectFlow({
     }
     setBusy(true);
     try {
-      const payload = await cancelChannelConnect(token, channelName, connect.session_id);
+      const payload = await cancelChannelConnect(
+        client,
+        channelName,
+        connect.session_id,
+      );
       setConnect(payload);
     } catch (err) {
       setError((err as Error).message);
@@ -165,11 +215,44 @@ export function ChannelQrConnectFlow({
     }
   };
 
+  const submitPoll = async (
+    params: Readonly<Record<string, string>> = {},
+  ): Promise<ChannelConnectPayload | null> => {
+    if (!connect?.session_id) return null;
+    setBusy(true);
+    setError(null);
+    try {
+      const payload = await pollChannelConnect(
+        client,
+        channelName,
+        connect.session_id,
+        params,
+      );
+      setConnect((current) => ({
+        ...(current ?? payload),
+        ...payload,
+        qr_url: payload.qr_url ?? current?.qr_url,
+      }));
+      if (payload.nanobot_features) {
+        onFeaturesUpdate(payload.nanobot_features);
+      }
+      if (payload.status !== "pending") {
+        setError(null);
+      }
+      return payload;
+    } catch (err) {
+      setError((err as Error).message);
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="mt-3 space-y-3">
       {pending ? (
-        <div className="grid gap-4 rounded-[14px] border border-border/70 p-4 sm:grid-cols-[auto_minmax(0,1fr)]">
-          <div className="grid h-[196px] w-[196px] place-items-center rounded-[14px] border border-border/60 bg-background">
+        <div className="grid gap-4 rounded-control border border-border/70 p-4 sm:grid-cols-[auto_minmax(0,1fr)]">
+          <div className="grid h-[196px] w-[196px] place-items-center rounded-control border border-border/60 bg-background">
             {qrDataUrl ? (
               <img
                 src={qrDataUrl}
@@ -187,10 +270,12 @@ export function ChannelQrConnectFlow({
             <p className="mt-1 text-[12.5px] leading-5 text-muted-foreground">
               {labels.scanDescription}
             </p>
-            <div className="mt-3 flex items-center gap-2 text-[12px] text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-              {labels.waiting}
-            </div>
+            {renderPending?.({ connect, busy, poll: submitPoll }) ?? (
+              <div className="mt-3 flex items-center gap-2 text-[12px] text-muted-foreground">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                {labels.waiting}
+              </div>
+            )}
             <div className="mt-4 flex flex-wrap justify-end gap-2">
               <Button
                 type="button"
@@ -207,21 +292,21 @@ export function ChannelQrConnectFlow({
         </div>
       ) : null}
 
-      {succeeded ? (
-        <div className="flex items-center gap-2 rounded-[12px] border border-emerald-500/20 px-3 py-2 text-[12px] font-medium text-emerald-700 dark:text-emerald-200">
+      {succeeded && !suppressSucceeded ? (
+        <div className="flex items-center gap-2 rounded-control border border-emerald-500/20 px-3 py-2 text-[12px] font-medium text-emerald-700 dark:text-emerald-200">
           <Check className="h-3.5 w-3.5" aria-hidden />
-          {connect.message ?? labels.connected}
+          {displayMessage ?? labels.connected}
         </div>
       ) : null}
 
       {connect && ["expired", "failed", "cancelled"].includes(connect.status) ? (
-        <div className="rounded-[12px] border border-border/60 px-3 py-2 text-[12px] leading-5 text-muted-foreground">
-          {connect.message || labels.stopped}
+        <div className="rounded-control border border-border/60 px-3 py-2 text-[12px] leading-5 text-muted-foreground">
+          {displayMessage || labels.stopped}
         </div>
       ) : null}
 
       {error ? (
-        <div className="rounded-[12px] border border-destructive/20 px-3 py-2 text-[12px] leading-5 text-destructive">
+        <div className="rounded-control border border-destructive/20 px-3 py-2 text-[12px] leading-5 text-destructive">
           {error}
         </div>
       ) : null}
@@ -232,7 +317,7 @@ export function ChannelQrConnectFlow({
           size="sm"
           variant="outline"
           className="h-8 rounded-full border-border/65 bg-background/80 px-3 text-[12px] font-semibold hover:bg-muted/70"
-          onClick={() => void start(channelName === "weixin" && succeeded)}
+          onClick={() => void start(forceOnRepeat && succeeded)}
           disabled={!canStart}
         >
           {busy ? (
@@ -250,85 +335,5 @@ export function ChannelQrConnectFlow({
         </Button>
       </div>
     </div>
-  );
-}
-export function FeishuConnectFlow({
-  token,
-  instanceId = "default",
-  mode = "replace",
-  idleLabel,
-  connectRequestId,
-  onFeaturesUpdate,
-}: {
-  token: string;
-  instanceId?: string;
-  mode?: "replace" | "create";
-  idleLabel?: string;
-  connectRequestId?: number;
-  onFeaturesUpdate: (payload: NanobotFeaturesPayload) => void;
-}) {
-  const { t } = useTranslation();
-  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
-  return (
-    <ChannelQrConnectFlow
-      token={token}
-      channelName="feishu"
-      startOptions={{ domain: "feishu", instanceId, mode }}
-      idleLabel={idleLabel}
-      connectRequestId={connectRequestId}
-      onFeaturesUpdate={onFeaturesUpdate}
-      labels={{
-        qrAlt: tx("settings.channels.feishuQrAlt", "Feishu connection QR code"),
-        scanTitle: tx("settings.channels.feishuScanTitle", "Scan with Feishu"),
-        scanDescription: tx(
-          "settings.channels.feishuScanDescription",
-          "Use Feishu or Lark on your phone to scan this code. nanobot will finish setup automatically after authorization.",
-        ),
-        waiting: tx("settings.channels.feishuWaiting", "Waiting for authorization..."),
-        connected: tx("settings.channels.feishuConnected", "Feishu is connected."),
-        stopped: tx("settings.channels.feishuConnectStopped", "Connection stopped."),
-        connecting: tx("settings.channels.feishuConnecting", "Connecting..."),
-        scanAgain: tx("settings.channels.scanAgain", "Scan again"),
-        connect: tx("settings.channels.connect", "Connect"),
-      }}
-    />
-  );
-}
-
-export function WeixinConnectFlow({
-  token,
-  idleLabel,
-  connectRequestId,
-  onFeaturesUpdate,
-}: {
-  token: string;
-  idleLabel?: string;
-  connectRequestId?: number;
-  onFeaturesUpdate: (payload: NanobotFeaturesPayload) => void;
-}) {
-  const { t } = useTranslation();
-  const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
-  return (
-    <ChannelQrConnectFlow
-      token={token}
-      channelName="weixin"
-      idleLabel={idleLabel}
-      connectRequestId={connectRequestId}
-      onFeaturesUpdate={onFeaturesUpdate}
-      labels={{
-        qrAlt: tx("settings.channels.weixinQrAlt", "WeChat login QR code"),
-        scanTitle: tx("settings.channels.weixinScanTitle", "Scan with WeChat"),
-        scanDescription: tx(
-          "settings.channels.weixinScanDescription",
-          "Use WeChat on your phone to scan this code. nanobot saves the account state locally after login.",
-        ),
-        waiting: tx("settings.channels.weixinWaiting", "Waiting for WeChat scan..."),
-        connected: tx("settings.channels.weixinConnected", "WeChat is connected."),
-        stopped: tx("settings.channels.weixinConnectStopped", "WeChat login stopped."),
-        connecting: tx("settings.channels.weixinConnecting", "Connecting..."),
-        scanAgain: tx("settings.channels.scanAgain", "Scan again"),
-        connect: tx("settings.channels.connect", "Connect"),
-      }}
-    />
   );
 }
