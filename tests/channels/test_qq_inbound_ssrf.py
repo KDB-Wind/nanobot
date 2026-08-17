@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 import pytest
 
 pytest.importorskip("botpy")
@@ -17,9 +19,10 @@ def _make_channel():
 
 
 class _FakeDownloadResp:
-    def __init__(self, status: int = 200) -> None:
+    def __init__(self, status: int = 200, body: bytes = b"", content_type: str = "") -> None:
         self.status = status
-        self.headers: dict[str, str] = {}
+        self.headers: dict[str, str] = {"Content-Type": content_type} if content_type else {}
+        self.content = _FakeDownloadContent(body)
 
     async def __aenter__(self):
         return self
@@ -28,16 +31,27 @@ class _FakeDownloadResp:
         return False
 
 
+class _FakeDownloadContent:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def iter_chunked(self, _chunk_size: int) -> AsyncIterator[bytes]:
+        if self._body:
+            yield self._body
+
+
 class _FakeDownloadHttp:
     """Records get() calls; never performs real I/O."""
 
-    def __init__(self, status: int = 200) -> None:
-        self.get_calls: list[tuple[str, dict]] = []
+    def __init__(self, status: int = 200, body: bytes = b"", content_type: str = "") -> None:
+        self.get_calls: list[tuple[str, dict[str, object]]] = []
         self._status = status
+        self._body = body
+        self._content_type = content_type
 
-    def get(self, url, **kwargs):
+    def get(self, url: str, **kwargs: object) -> _FakeDownloadResp:
         self.get_calls.append((url, kwargs))
-        return _FakeDownloadResp(self._status)
+        return _FakeDownloadResp(self._status, self._body, self._content_type)
 
 
 @pytest.mark.asyncio
@@ -60,8 +74,11 @@ async def test_inbound_download_blocks_ssrf_target() -> None:
 
 
 @pytest.mark.asyncio
-async def test_inbound_download_does_not_follow_redirects() -> None:
+async def test_inbound_download_does_not_follow_redirects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A redirect on an inbound attachment download must be rejected, not followed."""
+    monkeypatch.setattr("nanobot.channels.qq.runtime.validate_url_target", lambda _url: (True, ""))
     channel = _make_channel()
     fake_http = _FakeDownloadHttp(status=302)
     channel._http = fake_http
@@ -72,4 +89,27 @@ async def test_inbound_download_does_not_follow_redirects() -> None:
 
     assert result is None
     assert len(fake_http.get_calls) == 1
+    assert fake_http.get_calls[0][1]["allow_redirects"] is False
+
+
+@pytest.mark.asyncio
+async def test_inbound_download_saves_successful_attachment(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid 200 response still follows the normal atomic media write path."""
+    monkeypatch.setattr("nanobot.channels.qq.runtime.validate_url_target", lambda _url: (True, ""))
+    channel = _make_channel()
+    channel._media_root = tmp_path
+    fake_http = _FakeDownloadHttp(body=b"qq attachment", content_type="application/pdf")
+    channel._http = fake_http
+
+    result = await channel._download_to_media_dir_chunked(
+        "https://example.com/attachment", filename_hint="report"
+    )
+
+    assert result is not None
+    saved_path = tmp_path / "report.pdf"
+    assert result == str(saved_path)
+    assert saved_path.read_bytes() == b"qq attachment"
     assert fake_http.get_calls[0][1]["allow_redirects"] is False
