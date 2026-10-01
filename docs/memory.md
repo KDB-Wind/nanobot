@@ -29,9 +29,11 @@ Memory moves through nanobot in two stages.
 
 ### Stage 1: Consolidator
 
-When a conversation grows large enough to pressure the context window, nanobot does not try to carry every old message forever.
+When a conversation grows large, nanobot summarizes the conversation covered by compaction and appends the result to `memory/history.jsonl`. The model continues with the summary and any messages after it. The original messages remain in your saved chat history, but messages covered by the summary are no longer sent to the model verbatim. Each summary preserves useful long-term facts and a short handoff for active work.
 
-Instead, the `Consolidator` summarizes the oldest safe slice of the conversation and appends that summary to `memory/history.jsonl`.
+Compaction also runs after a configured period of inactivity, or when you send `/compact`. See [Auto Compact](./configuration.md#auto-compact) for idle timing and how to disable automatic idle compaction.
+
+Automatic compaction does not post lifecycle notices to built-in chat channels by default. This only silences chat messages: compaction still runs, and WebUI/TUI retain structured status and history. Manual `/compact` keeps its start and outcome feedback. Set `channels.showCompactionNotices: true` to enable automatic notices globally, or set `showCompactionNotices` in a channel's configuration to override that default. Omitted or `null` channel overrides inherit the global value; existing explicit QQ overrides are preserved.
 
 This file is:
 
@@ -64,6 +66,11 @@ This is why nanobot's memory is not just archival. It is interpretive.
 
 ## The Files
 
+In this page, `workspace` means the configured **agent workspace** (the default
+is `~/.nanobot/workspace/`, or the path passed with `--workspace`). Selecting a
+different project in the WebUI changes that chat's project context and tool
+working directory; it does not relocate the files below.
+
 ```text
 workspace/
 ├── SOUL.md              # The bot's long-term voice and communication style
@@ -78,6 +85,11 @@ workspace/
     ├── .dream_cursor    # Dream consumption cursor
     └── .git/            # Version history for long-term memory files
 ```
+
+A selected project may provide its own `AGENTS.md`, but project-local `SOUL.md`,
+`USER.md`, and `memory/` do not replace the agent-owned files above. This keeps
+one agent's profile and memory continuous while it works across projects. Use a
+separate configured agent workspace when identity or memory must be isolated.
 
 These files play different roles:
 
@@ -122,6 +134,7 @@ Memory is not hidden behind the curtain. Users can inspect and guide it.
 
 | Command | What it does |
 |---------|--------------|
+| `/compact` | Summarize the current conversation context while keeping saved chat history |
 | `/dream` | Run Dream immediately |
 | `/dream-log` | Show the latest Dream memory change |
 | `/dream-log <sha>` | Show a specific Dream change |
@@ -176,9 +189,7 @@ Dream is configured under `agents.defaults.dream`:
     "defaults": {
       "dream": {
         "intervalH": 2,
-        "modelOverride": null,
-        "maxBatchSize": 20,
-        "maxIterations": 10
+        "modelOverride": null
       }
     }
   }
@@ -189,16 +200,13 @@ Dream is configured under `agents.defaults.dream`:
 |-------|---------|
 | `intervalH` | How often Dream runs, in hours |
 | `cron` | Cron expression override (takes precedence over `intervalH`) |
-| `modelOverride` | Optional Dream-specific model override *(pending implementation)* |
-| `maxBatchSize` | *(Deprecated — not used)* |
-| `maxIterations` | *(Deprecated — not used)* |
+| `modelOverride` | Optional model preset name used for Dream |
 
 In practical terms:
 
 - `intervalH` is the normal way to configure Dream frequency. Internally it runs as an `every` schedule.
 - `cron` overrides `intervalH` when set, allowing precise cron expressions (e.g. `0 */4 * * *`).
-- `modelOverride` is reserved for a future release. Currently Dream uses the same model as the main agent.
-- `maxBatchSize` and `maxIterations` are preserved for config compatibility but no longer affect behavior.
+- `modelOverride` selects a named entry from `model_presets` for Dream. It accepts preset names only; raw model identifiers are not supported. If omitted, Dream uses the main agent's selected runtime.
 
 ## In Practice
 

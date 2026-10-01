@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nanobot.providers.base import ProviderCallContext
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 from nanobot.providers.registry import find_by_name
 
@@ -298,8 +299,8 @@ def _fake_chat_stream_legacy_function_call_chunks():
 
 
 @pytest.mark.asyncio
-async def test_openai_compat_stream_forwards_reasoning_deltas_deepseek_style() -> None:
-    """Regression: DeepSeek-V4 / reasoner expose ``delta.reasoning_content`` during streaming."""
+async def test_openai_compat_chat_stream_forwards_reasoning_deltas_deepseek_style() -> None:
+    """DeepSeek Chat Completions exposes ``delta.reasoning_content`` while streaming."""
     mock_chat = AsyncMock(return_value=_fake_chat_stream_reasoning_chunks())
     spec = find_by_name("deepseek")
     thinking: list[str] = []
@@ -320,6 +321,7 @@ async def test_openai_compat_stream_forwards_reasoning_deltas_deepseek_style() -
             default_model="deepseek-v4-pro",
             spec=spec,
         )
+        provider._api_type = "chat_completions"
         result = await provider.chat_stream(
             messages=[{"role": "user", "content": "hi"}],
             model="deepseek-v4-pro",
@@ -333,6 +335,77 @@ async def test_openai_compat_stream_forwards_reasoning_deltas_deepseek_style() -
     assert result.reasoning_content == "step1step2"
     assert result.content == "answer"
     mock_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_v4_pro_uses_responses_api() -> None:
+    mock_chat = AsyncMock(return_value=_fake_chat_response())
+    mock_responses = AsyncMock(return_value=_fake_responses_response("from responses"))
+
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_client_class:
+        client_instance = mock_client_class.return_value
+        client_instance.chat.completions.create = mock_chat
+        client_instance.responses.create = mock_responses
+
+        provider = OpenAICompatProvider(
+            api_key="sk-test",
+            default_model="deepseek-v4-pro",
+            spec=find_by_name("deepseek"),
+        )
+        result = await provider.chat(
+            messages=[{"role": "user", "content": "hello"}],
+            model="deepseek-v4-pro",
+            reasoning_effort="none",
+        )
+
+    assert result.content == "from responses"
+    mock_responses.assert_awaited_once()
+    mock_chat.assert_not_awaited()
+    call_kwargs = mock_responses.call_args.kwargs
+    assert call_kwargs["model"] == "deepseek-v4-pro"
+    assert call_kwargs["reasoning"] == {"effort": "none"}
+    assert call_kwargs["tools"] == [{"type": "web_search"}]
+    assert "include" not in call_kwargs
+
+
+@pytest.mark.asyncio
+async def test_deepseek_vision_uses_responses_api_with_image_input() -> None:
+    mock_chat = AsyncMock(return_value=_fake_chat_response())
+    mock_responses = AsyncMock(return_value=_fake_responses_response("vision response"))
+    content = [
+        {"type": "text", "text": "describe this image"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+    ]
+
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_client_class:
+        client_instance = mock_client_class.return_value
+        client_instance.chat.completions.create = mock_chat
+        client_instance.responses.create = mock_responses
+
+        provider = OpenAICompatProvider(
+            api_key="sk-test-key",
+            default_model="deepseek-v4-flash-vision-exp",
+            spec=find_by_name("deepseek"),
+        )
+        result = await provider.chat(
+            messages=[{"role": "user", "content": content}],
+            model="deepseek-v4-flash-vision-exp",
+        )
+
+    assert result.content == "vision response"
+    mock_chat.assert_not_awaited()
+    call_kwargs = mock_responses.call_args.kwargs
+    assert call_kwargs["input"] == [{
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "describe this image"},
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,AA==",
+                "detail": "auto",
+            },
+        ],
+    }]
 
 
 @pytest.mark.asyncio
@@ -679,6 +752,7 @@ async def test_direct_openai_gpt5_uses_responses_api() -> None:
     assert call_kwargs["max_output_tokens"] == 4096
     assert "input" in call_kwargs
     assert "messages" not in call_kwargs
+    assert call_kwargs["include"] == ["reasoning.encrypted_content"]
 
 
 @pytest.mark.asyncio
@@ -708,6 +782,40 @@ async def test_direct_openai_reasoning_prefers_responses_api() -> None:
     call_kwargs = mock_responses.call_args.kwargs
     assert call_kwargs["reasoning"] == {"effort": "medium"}
     assert call_kwargs["include"] == ["reasoning.encrypted_content"]
+
+
+@pytest.mark.asyncio
+async def test_direct_openai_retries_without_unsupported_server_compaction() -> None:
+    mock_chat = AsyncMock(return_value=_fake_chat_response())
+    mock_responses = AsyncMock(side_effect=[
+        _FakeResponsesError(400, "Unknown parameter: context_management"),
+        _fake_responses_response("compaction fallback"),
+    ])
+    spec = find_by_name("openai")
+
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_client_class:
+        client_instance = mock_client_class.return_value
+        client_instance.chat.completions.create = mock_chat
+        client_instance.responses.create = mock_responses
+        provider = OpenAICompatProvider(
+            api_key="sk-test-key",
+            default_model="gpt-5.6",
+            spec=spec,
+        )
+
+        result = await provider.chat_with_context(
+            messages=[{"role": "user", "content": "hello"}],
+            model="gpt-5.6",
+            provider_context=ProviderCallContext(context_window_tokens=200_000),
+        )
+
+    assert result.content == "compaction fallback"
+    assert result.provider_state is not None
+    assert mock_responses.await_count == 2
+    assert "context_management" in mock_responses.call_args_list[0].kwargs
+    assert "context_management" not in mock_responses.call_args_list[1].kwargs
+    assert provider.supports_native_compaction("gpt-5.6") is False
+    mock_chat.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -764,7 +872,9 @@ async def test_openrouter_gpt5_stays_on_chat_completions() -> None:
 @pytest.mark.asyncio
 async def test_direct_openai_streaming_gpt5_uses_responses_api() -> None:
     mock_chat = AsyncMock(return_value=_StalledStream())
-    mock_responses = AsyncMock(return_value=_fake_responses_stream("hi"))
+    stream = MagicMock()
+    stream.__aiter__.side_effect = lambda: _fake_responses_stream("hi")
+    mock_responses = AsyncMock(return_value=stream)
     spec = find_by_name("openai")
 
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_client_class:
@@ -784,6 +894,7 @@ async def test_direct_openai_streaming_gpt5_uses_responses_api() -> None:
 
     assert result.content == "hi"
     assert result.finish_reason == "stop"
+    stream.__aexit__.assert_awaited_once()
     mock_responses.assert_awaited_once()
     mock_chat.assert_not_awaited()
 
@@ -993,10 +1104,37 @@ def test_openai_compat_preserves_message_level_reasoning_fields() -> None:
         {"role": "user", "content": "thanks"},
     ])
 
-    assert sanitized[1]["content"] is None
+    assert sanitized[1]["content"] == "done"
     assert sanitized[1]["reasoning_content"] == "hidden"
     assert sanitized[1]["extra_content"] == {"debug": True}
     assert sanitized[1]["tool_calls"][0]["extra_content"] == {"google": {"thought_signature": "sig"}}
+
+
+def test_openai_compat_replays_tool_call_commentary_to_model() -> None:
+    spec = find_by_name("openai")
+    assert spec is not None
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(spec=spec)
+
+    kwargs = provider._build_kwargs(
+        messages=[
+            {"role": "user", "content": "check the files"},
+            {
+                "role": "assistant",
+                "content": "I am checking the profile first.",
+                "tool_calls": [_tool_call("call_1")],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+        ],
+        tools=None,
+        model="gpt-5",
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort="high",
+        tool_choice=None,
+    )
+
+    assert kwargs["messages"][1]["content"] == "I am checking the profile first."
 
 
 def _deepseek_kwargs(messages: list[dict]) -> dict:
@@ -1086,7 +1224,7 @@ def test_openai_compat_preserves_tool_call_ids_after_consecutive_assistant_messa
     ])
 
     assert sanitized[1]["role"] == "assistant"
-    assert sanitized[1]["content"] is None
+    assert sanitized[1]["content"] == "<think>我再查一下</think>"
     assert sanitized[1]["tool_calls"][0]["id"] == "call_function_akxp3wqzn7ph_1"
     assert sanitized[2]["tool_call_id"] == "call_function_akxp3wqzn7ph_1"
 
@@ -1114,7 +1252,7 @@ def test_mistral_normalizes_tool_call_ids_after_consecutive_assistant_messages()
     ])
 
     assert sanitized[1]["role"] == "assistant"
-    assert sanitized[1]["content"] is None
+    assert sanitized[1]["content"] == "<think>我再查一下</think>"
     assert sanitized[1]["tool_calls"][0]["id"] == "3ec83c30d"
     assert sanitized[2]["tool_call_id"] == "3ec83c30d"
 
@@ -1291,8 +1429,32 @@ def test_non_dashscope_minimal_not_retranslated() -> None:
     assert kw["reasoning_effort"] == "minimal"
 
 
-def test_dashscope_no_extra_body_when_reasoning_effort_none() -> None:
-    kw = _build_kwargs_for("dashscope", "qwen-turbo", reasoning_effort=None)
+@pytest.mark.parametrize(
+    "provider_name, model",
+    [
+        pytest.param("dashscope", "qwen-turbo", id="dashscope_no_extra_body_when_reasoning_effort_none"),
+        pytest.param("minimax", "MiniMax-M2.7", id="minimax_no_extra_body_when_reasoning_effort_none"),
+        pytest.param(
+            "byteplus",
+            "doubao-seed-2-0-pro",
+            id="byteplus_no_extra_body_when_reasoning_effort_none",
+        ),
+        pytest.param("deepseek", "deepseek-chat", id="deepseek_no_extra_body_when_reasoning_effort_none"),
+        pytest.param("moonshot", "kimi-k2.5", id="kimi_k25_no_extra_body_when_reasoning_effort_none"),
+        pytest.param(
+            "openrouter",
+            "moonshotai/kimi-k2.5",
+            id="kimi_k25_thinking_disabled_with_openrouter_prefix",
+        ),
+        pytest.param(
+            "openrouter",
+            "qwen/qwen3.6-flash",
+            id="qwen_no_extra_body_when_reasoning_effort_omitted",
+        ),
+    ],
+)
+def test_provider_omits_extra_body_without_reasoning_effort(provider_name, model) -> None:
+    kw = _build_kwargs_for(provider_name, model, reasoning_effort=None)
     assert "extra_body" not in kw
 
 
@@ -1304,11 +1466,6 @@ def test_minimax_reasoning_split_enabled_with_reasoning_effort() -> None:
 def test_minimax_reasoning_split_disabled_for_minimal() -> None:
     kw = _build_kwargs_for("minimax", "MiniMax-M2.7", reasoning_effort="minimal")
     assert kw["extra_body"] == {"reasoning_split": False}
-
-
-def test_minimax_no_extra_body_when_reasoning_effort_none() -> None:
-    kw = _build_kwargs_for("minimax", "MiniMax-M2.7", reasoning_effort=None)
-    assert "extra_body" not in kw
 
 
 def test_volcengine_thinking_enabled() -> None:
@@ -1333,11 +1490,6 @@ def test_byteplus_thinking_disabled_for_minimal() -> None:
     assert kw["extra_body"] == {"thinking": {"type": "disabled"}}
 
 
-def test_byteplus_no_extra_body_when_reasoning_effort_none() -> None:
-    kw = _build_kwargs_for("byteplus", "doubao-seed-2-0-pro", reasoning_effort=None)
-    assert "extra_body" not in kw
-
-
 def test_deepseek_thinking_enabled() -> None:
     """DeepSeek V4 requires extra_body.thinking when reasoning_effort is set."""
     kw = _build_kwargs_for("deepseek", "deepseek-v4-pro", reasoning_effort="high")
@@ -1348,12 +1500,6 @@ def test_deepseek_thinking_disabled_for_minimal() -> None:
     """reasoning_effort='minimal' must send thinking.type=disabled to DeepSeek."""
     kw = _build_kwargs_for("deepseek", "deepseek-v4-pro", reasoning_effort="minimal")
     assert kw["extra_body"] == {"thinking": {"type": "disabled"}}
-
-
-def test_deepseek_no_extra_body_when_reasoning_effort_none() -> None:
-    """Without reasoning_effort the thinking param must not be injected."""
-    kw = _build_kwargs_for("deepseek", "deepseek-chat", reasoning_effort=None)
-    assert "extra_body" not in kw
 
 
 def test_deepseek_backfills_reasoning_content_on_legacy_tool_call_messages() -> None:
@@ -1435,6 +1581,60 @@ def test_deepseek_v4_backfills_incomplete_reasoning_history_when_effort_implicit
     assert kw["messages"][-1]["content"] == "thanks"
 
 
+@pytest.mark.parametrize("model", ["deepseek-flash", "deepseek/deepseek-flash"])
+@pytest.mark.parametrize("effort", [None, "high", "none", "minimal"])
+@pytest.mark.parametrize("history_reasoning", [None, "", "Existing reasoning."])
+def test_deepseek_flash_backfills_missing_tool_history_reasoning(
+    model: str, effort: str | None, history_reasoning: str | None,
+) -> None:
+    """Default thinking rejects tool-call history without reasoning_content."""
+    provider = OpenAICompatProvider(
+        api_key="k", default_model=model, spec=find_by_name("deepseek"),
+    )
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call_read_file", "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path": "example.txt"}'},
+        }],
+    }
+    if history_reasoning is not None:
+        assistant["reasoning_content"] = history_reasoning
+    messages = [
+        {"role": "user", "content": "Read example.txt and tell me its contents."},
+        assistant,
+        {"role": "tool", "tool_call_id": "call_read_file", "content": "hello world"},
+    ]
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "read_file", "description": "Read a file.",
+            "parameters": {
+                "type": "object", "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }]
+    kwargs = provider._build_kwargs(
+        messages=messages, tools=tools, model=model,
+        max_tokens=128, temperature=0.7, reasoning_effort=effort, tool_choice=None,
+    )
+    sent_assistant = kwargs["messages"][1]
+    if history_reasoning is not None:
+        assert sent_assistant["reasoning_content"] == history_reasoning
+    elif effort in ("none", "minimal"):
+        assert "reasoning_content" not in sent_assistant
+    else:
+        assert sent_assistant["reasoning_content"] == ""
+    assert sent_assistant["tool_calls"] == assistant["tool_calls"]
+    assert kwargs["messages"][2] == messages[2]
+    assert ("reasoning_content" in assistant) == (history_reasoning is not None)
+    if effort is None:
+        assert "reasoning_effort" not in kwargs
+        assert "extra_body" not in kwargs
+
+
 def test_deepseek_chat_keeps_tool_history_when_effort_implicit() -> None:
     """Non-thinking deepseek-chat must keep history untouched and must NOT
     receive backfilled reasoning_content (#3554, #3584)."""
@@ -1489,6 +1689,51 @@ def test_deepseek_coerces_list_content_to_string() -> None:
     assert "world" in kw["messages"][0]["content"]
 
 
+@pytest.mark.parametrize("model", [
+    "deepseek-flash",
+    "deepseek-v4-flash-vision-exp",
+])
+@pytest.mark.parametrize("prefixed", [False, True])
+@pytest.mark.parametrize("with_text", [False, True])
+@pytest.mark.parametrize("responses", [False, True])
+def test_deepseek_vision_preserves_multimodal_content(
+    model: str, prefixed: bool, with_text: bool, responses: bool,
+) -> None:
+    """DeepSeek vision models must preserve images on both API surfaces."""
+    if prefixed:
+        model = f"deepseek/{model}"
+    spec = find_by_name("deepseek")
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        p = OpenAICompatProvider(
+            api_key="k",
+            default_model=model,
+            spec=spec,
+        )
+    urls = ["data:image/png;base64,AA==", "https://example.com/image.png"]
+    content = [{"type": "text", "text": "describe these images"}] if with_text else []
+    content.extend({"type": "image_url", "image_url": {"url": url}} for url in urls)
+
+    build_request = p._build_responses_body if responses else p._build_kwargs
+    kw = build_request(
+        messages=[{"role": "user", "content": content}],
+        tools=None,
+        model=model,
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+
+    if responses:
+        expected = [{"type": "input_text", "text": "describe these images"}] if with_text else []
+        expected.extend(
+            {"type": "input_image", "image_url": url, "detail": "auto"} for url in urls
+        )
+        assert kw["input"] == [{"role": "user", "content": expected}]
+    else:
+        assert kw["messages"][0]["content"] == content
+
+
 def test_non_deepseek_keeps_list_content() -> None:
     """Only DeepSeek should force string content; OpenAI-compatible providers keep blocks."""
     spec = find_by_name("openai")
@@ -1519,74 +1764,105 @@ def test_openai_no_thinking_extra_body() -> None:
     assert "extra_body" not in kw
 
 
-def test_kimi_k25_thinking_enabled() -> None:
-    """kimi-k2.5 with reasoning_effort set should opt in to thinking."""
-    kw = _build_kwargs_for("moonshot", "kimi-k2.5", reasoning_effort="medium")
-    assert kw.get("extra_body") == {"thinking": {"type": "enabled"}}
+@pytest.mark.parametrize(
+    "provider_name, model, effort, thinking_type",
+    [
+        pytest.param("moonshot", "kimi-k2.5", "medium", "enabled", id="kimi_k25_thinking_enabled"),
+        pytest.param(
+            "moonshot",
+            "kimi-k2.5",
+            "minimal",
+            "disabled",
+            id="kimi_k25_thinking_disabled_for_minimal",
+        ),
+        pytest.param("moonshot", "kimi-k2.6", "medium", "enabled", id="kimi_k26_thinking_enabled"),
+        pytest.param("moonshot", "kimi-k2.7-code", "medium", "enabled", id="kimi_k27_code_thinking_enabled"),
+        pytest.param(
+            "moonshot",
+            "k2.6-code-preview",
+            "high",
+            "enabled",
+            id="kimi_k26_code_preview_thinking_enabled",
+        ),
+        pytest.param(
+            "deepseek",
+            "deepseek-v4-pro",
+            "none",
+            "disabled",
+            id="deepseek_thinking_disabled_for_none_string",
+        ),
+        pytest.param(
+            "moonshot",
+            "kimi-k2.5",
+            "none",
+            "disabled",
+            id="kimi_k25_thinking_disabled_for_none_string",
+        ),
+    ],
+)
+def test_provider_thinking_type_mapping(provider_name, model, effort, thinking_type) -> None:
+    kw = _build_kwargs_for(provider_name, model, reasoning_effort=effort)
+    assert kw.get("extra_body") == {"thinking": {"type": thinking_type}}
     # Moonshot rejects both 'reasoning_effort' and 'thinking' (#3939)
     assert "reasoning_effort" not in kw
 
 
-def test_kimi_k25_thinking_disabled_for_minimal() -> None:
-    """reasoning_effort='minimal' maps to thinking disabled for kimi-k2.5."""
-    kw = _build_kwargs_for("moonshot", "kimi-k2.5", reasoning_effort="minimal")
-    assert kw.get("extra_body") == {"thinking": {"type": "disabled"}}
+def test_kimi_k3_uses_native_defaults() -> None:
+    """K3 omits fixed sampling params and uses the non-deprecated token limit field."""
+    kw = _build_kwargs_for("moonshot", "kimi-k3", reasoning_effort=None)
+
+    assert "temperature" not in kw
+    assert "max_tokens" not in kw
+    assert kw["max_completion_tokens"] == 1024
     assert "reasoning_effort" not in kw
-
-
-def test_kimi_k25_no_extra_body_when_reasoning_effort_none() -> None:
-    """Without reasoning_effort the thinking param must not be injected."""
-    kw = _build_kwargs_for("moonshot", "kimi-k2.5", reasoning_effort=None)
     assert "extra_body" not in kw
 
 
-def test_kimi_k25_thinking_enabled_with_openrouter_prefix() -> None:
-    """OpenRouter-style model names like moonshotai/kimi-k2.5 must trigger thinking.
+def test_kimi_k3_uses_top_level_max_reasoning_effort() -> None:
+    """K3 uses top-level reasoning_effort=max, never the K2.x thinking body."""
+    kw = _build_kwargs_for("moonshot", "kimi-k3", reasoning_effort="max")
 
-    OR drops upstream-provider `thinking` fields, so the same intent also has
-    to go through OR's `reasoning.effort` shape (#3851 follow-up).
-    """
-    kw = _build_kwargs_for("openrouter", "moonshotai/kimi-k2.5", reasoning_effort="medium")
+    assert kw["reasoning_effort"] == "max"
+    assert "temperature" not in kw
+    assert "extra_body" not in kw
+
+
+def test_kimi_k3_normalizes_legacy_enabled_reasoning_effort() -> None:
+    """Switching a K2.x preset to K3 must not send unsupported effort values."""
+    kw = _build_kwargs_for("moonshot", "kimi-k3", reasoning_effort="high")
+
+    assert kw["reasoning_effort"] == "max"
+    assert "extra_body" not in kw
+
+
+def test_kimi_k3_omits_disabled_reasoning_effort() -> None:
+    """K3 cannot disable reasoning, so disabled effort falls back to its default."""
+    kw = _build_kwargs_for("moonshot", "kimi-k3", reasoning_effort="none")
+
+    assert "reasoning_effort" not in kw
+    assert "temperature" not in kw
+    assert "extra_body" not in kw
+
+
+@pytest.mark.parametrize(
+    "model, effort",
+    [
+        pytest.param("moonshotai/kimi-k2.5", "medium", id="k25_thinking_enabled_with_openrouter_prefix"),
+        pytest.param("moonshotai/kimi-k2.6", "medium", id="k26_thinking_enabled_with_openrouter_prefix"),
+        pytest.param(
+            "moonshotai/kimi-k2.7-code",
+            "high",
+            id="k27_code_thinking_enabled_with_openrouter_prefix",
+        ),
+    ],
+)
+def test_openrouter_kimi_thinking_mapping(model, effort) -> None:
+    kw = _build_kwargs_for("openrouter", model, reasoning_effort=effort)
     assert kw.get("extra_body") == {
         "thinking": {"type": "enabled"},
-        "reasoning": {"effort": "medium"},
+        "reasoning": {"effort": effort},
     }
     # Even via OR, reasoning_effort wire kwarg is dropped for kimi models
-    assert "reasoning_effort" not in kw
-
-
-def test_kimi_k26_thinking_enabled() -> None:
-    """kimi-k2.6 with reasoning_effort set should opt in to thinking."""
-    kw = _build_kwargs_for("moonshot", "kimi-k2.6", reasoning_effort="medium")
-    assert kw.get("extra_body") == {"thinking": {"type": "enabled"}}
-    assert "reasoning_effort" not in kw
-
-
-def test_kimi_k26_thinking_enabled_with_openrouter_prefix() -> None:
-    """OpenRouter-style names like moonshotai/kimi-k2.6 must trigger thinking
-    via both upstream `thinking` and OR's `reasoning.effort`."""
-    kw = _build_kwargs_for("openrouter", "moonshotai/kimi-k2.6", reasoning_effort="medium")
-    assert kw.get("extra_body") == {
-        "thinking": {"type": "enabled"},
-        "reasoning": {"effort": "medium"},
-    }
-    assert "reasoning_effort" not in kw
-
-
-def test_kimi_k27_code_thinking_enabled() -> None:
-    """Kimi K2.7 Code supports native thinking controls."""
-    kw = _build_kwargs_for("moonshot", "kimi-k2.7-code", reasoning_effort="medium")
-    assert kw.get("extra_body") == {"thinking": {"type": "enabled"}}
-    assert "reasoning_effort" not in kw
-
-
-def test_kimi_k27_code_thinking_enabled_with_openrouter_prefix() -> None:
-    """OpenRouter-routed Kimi K2.7 Code should carry both thinking shapes."""
-    kw = _build_kwargs_for("openrouter", "moonshotai/kimi-k2.7-code", reasoning_effort="high")
-    assert kw.get("extra_body") == {
-        "thinking": {"type": "enabled"},
-        "reasoning": {"effort": "high"},
-    }
     assert "reasoning_effort" not in kw
 
 
@@ -1604,29 +1880,20 @@ def test_kimi_k27_code_thinking_none_with_openrouter_prefix_omits_disabled() -> 
     assert "reasoning_effort" not in kw
 
 
-def test_moonshot_kimi_k26_temperature_override() -> None:
-    """Moonshot registry forces temperature 1.0 for kimi-k2.6 (API requirement)."""
-    kw = _build_kwargs_for("moonshot", "kimi-k2.6", reasoning_effort=None)
-    assert kw["temperature"] == 1.0
+@pytest.mark.parametrize("model", ["kimi-k2.5", "kimi-k2.6"])
+@pytest.mark.parametrize("reasoning_effort", [None, "none", "minimal", "medium", "high"])
+def test_moonshot_kimi_k25_k26_omit_temperature(
+    model: str, reasoning_effort: str | None,
+) -> None:
+    """Moonshot chooses the valid temperature from the K2.5/K2.6 thinking mode."""
+    kw = _build_kwargs_for("moonshot", model, reasoning_effort=reasoning_effort)
+    assert "temperature" not in kw
 
 
 def test_moonshot_kimi_k27_code_temperature_override() -> None:
     """Moonshot registry should force temperature 1.0 for Kimi K2.7 Code."""
     kw = _build_kwargs_for("moonshot", "kimi-k2.7-code", reasoning_effort=None)
     assert kw["temperature"] == 1.0
-
-
-def test_kimi_k25_thinking_disabled_with_openrouter_prefix() -> None:
-    """OpenRouter names must NOT trigger thinking without reasoning_effort."""
-    kw = _build_kwargs_for("openrouter", "moonshotai/kimi-k2.5", reasoning_effort=None)
-    assert "extra_body" not in kw
-
-
-def test_kimi_k26_code_preview_thinking_enabled() -> None:
-    """k2.6-code-preview also supports thinking; should behave like k2.5."""
-    kw = _build_kwargs_for("moonshot", "k2.6-code-preview", reasoning_effort="high")
-    assert kw.get("extra_body") == {"thinking": {"type": "enabled"}}
-    assert "reasoning_effort" not in kw
 
 
 def test_kimi_k2_series_no_thinking_injection() -> None:
@@ -1645,25 +1912,26 @@ def test_kimi_k2_thinking_series_no_thinking_injection() -> None:
 # reasoning_effort="none" — treated as thinking disabled
 # ---------------------------------------------------------------------------
 
-def test_deepseek_thinking_disabled_for_none_string() -> None:
-    """reasoning_effort='none' must send thinking.type=disabled and skip reasoning_effort field."""
-    kw = _build_kwargs_for("deepseek", "deepseek-v4-pro", reasoning_effort="none")
-    assert kw.get("extra_body") == {"thinking": {"type": "disabled"}}
-    assert "reasoning_effort" not in kw
-
-
-def test_kimi_k25_thinking_disabled_for_none_string() -> None:
-    """reasoning_effort='none' maps to thinking disabled for kimi-k2.5."""
-    kw = _build_kwargs_for("moonshot", "kimi-k2.5", reasoning_effort="none")
-    assert kw.get("extra_body") == {"thinking": {"type": "disabled"}}
-    assert "reasoning_effort" not in kw
-
-
 def test_dashscope_thinking_disabled_for_none_string() -> None:
     """reasoning_effort='none' disables thinking and must not emit reasoning_effort on DashScope."""
     kw = _build_kwargs_for("dashscope", "qwen3.6-plus", reasoning_effort="none")
     assert kw.get("extra_body") == {"enable_thinking": False}
     assert "reasoning_effort" not in kw
+
+
+def test_qwen_thinking_enabled_via_model_level_mapping() -> None:
+    """Non-DashScope providers (e.g. OpenRouter) must pick up model-level
+    enable_thinking for Qwen models when reasoning_effort is set."""
+    kw = _build_kwargs_for("openrouter", "qwen/qwen3.6-flash", reasoning_effort="medium")
+    assert kw["extra_body"] == {"enable_thinking": True, "reasoning": {"effort": "medium"}}
+
+
+def test_qwen_thinking_disabled_via_model_level_mapping() -> None:
+    """reasoning_effort='none' must send enable_thinking: False via model-level
+    mapping on non-DashScope providers. OpenRouter also emits its own
+    reasoning.effort alongside the provider-level thinking control."""
+    kw = _build_kwargs_for("openrouter", "qwen/qwen3.5-flash", reasoning_effort="none")
+    assert kw["extra_body"] == {"enable_thinking": False, "reasoning": {"effort": "none"}}
 
 
 def test_deepseek_no_backfill_when_reasoning_effort_none_string() -> None:
@@ -1683,3 +1951,30 @@ def test_deepseek_no_backfill_when_reasoning_effort_none_string() -> None:
     )
     assistant = kw["messages"][1]
     assert "reasoning_content" not in assistant
+
+
+@pytest.mark.asyncio
+async def test_responses_request_preserves_optional_tool_fields() -> None:
+    mock_responses = AsyncMock(return_value=_fake_responses_response())
+    parameters = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": [],
+    }
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_client:
+        mock_client.return_value.responses.create = mock_responses
+        provider = OpenAICompatProvider(
+            api_key="sk-test", default_model="gpt-5", spec=find_by_name("openai"),
+        )
+        result = await provider.chat(
+            messages=[{"role": "user", "content": "Search issues"}],
+            tools=[{"type": "function", "function": {
+                "name": "list_issues", "parameters": parameters,
+            }}],
+        )
+
+    assert result.content == "ok"
+    mock_responses.assert_awaited_once()
+    tool = mock_responses.call_args.kwargs["tools"][0]
+    assert tool["strict"] is False
+    assert tool["parameters"] == parameters
