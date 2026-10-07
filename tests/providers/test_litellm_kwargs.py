@@ -9,9 +9,11 @@ Validates that:
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from nanobot.providers.base import ProviderCallContext
@@ -1059,6 +1061,10 @@ def test_compatible_provider_keeps_temperature_when_reasoning_effort_is_set(
         ("gpt-6-sol", "high", False),
         ("gpt-6-sol", None, False),
         ("gpt-6-sol", "none", True),
+        ("gpt-6-luna", "none", True),
+        ("gpt-6-luna", None, False),
+        ("gpt-6-astra", "none", False),
+        ("gpt-6.1-sol", "none", False),
     ],
 )
 @pytest.mark.asyncio
@@ -1088,12 +1094,60 @@ async def test_gpt6_temperature_requires_explicit_none_effort(
     request_mock.assert_awaited_once()
     other_mock.assert_not_awaited()
     request = request_mock.call_args.kwargs
+    if effort is None:
+        assert "reasoning" not in request
+        assert "reasoning_effort" not in request
     if supports_temperature:
         assert request["temperature"] == 0.2
+        if api_type == "responses":
+            assert request["reasoning"] == {"effort": "none"}
+        else:
+            assert request["reasoning_effort"] == "none"
     else:
         assert "temperature" not in request
         if api_type == "responses":
             assert request["include"] == ["reasoning.encrypted_content"]
+
+
+@pytest.mark.parametrize("api_type", ["chat_completions", "responses"])
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "openai/gpt-6-sol-2026-09-01"])
+@pytest.mark.asyncio
+async def test_gpt6_explicit_none_reaches_http_request(api_type: str, model: str) -> None:
+    from openai import AsyncOpenAI
+
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if api_type == "responses":
+            payload = _fake_responses_response().model_dump()
+        else:
+            payload = {
+                "choices": [{"message": {"role": "assistant", "content": "ok"},
+                             "finish_reason": "stop", "index": 0}],
+            }
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        provider = OpenAICompatProvider(
+            api_key="synthetic-audit-token", default_model=model,
+            spec=find_by_name("openai"), api_type=api_type,
+        )
+        provider._client = AsyncOpenAI(
+            api_key="synthetic-audit-token", http_client=http, max_retries=0,
+        )
+        result = await provider.chat(
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.2, reasoning_effort="NONE",
+        )
+    assert len(requests) == 1
+    assert result.content == "ok"
+    body = requests[0]
+    effort = (body.get("reasoning", {}).get("effort") if api_type == "responses"
+              else body.get("reasoning_effort"))
+    assert effort == "none"
+    assert body["temperature"] == 0.2
 
 
 def test_openai_compat_build_kwargs_uses_gpt5_safe_parameters() -> None:

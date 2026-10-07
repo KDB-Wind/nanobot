@@ -170,6 +170,13 @@ def _model_slug(model_name: str) -> str:
     return model_name.lower().rsplit("/", 1)[-1]
 
 
+def _supports_explicit_none(model_name: str) -> bool:
+    """GPT-6 Sol/Luna require a wire value to disable their default reasoning."""
+    slug = _model_slug(model_name)
+    return any(slug == model or slug.startswith(f"{model}-")
+               for model in ("gpt-6-sol", "gpt-6-luna"))
+
+
 def _provider_prefix_key(name: str) -> str:
     return to_snake(name.replace("-", "_")).lower()
 
@@ -909,7 +916,10 @@ class OpenAICompatProvider(LLMProvider):
             return False
         name = model_name.lower()
         if "gpt-6" in name:
-            return bool(reasoning_effort and reasoning_effort.lower() == "none")
+            return bool(
+                reasoning_effort and reasoning_effort.lower() == "none"
+                and _supports_explicit_none(model_name)
+            )
         return not any(token in name for token in ("gpt-5", "o1", "o3", "o4"))
 
     def _opencode_affinity_headers(
@@ -1034,8 +1044,8 @@ class OpenAICompatProvider(LLMProvider):
 
         if strip_effort:
             wire_effort = None
-        elif wire_effort and semantic_effort != "none":
-            kwargs["reasoning_effort"] = wire_effort
+        elif wire_effort and (semantic_effort != "none" or _supports_explicit_none(model_name)):
+            kwargs["reasoning_effort"] = "none" if semantic_effort == "none" else wire_effort
 
         # Only send thinking controls when reasoning_effort is explicit so
         # omitting the config preserves each provider's default.
@@ -1325,8 +1335,12 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_enabled = bool(reasoning_effort and reasoning_effort.lower() != "none")
         if (not supports_temperature or reasoning_enabled) and not preserve_reasoning:
             body["include"] = ["reasoning.encrypted_content"]
-        if reasoning_effort and (reasoning_effort.lower() != "none" or is_deepseek):
-            body["reasoning"] = {"effort": reasoning_effort}
+        if reasoning_effort and (
+            reasoning_effort.lower() != "none" or is_deepseek or _supports_explicit_none(model_name)
+        ):
+            body["reasoning"] = {
+                "effort": "none" if reasoning_effort.lower() == "none" else reasoning_effort,
+            }
         if replayed and "gpt-5.6" in model_name.lower():
             body.setdefault("reasoning", {})["context"] = "all_turns"
 
