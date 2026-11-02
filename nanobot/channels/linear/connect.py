@@ -46,7 +46,7 @@ class LinearConnectStore:
 
     async def close(self) -> None:
         for session_id in tuple(self._sessions):
-            await self.cancel(session_id)
+            await self._discard_session(session_id)
 
     async def handle(self, action: str, query: QueryParams) -> dict[str, Any]:
         await self._cleanup()
@@ -193,6 +193,9 @@ class LinearConnectStore:
         session = self._sessions.get(session_id)
         if session is not None:
             async with session.completion_lock:
+                if session.result is not None:
+                    await self._release_listener(session)
+                    return dict(session.result)
                 await self._close_session(session_id)
         return _terminal(session_id, "cancelled", "Linear authorization cancelled.")
 
@@ -304,7 +307,14 @@ class LinearConnectStore:
             if time.monotonic() >= session.flow.deadline
         ]
         for session_id in expired:
-            await self.cancel(session_id)
+            await self._discard_session(session_id)
+
+    async def _discard_session(self, session_id: str) -> None:
+        """Lifecycle cleanup also removes committed results retained for the browser."""
+        session = self._sessions.get(session_id)
+        if session is not None:
+            async with session.completion_lock:
+                await self._close_session(session_id)
 
     async def _close_session(self, session_id: str) -> None:
         session = self._sessions.get(session_id)
@@ -319,7 +329,7 @@ class LinearConnectStore:
 
     async def _expire_session(self, session: LinearConnectSession) -> None:
         await asyncio.sleep(max(0, session.flow.deadline - time.monotonic()))
-        await self.cancel(session.flow.session_id)
+        await self._discard_session(session.flow.session_id)
 
     @staticmethod
     async def _release_listener(session: LinearConnectSession) -> None:
