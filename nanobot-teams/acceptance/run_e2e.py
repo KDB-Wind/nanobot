@@ -987,6 +987,7 @@ async def _ledger_second_session(config: Path, ledger_path: Path, task_id: str) 
 
 def scenario_ledger_restart() -> None:
     reset()
+    (OUT / "ledger.sqlite3").unlink(missing_ok=True)
     stub = start_stub(0.0, 200, "ledger-probe-answer-alpha")
     try:
         config = write_teams(f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions")
@@ -1000,6 +1001,95 @@ def scenario_ledger_restart() -> None:
         assert b"ledger-probe-answer-alpha" not in blob
         assert RESEARCH_KEY.encode() not in blob
         log("PASS ledger_restart")
+    finally:
+        stub.shutdown()
+
+
+async def _budget_mcp_calls(config: Path, ledger_path: Path) -> list[dict]:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    params = StdioServerParameters(
+        command=str(PY_TEAMS),
+        args=[
+            "-m",
+            "nanobot_teams",
+            "--config",
+            str(config),
+            "--caller",
+            "planner",
+            "--ledger",
+            str(ledger_path),
+        ],
+        env={**os.environ, "TEAMS_RESEARCH_API_KEY": RESEARCH_KEY},
+        cwd=str(OUT),
+    )
+    results = []
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            for index in range(3):
+                result = await session.call_tool(
+                    "delegate_task", {"bot_id": "research", "task": f"budget probe {index}"}
+                )
+                results.append(json.loads(result.content[0].text))
+    return results
+
+
+def scenario_budget_reject() -> None:
+    reset()
+    (OUT / "ledger.sqlite3").unlink(missing_ok=True)
+    stub = start_stub(0.0, 200, "budget-answer")
+    try:
+        config = write_teams_v2(
+            f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions",
+            f"http://127.0.0.1:{WRITER_PORT}/v1/chat/completions",
+        )
+        registry = json.loads(config.read_text(encoding="utf-8"))
+        registry["bots"] = [
+            bot for bot in registry["bots"] if bot["id"] in ("planner", "research")
+        ]
+        registry["budgets"] = {"planner": {"delegations": 2}}
+        config.write_text(json.dumps(registry, indent=2), encoding="utf-8")
+        ledger_path = OUT / "ledger.sqlite3"
+
+        results = asyncio.run(_budget_mcp_calls(config, ledger_path))
+        assert [row["status"] for row in results] == [
+            "completed",
+            "completed",
+            "failed",
+        ], results
+        assert results[2]["error_code"] == "budget_exceeded", results[2]
+        assert StubHandler.hits == 2, StubHandler.hits
+
+        graph = subprocess.run(
+            [str(PY_TEAMS), "-m", "nanobot_teams", "graph", "--config", str(config)],
+            capture_output=True, text=True, env=os.environ, cwd=str(ROOT),
+        )
+        assert graph.returncode == 0, graph.stdout + graph.stderr
+        assert "planner --> research" in graph.stdout
+
+        budget = subprocess.run(
+            [
+                str(PY_TEAMS), "-m", "nanobot_teams", "budget",
+                "--config", str(config), "--ledger", str(ledger_path),
+            ],
+            capture_output=True, text=True, env=os.environ, cwd=str(ROOT),
+        )
+        assert budget.returncode == 0, budget.stdout + budget.stderr
+        assert "2/2 OVER" in budget.stdout, budget.stdout
+
+        audit = subprocess.run(
+            [
+                str(PY_TEAMS), "-m", "nanobot_teams", "audit",
+                "--ledger", str(ledger_path),
+            ],
+            capture_output=True, text=True, env=os.environ, cwd=str(ROOT),
+        )
+        assert audit.returncode == 0, audit.stdout + audit.stderr
+        assert "planner -> research" in audit.stdout
+        assert "completed=2" in audit.stdout
+        log("PASS budget_reject")
     finally:
         stub.shutdown()
 
@@ -1018,6 +1108,7 @@ SCENARIOS = {
     "bot_init_live": scenario_bot_init_live,
     "check_errors": scenario_check_errors,
     "ledger_restart": scenario_ledger_restart,
+    "budget_reject": scenario_budget_reject,
     "plugin_manifest": scenario_plugin_manifest,
 }
 

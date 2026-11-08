@@ -102,6 +102,21 @@ class Delegator:
         self._busy = False
         self._blocked = False
 
+    def _budget_exceeded(self) -> str | None:
+        budget = self._config.budgets.get(self._caller_id)
+        if budget is None:
+            return None
+        if not self._ledger.enabled:
+            return "Budgets need --ledger; this instance runs without one."
+        used_count, used_bytes, used_seconds = self._ledger.usage_for(self._caller_id)
+        if budget.delegations is not None and used_count >= budget.delegations:
+            return f"Delegation budget spent: {used_count} of {budget.delegations}."
+        if budget.result_bytes is not None and used_bytes >= budget.result_bytes:
+            return f"Result byte budget spent: {used_bytes} of {budget.result_bytes}."
+        if budget.chain_seconds is not None and used_seconds >= budget.chain_seconds:
+            return f"Time budget spent: {used_seconds:.1f} of {budget.chain_seconds} seconds."
+        return None
+
     def list_tasks(
         self, limit: int = 50, target: str | None = None, status: str | None = None
     ) -> list[TaskRecord]:
@@ -142,6 +157,10 @@ class Delegator:
             return self._refuse(task_id, bot_id, "blocked", _BLOCKED)
         if self._busy:
             return self._refuse(task_id, bot_id, "busy", _BUSY)
+
+        over = self._budget_exceeded()
+        if over is not None:
+            return self._refuse(task_id, bot_id, "budget_exceeded", over)
 
         try:
             if any(

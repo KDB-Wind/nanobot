@@ -19,7 +19,7 @@ from .ledger import Ledger
 from .lifecycle import bot_init, check, print_findings
 from .server import serve
 
-_SUBCOMMANDS = ("serve", "bot", "check")
+_SUBCOMMANDS = ("serve", "bot", "check", "graph", "budget", "audit")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -34,6 +34,11 @@ def _dispatch(args: list[str]) -> int:
         return _run_server(_parse_serve(args[1:]))
     if args[0] == "check":
         return _run_check(_parse_check(args[1:]))
+    if args[0] == "graph":
+        return _run_graph(_parse_graph(args[1:]))
+    if args[0] == "budget":
+        return _run_budget(_parse_budget(args[1:]))
+    return _run_audit(_parse_audit(args[1:]))
     if len(args) >= 2 and args[1] == "init":
         return _run_bot_init(_parse_bot_init(args[2:]))
     print("nanobot-teams bot: expected 'bot init ...'", file=sys.stderr)
@@ -84,6 +89,78 @@ def _run_bot_init(args: argparse.Namespace) -> int:
         for line in scaffold.checklist:
             print(f"- {line}")
     return exit_code
+
+
+def _run_graph(args: argparse.Namespace) -> int:
+    from .config import load_teams_config
+    from .reporting import render_graph
+
+    try:
+        config = load_teams_config(args.config)
+    except ConfigError as exc:
+        print(f"nanobot-teams: {exc}", file=sys.stderr)
+        return 2
+    print(render_graph(config))
+    return 0
+
+
+def _run_budget(args: argparse.Namespace) -> int:
+    from .config import load_teams_config
+    from .reporting import render_budget
+
+    try:
+        config = load_teams_config(args.config)
+    except ConfigError as exc:
+        print(f"nanobot-teams: {exc}", file=sys.stderr)
+        return 2
+    print(render_budget(config, [Path(p) for p in args.ledger]))
+    return 0
+
+
+def _run_audit(args: argparse.Namespace) -> int:
+    from .reporting import render_audit
+
+    print(
+        render_audit(
+            [Path(p) for p in args.ledger],
+            limit=args.limit,
+            target=args.target,
+            status=args.status,
+        )
+    )
+    return 0
+
+
+def _parse_graph(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="nanobot-teams graph")
+    parser.add_argument("--config", required=True, help="path to teams.json")
+    return parser.parse_args(argv)
+
+
+def _parse_budget(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="nanobot-teams budget")
+    parser.add_argument("--config", required=True, help="path to teams.json")
+    parser.add_argument(
+        "--ledger",
+        action="append",
+        default=[],
+        help="ledger file to read; repeatable; defaults to the registry directory",
+    )
+    return parser.parse_args(argv)
+
+
+def _parse_audit(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="nanobot-teams audit")
+    parser.add_argument(
+        "--ledger",
+        action="append",
+        required=True,
+        help="ledger file to read; repeatable",
+    )
+    parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--target")
+    parser.add_argument("--status")
+    return parser.parse_args(argv)
 
 
 def _parse_serve(argv: Sequence[str]) -> argparse.Namespace:

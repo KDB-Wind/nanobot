@@ -12,7 +12,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -32,7 +32,9 @@ _TOP_LEVEL_KEYS_V1 = frozenset(
         "limits",
     }
 )
-_TOP_LEVEL_KEYS_V2 = frozenset({"schema_version", "team_id", "thread_key", "bots", "limits"})
+_TOP_LEVEL_KEYS_V2 = frozenset(
+    {"schema_version", "team_id", "thread_key", "bots", "limits", "budgets"}
+)
 _BOT_KEYS_V1 = frozenset({"id", "display_name", "role", "endpoint", "api_key_env"})
 _BOT_KEYS_V2 = frozenset(
     {
@@ -79,6 +81,13 @@ class Limits:
 
 
 @dataclass(frozen=True)
+class Budget:
+    delegations: int | None = None
+    result_bytes: int | None = None
+    chain_seconds: float | None = None
+
+
+@dataclass(frozen=True)
 class BotConfig:
     id: str
     display_name: str
@@ -98,6 +107,7 @@ class TeamConfig:
     bots: tuple[BotConfig, ...]
     limits: Limits = Limits()
     default_caller_id: str | None = None
+    budgets: Mapping[str, Budget] = field(default_factory=dict)
 
     def bot(self, bot_id: str) -> BotConfig | None:
         return next((bot for bot in self.bots if bot.id == bot_id), None)
@@ -205,6 +215,7 @@ def _load_v2(root: dict[str, Any]) -> TeamConfig:
         thread_key=thread_key,
         bots=bots,
         limits=_limits(root.get("limits")),
+        budgets=_budgets(root.get("budgets"), bots),
     )
 
 
@@ -227,6 +238,33 @@ def _validate_v2_graph(bots: tuple[BotConfig, ...]) -> None:
                 raise ConfigError(
                     f"bot {bot.id!r} lists unknown caller {caller!r} in allowed_callers"
                 )
+
+
+_BUDGET_KEYS = frozenset({"delegations", "result_bytes", "chain_seconds"})
+
+
+def _budgets(value: Any, bots: tuple[BotConfig, ...]) -> dict[str, Budget]:
+    if value is None:
+        return {}
+    entry = _object(value, "budgets")
+    known = {bot.id for bot in bots}
+    budgets: dict[str, Budget] = {}
+    for bot_id, raw in entry.items():
+        if bot_id not in known:
+            raise ConfigError(f"budgets names unknown bot {bot_id!r}")
+        limits = _object(raw, f"budgets.{bot_id}")
+        _reject_unknown(limits, _BUDGET_KEYS, f"budgets.{bot_id}")
+        fields: dict[str, int | float] = {}
+        for key, ceiling in limits.items():
+            if isinstance(ceiling, bool) or not isinstance(ceiling, int | float):
+                raise ConfigError(f"budgets.{bot_id}.{key} must be a number")
+            if ceiling <= 0:
+                raise ConfigError(f"budgets.{bot_id}.{key} must be positive")
+            if key in {"delegations", "result_bytes"} and not isinstance(ceiling, int):
+                raise ConfigError(f"budgets.{bot_id}.{key} must be an integer")
+            fields[key] = ceiling
+        budgets[bot_id] = Budget(**fields)
+    return budgets
 
 
 def _object(value: Any, where: str) -> dict[str, Any]:

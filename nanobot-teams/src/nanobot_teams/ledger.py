@@ -157,6 +157,20 @@ class Ledger:
             return []
         return [_row_to_record(row) for row in rows]
 
+    def usage_for(self, caller: str) -> tuple[int, int, float]:
+        """Delegations, cumulative result bytes, and cumulative seconds for one caller."""
+        if self._conn is None:
+            return (0, 0, 0.0)
+        try:
+            row = self._conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(result_bytes), 0), "
+                "COALESCE(SUM(duration_ms), 0) FROM tasks WHERE caller = ?",
+                (caller,),
+            ).fetchone()
+        except sqlite3.Error:
+            return (0, 0, 0.0)
+        return (int(row[0]), int(row[1]), float(row[2]) / 1000.0)
+
     def get_task(self, task_id: str) -> TaskRecord | None:
         if self._conn is None:
             return None

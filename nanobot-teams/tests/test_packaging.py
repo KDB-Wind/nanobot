@@ -76,6 +76,7 @@ def test_config_has_no_secret_fields() -> None:
         "bots",
         "limits",
         "default_caller_id",
+        "budgets",
     }
     assert not (bot_fields | team_fields) & {"api_key", "token", "secret", "authorization"}
 

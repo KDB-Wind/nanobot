@@ -287,6 +287,39 @@ Add the two tools to `enabledTools` when you pin the list:
 "enabledTools": ["list_bots", "delegate_task", "list_tasks", "get_task"]
 ```
 
+## Budgets and operator views
+
+A schema 2 registry can cap what one caller may spend:
+
+```json
+{
+  "budgets": {
+    "planner": {"delegations": 100, "result_bytes": 1048576, "chain_seconds": 600.0},
+    "mid": {"delegations": 20}
+  }
+}
+```
+
+Enforcement counts what the ledger recorded for that caller: total
+delegations, cumulative returned bytes, cumulative seconds. A delegation past
+any cap fails locally with `budget_exceeded` and no HTTP request. Budgets
+require `--ledger`; an instance with budgets configured but no ledger refuses
+every delegation instead of guessing.
+
+Three read-only CLI commands work from the registry and ledger files:
+
+```bash
+nanobot-teams graph --config teams.json
+nanobot-teams budget --config teams.json --ledger path/to/ledger.sqlite3
+nanobot-teams audit --ledger path/to/ledger.sqlite3 --status completed
+```
+
+`graph` prints each bot with its outgoing edges plus a mermaid diagram of the
+authorization graph. `budget` prints used/limit per bot and marks `OVER` when
+a cap is reached. `audit` prints ledger rows across one or more files with
+`--target`, `--status`, and `--limit` filters and a status summary. None of
+them write anything or contact Nanobot.
+
 ## Operate
 
 The server logs to stderr only. Each delegation logs the task id, bot id, duration, status, and error code. It does not log the task or the answer.
