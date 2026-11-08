@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    paths: ["nanobot-teams/**", ".github/workflows/ci.yml"]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: nanobot-teams
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e . pytest pytest-asyncio ruff
+      - run: ruff check src tests acceptance
+      - run: pytest -q

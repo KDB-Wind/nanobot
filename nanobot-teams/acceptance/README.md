@@ -41,7 +41,11 @@ NANOBOT_TEAMS_PRESET=glm-5.3-flash python acceptance/run_e2e.py all
 | `check_errors` | `check` exits 1 and names the missing key variable and the unknown preset. |
 | `ledger_restart` | A delegation lands in the SQLite ledger, a fresh MCP process reads it back, and the database holds no task text, answer, or key. |
 | `budget_reject` | A two-delegation cap refuses the third call with `budget_exceeded` before HTTP; graph, budget, and audit print the state. |
+| `packaging_fresh` | Builds the wheel, installs it into a clean venv with resolved dependencies, runs a delegation from it, and uninstalls. |
 | `plugin_manifest` | Real `discover_agent_plugins` accepts the package. |
+
+`packaging_fresh` reaches PyPI for dependencies; on a WSL NAT guest export the
+proxy variables before running it, as for the other scenarios.
 
 ## Unix path
 

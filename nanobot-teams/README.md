@@ -26,10 +26,11 @@ Every bot keeps its own identity, workspace, model, memory, and session. Teams m
 | Item | Tested value |
 | --- | --- |
 | Nanobot baseline | 0.4.1 at commit `1e2dc02fa228b6c5c62b8fc84de2a2d77dd925f3`, installed editable from the local worktree |
+| Package version | 0.2.0, wheel built and installed into a clean venv by `packaging_fresh` |
 | Python | 3.11.4 on Windows, 3.11.15 on Ubuntu (WSL2) |
 | Platforms | Windows 11, Ubuntu 22.04 kernel 6.18 on WSL2 in NAT mode |
 | Resolved deps | `mcp` 1.30.0, `httpx` 0.28.1, `anyio` 4.16.0, `pydantic` 2.14.3, identical on both platforms |
-| Server acceptance | 6/6 scenarios pass on Windows and on Ubuntu, see `acceptance/README.md` |
+| Server acceptance | All scenarios pass on Windows and on Ubuntu, see `acceptance/README.md` |
 | WebUI acceptance | Pass on Windows |
 
 The Ubuntu run routes egress through a host-side byte relay because the WSL NAT
@@ -344,12 +345,16 @@ To uninstall, remove the plugin directory and the `nanobot-teams` distribution. 
 
 ## Security boundaries
 
-- The Registry, the executable, and the MCP environment are the control plane. Do not let model output create or edit them.
-- The Planner holds only the Research API key. Research holds no Planner key and no Teams outbound tools.
-- The transport does not use environment proxies, does not follow redirects, and does not retry. The Bearer token and task cannot be forwarded to another host by the client.
+- The Registry, the executable, and the MCP environment are the control plane. Do not let model output create or edit them. `--caller`, `--config`, and `--ledger` are launch configuration, never tool arguments.
+- Each instance resolves credentials only for targets its caller is authorized to reach. A middle-hop bot never holds keys for bots it cannot call. Research holds no Planner key and no Teams outbound tools unless you register them.
+- The transport does not use environment proxies, does not follow redirects, and does not retry. The Bearer token and task cannot be forwarded to another host by the client. Endpoints stay pinned to loopback.
+- Envelope values (hop, deadline, chain) travel through the receiving model. The server validates their shape and enforces hop, loop, and budget bounds locally, but cannot prove they are the values the upstream generated. Treat them as caps, not as authenticated ancestry.
+- The ledger stores ids, counts, and timings only. Task text, answers, and credentials never enter it, and the acceptance scenario checks the database bytes for their absence.
+- Budgets count ledger rows, so they bound what this installation spent. They are not a distributed quota: two MCP processes sharing one ledger file have no cross-process lock.
+- `bot init` and `check` write and read only the paths the operator names. `check` probes endpoints with plain TCP connects.
 - `restrictToWorkspace` is an application path guard, not an operating system sandbox. Two processes under the same OS user can usually read each other's files. Use separate OS accounts or containers when the bots do not trust each other.
 - Research web pages, tool output, and answers are untrusted data. The Planner must not promote them to instructions or use them to choose an endpoint.
-- Logs keep task ids, bot ids, timing, status, and error codes. Nanobot itself may log session data and prompt prefixes. Review its log retention separately.
+- Logs keep task ids, root ids, caller, target, hop, timing, status, error codes, and byte counts. Nanobot itself may log session data and prompt prefixes. Review its log retention separately.
 
 ## Limits
 
@@ -365,6 +370,29 @@ To uninstall, remove the plugin directory and the `nanobot-teams` distribution. 
 `ROADMAP.md` covers the stages after this MVP: multiple bots with an authorization
 graph, multi-hop delegation, lifecycle tooling, a local task ledger, and release
 hardening.
+
+## Implemented, tested, unsupported
+
+| Capability | State |
+| --- | --- |
+| Schema 1 single-caller registry | Implemented; tested on Windows and Ubuntu, live scenarios |
+| Schema 2 authorization graph, `--caller` identity | Implemented; tested on both platforms, live three-bot scenarios |
+| `capabilities` and `model_preset` metadata | Implemented and surfaced; advisory only |
+| Multi-hop envelope, loop and hop limits, deadline budget | Implemented; unit matrix plus live `chain_abc`, `chain_loop`, `chain_budget` |
+| Busy single-flight, unknown-result block, no-retry | Implemented; live `unknown_block` since the MVP |
+| `bot init` and `check` lifecycle tools | Implemented; live `bot_init_live`, `check_errors` |
+| SQLite ledger behind `--ledger`, `list_tasks`, `get_task` | Implemented; live `ledger_restart` including a byte-level privacy check |
+| Caller budgets (`delegations`, `result_bytes`, `chain_seconds`) | Implemented; live `budget_reject` |
+| `graph`, `budget`, `audit` CLI views | Implemented; exercised inside `budget_reject` |
+| Remote task query, cancel, resume, idempotency | Not implemented; upstream has no such API. Do not build on task ids as handles |
+| Autonomous group chat, mentions, proactive pushes | Unsupported by design |
+| Auto-start or supervise bot processes | Unsupported; `bot init` prints the command, the operator starts it |
+| Cross-process budget locking, exactly-once delivery | Unsupported; one ledger writer per installation is assumed |
+| Read-only web page | Not delivered; the CLI views cover the same data |
+| Wheel packaging and fresh-environment install | Implemented; the `packaging_fresh` scenario builds the wheel, installs it into a clean venv, runs a delegation from it, and uninstalls |
+
+The WebUI-path acceptance (`run_webui.py`) covers the MVP single-hop flow on
+Windows with Edge; it has not been replayed on Unix.
 
 ## Troubleshooting
 

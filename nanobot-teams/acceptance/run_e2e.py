@@ -1094,6 +1094,84 @@ def scenario_budget_reject() -> None:
         stub.shutdown()
 
 
+def scenario_packaging_fresh() -> None:
+    reset()
+    stub = start_stub(0.0, 200, "fresh-env-answer")
+    try:
+        dist = OUT / "dist"
+        shutil.rmtree(dist, ignore_errors=True)
+        dist.mkdir(parents=True)
+        build = subprocess.run(
+            [str(PY_TEAMS), "-m", "build", "--wheel", "--outdir", str(dist), str(TEAMS)],
+            capture_output=True, text=True, env=os.environ, cwd=str(TEAMS),
+        )
+        assert build.returncode == 0, build.stdout + build.stderr
+        wheel = next(dist.glob("nanobot_teams-*.whl"))
+        assert "0.2.0" in wheel.name, wheel.name
+
+        fresh = OUT / "fresh"
+        shutil.rmtree(fresh, ignore_errors=True)
+        venv_result = subprocess.run(
+            [str(PY_TEAMS), "-m", "venv", str(fresh)],
+            capture_output=True, text=True, env=os.environ,
+        )
+        assert venv_result.returncode == 0, venv_result.stderr
+        fresh_py = fresh / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        pip_env = os.environ.copy()
+
+        install = subprocess.run(
+            [str(fresh_py), "-m", "pip", "install", "--quiet", str(wheel)],
+            capture_output=True, text=True, env=pip_env,
+        )
+        assert install.returncode == 0, install.stdout + install.stderr
+
+        probe = subprocess.run(
+            [str(fresh_py), "-c", "import nanobot_teams; print(nanobot_teams.__version__)"],
+            capture_output=True, text=True, env=pip_env,
+        )
+        assert probe.returncode == 0, probe.stderr
+        assert probe.stdout.strip() == "0.2.0", probe.stdout
+
+        config = write_teams(f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions")
+
+        async def fresh_session() -> dict:
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
+
+            params = StdioServerParameters(
+                command=str(fresh_py),
+                args=["-m", "nanobot_teams", "--config", str(config)],
+                env={**os.environ, "TEAMS_RESEARCH_API_KEY": RESEARCH_KEY},
+                cwd=str(OUT),
+            )
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    await session.call_tool("list_bots", {})
+                    result = await session.call_tool(
+                        "delegate_task", {"bot_id": "research", "task": "fresh probe"}
+                    )
+                    return json.loads(result.content[0].text)
+
+        payload = asyncio.run(fresh_session())
+        assert payload["status"] == "completed", payload
+        assert payload["content"] == "fresh-env-answer"
+
+        uninstall = subprocess.run(
+            [str(fresh_py), "-m", "pip", "uninstall", "-y", "--quiet", "nanobot-teams"],
+            capture_output=True, text=True, env=pip_env,
+        )
+        assert uninstall.returncode == 0, uninstall.stderr
+        gone = subprocess.run(
+            [str(fresh_py), "-c", "import nanobot_teams"],
+            capture_output=True, text=True, env=pip_env,
+        )
+        assert gone.returncode != 0, gone.stdout
+        log("PASS packaging_fresh")
+    finally:
+        stub.shutdown()
+
+
 SCENARIOS = {
     "research_direct": scenario_research_direct,
     "delegate_basic": scenario_delegate_basic,
@@ -1109,6 +1187,7 @@ SCENARIOS = {
     "check_errors": scenario_check_errors,
     "ledger_restart": scenario_ledger_restart,
     "budget_reject": scenario_budget_reject,
+    "packaging_fresh": scenario_packaging_fresh,
     "plugin_manifest": scenario_plugin_manifest,
 }
 
