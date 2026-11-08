@@ -14,6 +14,10 @@ credentials, so they are run by hand rather than in CI.
 
 Select a preset with `NANOBOT_TEAMS_PRESET`; it defaults to `step-5-preview`.
 
+`NANOBOT_TEAMS_API_BASE` overrides the preset provider's base URL. Use it when the
+subscription endpoint differs from the provider default, for example
+`https://api.stepfun.com/step_plan/v1`.
+
 ## Server path
 
 ```bash

@@ -211,3 +211,4 @@ To uninstall, remove the plugin directory and the `nanobot-teams` distribution. 
 | `outcome_unknown` | The request may have reached Research | Do not retry. Check Research before you resume |
 | `response_too_large` | The answer exceeded 256 KiB before parsing | Narrow the task or raise `response_max_bytes` after review |
 | `truncated: true` | The answer exceeded 32 KiB after parsing | The full answer is not available. Ask a narrower follow-up |
+| `failed` with `provider_unavailable`, or a provider 402 | The subscription plan uses a different base URL than the API default | Set `providers.<name>.apiBase` to the plan endpoint, for example `https://api.stepfun.com/step_plan/v1`, and restart |

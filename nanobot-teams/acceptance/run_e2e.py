@@ -47,6 +47,14 @@ def user_config() -> dict:
     return json.loads(USER_CONFIG.read_text(encoding="utf-8"))
 
 
+def provider_config(preset: dict, source: dict) -> dict:
+    provider = dict(source["providers"][preset["provider"]])
+    override = os.environ.get("NANOBOT_TEAMS_API_BASE")
+    if override:
+        provider["apiBase"] = override
+    return provider
+
+
 def base_config(workspace: Path, port: int, api_key_ref: str, *, restrict: bool) -> dict:
     source = user_config()
     preset = source["modelPresets"][PRESET]
@@ -68,7 +76,7 @@ def base_config(workspace: Path, port: int, api_key_ref: str, *, restrict: bool)
                 "dream": {"enabled": False},
             }
         },
-        "providers": {preset["provider"]: source["providers"][preset["provider"]]},
+        "providers": {preset["provider"]: provider_config(preset, source)},
         "modelPresets": {PRESET: preset},
         "api": {
             "host": "127.0.0.1",
