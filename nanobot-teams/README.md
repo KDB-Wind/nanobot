@@ -198,6 +198,12 @@ To uninstall, remove the plugin directory and the `nanobot-teams` distribution. 
 - No file attachments, group chat, mentions, or proactive messages.
 - A running HTTP request does not survive a restart of either process.
 
+## Roadmap
+
+`ROADMAP.md` covers the stages after this MVP: multiple bots with an authorization
+graph, multi-hop delegation, lifecycle tooling, a local task ledger, and release
+hardening.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Action |
