@@ -9,9 +9,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from .config import Budget, TeamConfig
+from .config import TeamConfig
 from .ledger import Ledger
-
 
 _MERMAQ_SAFE = str.maketrans({".": "_", "-": "_"})
 
@@ -117,14 +116,3 @@ def _pair(used: int | float, limit: int | float | None, unit: str) -> str:
         return f"{used}{unit}/-"
     state = "ok" if used < limit else "OVER"
     return f"{used}{unit}/{limit}{unit} {state}"
-
-
-def budget_hint(budget: Budget) -> str:
-    parts = []
-    if budget.delegations is not None:
-        parts.append(f"{budget.delegations} delegations")
-    if budget.result_bytes is not None:
-        parts.append(f"{budget.result_bytes} result bytes")
-    if budget.chain_seconds is not None:
-        parts.append(f"{budget.chain_seconds} seconds")
-    return ", ".join(parts) or "unlimited"
