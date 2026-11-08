@@ -1,8 +1,9 @@
 # Acceptance runs
 
-Windows-only harnesses that exercise the real integration. They sit outside the
-package: they need two live Nanobot processes, a browser, and provider
-credentials, so they are run by hand rather than in CI.
+Harnesses that exercise the real integration. They sit outside the package:
+they need two live Nanobot processes, a browser, and provider credentials, so
+they are run by hand rather than in CI. The server path runs on Windows and on
+Linux; the WebUI path needs Edge and has only been run on Windows.
 
 ## Prerequisites
 
@@ -32,6 +33,34 @@ NANOBOT_TEAMS_PRESET=glm-5.3-flash python acceptance/run_e2e.py all
 | `long_timeout` | A 35 second task outlives the 30 second default and returns at ~48 s. |
 | `unknown_block` | A 500 marks the target and a retry never reaches HTTP. |
 | `plugin_manifest` | Real `discover_agent_plugins` accepts the package. |
+
+## Unix path
+
+`run_e2e.py` picks `.venv/bin` interpreter paths on POSIX. A Linux run needs
+the same layout inside a clone of this worktree: `.venv-nanobot` at the root
+with `.[api]` installed, and `nanobot-teams/.venv` with this package. The
+`git` path quirk matters: clone the main repository, not the worktree
+directory, because a worktree's `.git` file points back at an absolute Windows
+path that POSIX git cannot follow.
+
+When the guest is WSL in NAT mode with no direct egress, start `relay.py` on
+the Windows host bound to the WSL gateway address, forwarding to the
+loopback-bound host proxy. Then export the proxy plus a localhost bypass and
+run the suite:
+
+```bash
+py acceptance/relay.py --listen <gateway-ip>:17897 --target 127.0.0.1:<proxy-port>
+export http_proxy=http://<gateway-ip>:17897 https_proxy=http://<gateway-ip>:17897
+export no_proxy=127.0.0.1,localhost
+.venv/bin/python acceptance/run_e2e.py all
+```
+
+`no_proxy` matters. The harness health checks hit 127.0.0.1 and must not be
+routed into the proxy. The Teams transport is unaffected either way because it
+runs with `trust_env=False` and only talks to loopback.
+
+Recorded Linux result, 2026-11-08 on Ubuntu 22.04 (WSL2, kernel 6.18.33,
+Python 3.11.15): 6/6 scenarios pass, `long_timeout` elapsed 38.2 s.
 
 ## WebUI path
 

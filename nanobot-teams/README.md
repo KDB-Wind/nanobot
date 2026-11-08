@@ -20,6 +20,21 @@ The Planner keeps its own identity, workspace, model, memory, and session. The R
 - Two Nanobot instances with separate homes, config directories, workspaces, model credentials, and sessions.
 - A Planner workspace where you can install an Agent Plugin.
 
+## Support matrix
+
+| Item | Tested value |
+| --- | --- |
+| Nanobot baseline | 0.4.1 at commit `1e2dc02fa228b6c5c62b8fc84de2a2d77dd925f3`, installed editable from the local worktree |
+| Python | 3.11.4 on Windows, 3.11.15 on Ubuntu (WSL2) |
+| Platforms | Windows 11, Ubuntu 22.04 kernel 6.18 on WSL2 in NAT mode |
+| Resolved deps | `mcp` 1.30.0, `httpx` 0.28.1, `anyio` 4.16.0, `pydantic` 2.14.3, identical on both platforms |
+| Server acceptance | 6/6 scenarios pass on Windows and on Ubuntu, see `acceptance/README.md` |
+| WebUI acceptance | Pass on Windows |
+
+The Ubuntu run routes egress through a host-side byte relay because the WSL NAT
+guest has no direct network access; `acceptance/README.md` describes the setup.
+That relay is an environment adapter for this machine, not a product dependency.
+
 ## Install the server
 
 ```bash

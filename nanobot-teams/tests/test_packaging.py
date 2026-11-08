@@ -23,6 +23,23 @@ def test_no_nanobot_imports() -> None:
     assert offenders == []
 
 
+def test_no_filesystem_writes_in_src() -> None:
+    writes = re.compile(
+        r"\.(?:write_text|write_bytes|mkdir|rmdir|unlink|rename|replace|touch)\s*\("
+        r"|os\.(?:remove|rename|replace|makedirs|mkdir|rmdir|unlink)\s*\("
+        r"|\bshutil\s*\."
+        r"|\bopen\s*\([^)]*['\"][wax]"
+    )
+    offenders = [
+        f"{path.name}:{number}"
+        for path in sorted(SRC.glob("*.py"))
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if writes.search(line)
+    ]
+
+    assert offenders == []
+
+
 def test_console_script_and_dependencies() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
