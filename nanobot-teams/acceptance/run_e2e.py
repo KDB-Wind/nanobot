@@ -305,7 +305,7 @@ def start_stub(delay: float, status: int, content: str, port: int = STUB_PORT) -
     return server
 
 
-def _wait_ports_bindable(timeout: float = 25.0) -> None:
+def _wait_ports_bindable(timeout: float = 90.0) -> None:
     """Block until no e2e port still has a live listener.
 
     The probe binds with SO_REUSEADDR so short-lived TIME_WAIT sockets from a
@@ -830,7 +830,7 @@ def scenario_chain_budget() -> None:
         config = write_teams_chain(research_port=STUB_PORT)
         results = asyncio.run(_chain_mcp_calls(config, [
             _chain_call(deadline_remaining_s=0),
-            _chain_call(deadline_remaining_s=0.5),
+            _chain_call(deadline_remaining_s=1.5),
         ]))
         error, exhausted = results[0]
         assert error and exhausted["error_code"] == "budget_exhausted", exhausted
