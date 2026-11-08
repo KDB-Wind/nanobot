@@ -819,6 +819,129 @@ def scenario_chain_budget() -> None:
         stub.shutdown()
 
 
+WRITER2_PORT = 8905
+WRITER2_KEY = secrets.token_urlsafe(24)
+
+
+def scenario_bot_init_live() -> None:
+    reset()
+    nonce = f"GEN-{secrets.token_hex(4).upper()}"
+    write_teams_v2(
+        f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions",
+        f"http://127.0.0.1:{WRITER2_PORT}/v1/chat/completions",
+    )
+    # shrink the registry to planner+research only, then let the CLI add writer2
+    registry_path = OUT / "teams.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["bots"] = [bot for bot in registry["bots"] if bot["id"] in ("planner", "research")]
+    registry_path.write_text(json.dumps(registry, indent=2), encoding="utf-8")
+
+    env = process_env()
+    env["TEAMS_WRITER2_API_KEY"] = WRITER2_KEY
+    env.pop("TEAMS_WRITER_API_KEY", None)
+    home = OUT / "writer2"
+
+    init = subprocess.run(
+        [
+            str(PY_TEAMS), "-m", "nanobot_teams", "bot", "init", "writer2",
+            "--registry", str(registry_path),
+            "--home", str(home),
+            "--port", str(WRITER2_PORT),
+            "--preset", PRESET,
+            "--role", "generated writer",
+            "--allow", "planner",
+        ],
+        capture_output=True, text=True, env=env, cwd=str(ROOT),
+    )
+    assert init.returncode == 0, init.stdout + init.stderr
+    assert (home / "config.json").exists()
+    assert "TEAMS_WRITER2_API_KEY" in init.stdout
+
+    registry_after = json.loads(registry_path.read_text(encoding="utf-8"))
+    ids = [bot["id"] for bot in registry_after["bots"]]
+    assert ids == ["planner", "research", "writer2"], ids
+
+    (home / "workspace/secret.txt").write_text(nonce, encoding="utf-8")
+
+    pre_check = subprocess.run(
+        [str(PY_TEAMS), "-m", "nanobot_teams", "check", "--config", str(registry_path)],
+        capture_output=True, text=True, env=env, cwd=str(ROOT),
+    )
+    assert "endpoint_down" in pre_check.stdout, pre_check.stdout
+
+    planner = planner_config(
+        caller="planner",
+        extra_mcp_env={"TEAMS_WRITER2_API_KEY": "${TEAMS_WRITER2_API_KEY}"},
+    )
+    research_proc = None
+    writer2_proc = None
+    planner_proc = None
+    try:
+        writer2_proc = start_nanobot("writer2", home, home / "config.json", env)
+        wait_health(WRITER2_PORT, writer2_proc, "writer2")
+
+        post_check = subprocess.run(
+            [str(PY_TEAMS), "-m", "nanobot_teams", "check", "--config", str(registry_path)],
+            capture_output=True, text=True, env=env, cwd=str(ROOT),
+        )
+        assert post_check.returncode == 0, post_check.stdout + post_check.stderr
+        assert "writer2: something answers" in post_check.stdout, post_check.stdout
+
+        planner_proc = start_nanobot("planner", OUT / "planner", planner, env)
+        wait_health(PLANNER_PORT, planner_proc, "planner")
+        answer = chat(
+            PLANNER_PORT,
+            PLANNER_KEY,
+            "planner-init",
+            "You must use the Teams tools. Call mcp_teams_delegate_task once with "
+            "bot_id writer2 and exactly this task:\n\n"
+            "Read the file secret.txt in your workspace with your file tool. "
+            "Reply with only its exact contents and nothing else.\n\n"
+            "Do not answer from your own knowledge. After the tool returns, reply "
+            "with the returned content and nothing else.",
+            timeout=420,
+        )
+        assert nonce in answer, answer
+        log("PASS bot_init_live")
+    finally:
+        stop(planner_proc)
+        stop(writer2_proc)
+        stop(research_proc)
+
+
+def scenario_check_errors() -> None:
+    reset()
+    registry_path = OUT / "teams.json"
+    registry = {
+        "schema_version": 2,
+        "team_id": "e2e",
+        "thread_key": "main",
+        "bots": [
+            {"id": "planner", "display_name": "Planner", "role": "planning"},
+            {
+                "id": "research",
+                "display_name": "Research",
+                "role": "research",
+                "model_preset": "no-such-preset",
+                "endpoint": f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions",
+                "api_key_env": "TEAMS_RESEARCH_API_KEY",
+                "allowed_callers": ["planner"],
+            },
+        ],
+    }
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+    env = {k: v for k, v in process_env().items() if not k.startswith("TEAMS_")}
+    result = subprocess.run(
+        [str(PY_TEAMS), "-m", "nanobot_teams", "check", "--config", str(registry_path)],
+        capture_output=True, text=True, env=env, cwd=str(ROOT),
+    )
+    assert result.returncode == 1, result.stdout
+    assert "missing_env" in result.stdout, result.stdout
+    assert "unknown_preset" in result.stdout, result.stdout
+    log("PASS check_errors")
+
+
 SCENARIOS = {
     "research_direct": scenario_research_direct,
     "delegate_basic": scenario_delegate_basic,
@@ -830,6 +953,8 @@ SCENARIOS = {
     "chain_abc": scenario_chain_abc,
     "chain_loop": scenario_chain_loop,
     "chain_budget": scenario_chain_budget,
+    "bot_init_live": scenario_bot_init_live,
+    "check_errors": scenario_check_errors,
     "plugin_manifest": scenario_plugin_manifest,
 }
 

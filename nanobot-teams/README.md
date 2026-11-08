@@ -236,6 +236,35 @@ A 200 response is not proof that the research succeeded. The result carries `sem
 
 `acceptance/README.md` describes the two harnesses that replay these checks against live processes, including the WebUI path.
 
+## Lifecycle tools
+
+Two CLI subcommands help set up and diagnose bots. Neither starts a process.
+
+```bash
+nanobot-teams bot init writer2 --registry D:/BotData/teams/teams.json \
+  --home D:/BotData/writer2 --port 8905 --preset step-5-preview \
+  --role "Drafting" --allow planner
+```
+
+`bot init` writes `<home>/config.json` (a serve config bound to loopback, the
+preset, workspace-restricted tools, no exec) plus `<home>/workspace`, appends
+the bot to the registry with `allowed_callers` you name, and prints a
+checklist with the API key variable and the serve command. It refuses a
+duplicate id, an unknown caller, a busy port, or a registry that stops
+validating; on refusal it writes nothing. It needs a schema 2 registry.
+
+```bash
+nanobot-teams check --config D:/BotData/teams/teams.json
+```
+
+`check` prints one finding per line as `[severity] code: message` and exits 1
+when any error-level finding exists. It loads the registry, checks the API key
+environment variables, warns when an endpoint is up or down (a stopped bot is
+a warning, not an error), flags presets that are missing from
+`~/.nanobot/config.json`, and warns when the installed nanobot differs from
+the tested baseline. `--caller` scopes the check to one bot's view and
+`--no-probe` skips the socket probes.
+
 ## Operate
 
 The server logs to stderr only. Each delegation logs the task id, bot id, duration, status, and error code. It does not log the task or the answer.

@@ -37,6 +37,8 @@ NANOBOT_TEAMS_PRESET=glm-5.3-flash python acceptance/run_e2e.py all
 | `chain_abc` | A real three-instance chain: Planner delegates to Mid, Mid reads its envelope block and delegates to Research, the answer climbs back. |
 | `chain_loop` | A continuation whose target is already in the chain is refused with `loop_detected`, no HTTP. |
 | `chain_budget` | A spent deadline fails with `budget_exhausted`; a tiny deadline clamps the wait into `timed_out`, never `completed`. |
+| `bot_init_live` | `bot init` scaffolds a bot, the generated config starts a real instance, `check` approves it, and a Planner delegates to it. |
+| `check_errors` | `check` exits 1 and names the missing key variable and the unknown preset. |
 | `plugin_manifest` | Real `discover_agent_plugins` accepts the package. |
 
 ## Unix path

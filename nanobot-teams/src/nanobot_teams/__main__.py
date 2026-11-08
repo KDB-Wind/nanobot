@@ -1,4 +1,9 @@
-"""Command line entry point: run the stdio MCP server with a registry file."""
+"""Command line entry point: run the stdio MCP server or a lifecycle tool.
+
+`nanobot-teams --config X [--caller Y]` keeps serving the MCP protocol for
+existing registrations. New subcommands: `serve` (the same, spelled out),
+`bot init`, and `check`.
+"""
 
 from __future__ import annotations
 
@@ -7,13 +12,34 @@ import asyncio
 import logging
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from .config import ConfigError, load_teams_config, resolve_api_keys, resolve_caller
+from .lifecycle import bot_init, check, print_findings
 from .server import serve
+
+_SUBCOMMANDS = ("serve", "bot", "check")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parse_args(argv)
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] in _SUBCOMMANDS:
+        return _dispatch(args)
+    return _run_server(_parse_serve(args))
+
+
+def _dispatch(args: list[str]) -> int:
+    if args[0] == "serve":
+        return _run_server(_parse_serve(args[1:]))
+    if args[0] == "check":
+        return _run_check(_parse_check(args[1:]))
+    if len(args) >= 2 and args[1] == "init":
+        return _run_bot_init(_parse_bot_init(args[2:]))
+    print("nanobot-teams bot: expected 'bot init ...'", file=sys.stderr)
+    return 2
+
+
+def _run_server(args: argparse.Namespace) -> int:
     logging.basicConfig(
         stream=sys.stderr,
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -31,14 +57,66 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="nanobot-teams")
+def _run_check(args: argparse.Namespace) -> int:
+    findings = check(Path(args.config), caller=args.caller, probe=not args.no_probe)
+    return print_findings(findings)
+
+
+def _run_bot_init(args: argparse.Namespace) -> int:
+    scaffold, findings = bot_init(
+        args.bot_id,
+        registry_path=Path(args.registry),
+        home=Path(args.home),
+        port=args.port,
+        preset=args.preset,
+        display_name=args.display_name,
+        role=args.role,
+        allowed_callers=args.allow,
+    )
+    exit_code = print_findings(findings)
+    if exit_code == 0:
+        for line in scaffold.checklist:
+            print(f"- {line}")
+    return exit_code
+
+
+def _parse_serve(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="nanobot-teams serve")
     parser.add_argument("--config", required=True, help="path to teams.json")
     parser.add_argument(
         "--caller",
         help="bot id this MCP instance acts for; required for schema 2 registries",
     )
     parser.add_argument("--verbose", action="store_true", help="log debug detail")
+    return parser.parse_args(argv)
+
+
+def _parse_check(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="nanobot-teams check")
+    parser.add_argument("--config", required=True, help="path to teams.json")
+    parser.add_argument("--caller", help="limit the check to one caller's view")
+    parser.add_argument(
+        "--no-probe", action="store_true", help="skip the endpoint socket probes"
+    )
+    return parser.parse_args(argv)
+
+
+def _parse_bot_init(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="nanobot-teams bot init")
+    parser.add_argument("bot_id", help="id of the bot to create")
+    parser.add_argument("--registry", required=True, help="path to the schema 2 teams.json")
+    parser.add_argument("--home", required=True, help="home directory to create for the bot")
+    parser.add_argument("--port", required=True, type=int, help="API port for the bot")
+    parser.add_argument("--preset", required=True, help="model preset name")
+    parser.add_argument("--display-name", help="display name; defaults to the id")
+    parser.add_argument("--role", default="", help="one-line role description")
+    parser.add_argument(
+        "--allow",
+        action="append",
+        default=[],
+        dest="allow",
+        help="bot id allowed to call the new bot; repeatable",
+    )
     return parser.parse_args(argv)
 
 
