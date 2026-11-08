@@ -29,6 +29,27 @@ _DELEGATE_TASK_SCHEMA: dict[str, Any] = {
     "properties": {
         "bot_id": {"type": "string", "description": "Bot id reported by list_bots."},
         "task": {"type": "string", "description": "Self-contained task and expected output."},
+        "parent_task_id": {
+            "type": "string",
+            "description": "Task id from the envelope block you are serving, when continuing a chain.",
+        },
+        "root_task_id": {
+            "type": "string",
+            "description": "Root task id copied from the envelope block, when continuing a chain.",
+        },
+        "hop": {
+            "type": "integer",
+            "description": "Hop number copied from the envelope block, when continuing a chain.",
+        },
+        "deadline_remaining_s": {
+            "type": "number",
+            "description": "Remaining chain budget in seconds, copied from the envelope block.",
+        },
+        "chain": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Bot chain copied from the envelope block, ending with your own id.",
+        },
     },
     "required": ["bot_id", "task"],
     "additionalProperties": False,
@@ -76,7 +97,15 @@ def build_server(delegator: Delegator) -> Server:
             task = arguments.get("task")
             if not isinstance(bot_id, str) or not isinstance(task, str):
                 return _error_result("invalid_request", "bot_id and task must be strings.")
-            result = await delegator.delegate_task(bot_id, task)
+            result = await delegator.delegate_task(
+                bot_id,
+                task,
+                parent_task_id=_optional_str(arguments.get("parent_task_id")),
+                root_task_id=_optional_str(arguments.get("root_task_id")),
+                hop=arguments.get("hop"),
+                deadline_remaining_s=arguments.get("deadline_remaining_s"),
+                chain=arguments.get("chain"),
+            )
             is_error = result.status is not OutcomeKind.completed
             return _text_result(result.to_json(), is_error=is_error)
         return _error_result("unknown_tool", "Unknown tool.")
@@ -110,6 +139,10 @@ def _text_result(text: str, *, is_error: bool) -> types.CallToolResult:
         content=[types.TextContent(type="text", text=text)],
         isError=is_error,
     )
+
+
+def _optional_str(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
 
 
 def _error_result(error_code: str, detail: str) -> types.CallToolResult:

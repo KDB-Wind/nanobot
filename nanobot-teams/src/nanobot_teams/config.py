@@ -53,8 +53,10 @@ _LIMIT_KEYS = (
     "connect_timeout_s",
     "request_timeout_s",
     "total_timeout_s",
+    "max_hops",
 )
 _BYTE_LIMITS = frozenset({"task_max_bytes", "response_max_bytes", "result_max_bytes"})
+_INT_LIMITS = frozenset({"task_max_bytes", "response_max_bytes", "result_max_bytes", "max_hops"})
 _API_PATH = "/v1/chat/completions"
 _ID_MAX = 128
 _LABEL_MAX = 256
@@ -73,6 +75,7 @@ class Limits:
     connect_timeout_s: float = 3.0
     request_timeout_s: float = 135.0
     total_timeout_s: float = 145.0
+    max_hops: int = 2
 
 
 @dataclass(frozen=True)
@@ -346,8 +349,10 @@ def _limits(value: Any) -> Limits:
             raise ConfigError(f"limits.{key} must be a number")
         if raw <= 0:
             raise ConfigError(f"limits.{key} must be positive")
-        if key in _BYTE_LIMITS and not isinstance(raw, int):
+        if key in _INT_LIMITS and not isinstance(raw, int):
             raise ConfigError(f"limits.{key} must be an integer")
+        if key == "max_hops" and not 1 <= raw <= 4:
+            raise ConfigError("limits.max_hops must be between 1 and 4")
         overrides[key] = raw
     return Limits(**overrides)
 

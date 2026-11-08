@@ -1,14 +1,15 @@
 # Nanobot Teams
 
-Nanobot Teams is a standalone stdio MCP server that delegates one task from a Planner Nanobot instance to a Research Nanobot instance. It uses only the public OpenAI-compatible HTTP API of the Research instance. It does not import nanobot, read its files, or run a second agent loop.
+Nanobot Teams is a standalone stdio MCP server that delegates tasks between Nanobot instances over their public OpenAI-compatible HTTP APIs. A registry defines the bots and who may call whom; each instance's MCP server states the bot it acts for with `--caller`. It does not import nanobot, read its files, or run a second agent loop.
 
-The Planner keeps its own identity, workspace, model, memory, and session. The Research instance keeps its own. Teams moves one user message and one answer.
+Every bot keeps its own identity, workspace, model, memory, and session. Teams moves one user message and one answer per delegation, and a chain can cross a middle hop within a hop and budget envelope.
 
 ## What it does
 
-- `list_bots` returns the allowed targets with their id, display name, and role.
+- `list_bots` returns the targets this caller may use, with id, display name, role, and capabilities.
 - `delegate_task` sends one task and waits for one answer in the same tool call.
 - The target session id is deterministic for one team, caller, target, and thread.
+- Tasks carry an envelope block (root and parent task ids, hop, remaining budget, chain) that a middle bot copies onward; the server rejects loops, over-limit hops, and spent budgets.
 - One delegation runs at a time. A second call returns `busy` immediately.
 - No retries. A timeout or an unknown result blocks later delegations until the process restarts.
 - Task, HTTP response, and returned content have fixed byte limits.
@@ -119,10 +120,32 @@ Add an optional `limits` object to override the defaults:
     "result_max_bytes": 32768,
     "connect_timeout_s": 3.0,
     "request_timeout_s": 135.0,
-    "total_timeout_s": 145.0
+    "total_timeout_s": 145.0,
+    "max_hops": 2
   }
 }
 ```
+
+## Multi-hop chains
+
+A delegation sends one task and embeds a `[teams-envelope]` block at its top:
+the chain's root task id, the id for the next hop, the parent id, the hop
+number, the remaining chain budget in seconds, and the bot chain so far. A
+middle bot that wants to pass part of the task onward copies `root_task_id`,
+`hop`, `deadline_remaining_s`, and `chain` from its block and passes
+`parent_task_id` with the block's `task_id`. The plugin skill teaches this;
+the server re-validates everything:
+
+- `hop` must stay within `limits.max_hops` (default 2). Beyond it the call fails with `hop_limit`.
+- The target must not appear in `chain`. Delegating back to an ancestor fails with `loop_detected` before any HTTP request.
+- `deadline_remaining_s` must be positive. A spent budget fails with `budget_exhausted`. The remaining budget clamps the wait for this hop, and each hop hands the next one 90% of what it received, so the deadline only shrinks.
+- A partial envelope is rejected with `envelope_invalid`; continuing a chain requires every field.
+
+The envelope values travel through the receiving model, so treat them as
+structured but untrusted input: the server enforces the invariants above
+locally and never extends a deadline it is given. Results carry `root_task_id`
+and `hop` for observability; the middle bot sees only the task and the
+upstream answer, never user identity or credentials.
 
 ## Prepare the Research instance
 

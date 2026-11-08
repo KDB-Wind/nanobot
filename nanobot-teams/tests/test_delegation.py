@@ -86,7 +86,9 @@ async def test_completed_delegation(tmp_path: Path) -> None:
 
     body = json.loads(await requests[0].aread())
     assert "model" not in body
-    assert body["messages"] == [{"role": "user", "content": "find x"}]
+    content = body["messages"][0]["content"]
+    assert content.startswith("[teams-envelope]")
+    assert content.endswith("find x")
     assert body["stream"] is False
     assert body["session_id"].startswith("teams-v1-")
 

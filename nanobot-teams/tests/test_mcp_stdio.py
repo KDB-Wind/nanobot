@@ -117,7 +117,15 @@ async def test_stdio_server_speaks_mcp(tmp_path: Path, target: tuple[Target, int
                 assert by_name["list_bots"].inputSchema["properties"] == {}
                 assert by_name["list_bots"].inputSchema["additionalProperties"] is False
                 delegate_schema = by_name["delegate_task"].inputSchema
-                assert set(delegate_schema["properties"]) == {"bot_id", "task"}
+                assert set(delegate_schema["properties"]) == {
+                    "bot_id",
+                    "task",
+                    "parent_task_id",
+                    "root_task_id",
+                    "hop",
+                    "deadline_remaining_s",
+                    "chain",
+                }
                 assert set(delegate_schema["required"]) == {"bot_id", "task"}
                 assert delegate_schema["additionalProperties"] is False
 

@@ -34,6 +34,9 @@ NANOBOT_TEAMS_PRESET=glm-5.3-flash python acceptance/run_e2e.py all
 | `unknown_block` | A 500 marks the target and a retry never reaches HTTP. |
 | `multi_bot` | A schema 2 registry with three bots; Planner delegates to two authorized targets. |
 | `unauthorized_pair` | A caller not in `allowed_callers` is refused before any HTTP. |
+| `chain_abc` | A real three-instance chain: Planner delegates to Mid, Mid reads its envelope block and delegates to Research, the answer climbs back. |
+| `chain_loop` | A continuation whose target is already in the chain is refused with `loop_detected`, no HTTP. |
+| `chain_budget` | A spent deadline fails with `budget_exhausted`; a tiny deadline clamps the wait into `timed_out`, never `completed`. |
 | `plugin_manifest` | Real `discover_agent_plugins` accepts the package. |
 
 ## Unix path

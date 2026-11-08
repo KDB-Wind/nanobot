@@ -69,7 +69,13 @@ class HttpTransport:
         )
 
     async def send(
-        self, *, endpoint: str, api_key: str, task: str, session_id: str
+        self,
+        *,
+        endpoint: str,
+        api_key: str,
+        task: str,
+        session_id: str,
+        deadline_s: float | None = None,
     ) -> TransportOutcome:
         body = {
             "messages": [{"role": "user", "content": task}],
@@ -81,8 +87,9 @@ class HttpTransport:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        budget = min(self._limits.total_timeout_s, deadline_s or self._limits.total_timeout_s)
         try:
-            async with asyncio.timeout(self._limits.total_timeout_s):
+            async with asyncio.timeout(budget):
                 async with self._client.stream(
                     "POST", endpoint, json=body, headers=headers
                 ) as response:

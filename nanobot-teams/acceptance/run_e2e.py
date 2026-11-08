@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import URLError
@@ -303,11 +304,12 @@ def start_stub(delay: float, status: int, content: str) -> ThreadingHTTPServer:
 
 
 def reset() -> None:
-    for name in ("research", "planner", "writer", "logs"):
+    for name in ("research", "planner", "writer", "mid", "logs"):
         shutil.rmtree(OUT / name, ignore_errors=True)
     (OUT / "research/workspace").mkdir(parents=True, exist_ok=True)
     (OUT / "planner/workspace").mkdir(parents=True, exist_ok=True)
     (OUT / "writer/workspace").mkdir(parents=True, exist_ok=True)
+    (OUT / "mid/workspace").mkdir(parents=True, exist_ok=True)
 
 
 def research_config() -> Path:
@@ -317,7 +319,11 @@ def research_config() -> Path:
     return path
 
 
-def planner_config(caller: str | None = None, writer_target: bool = False) -> Path:
+def planner_config(
+    caller: str | None = None,
+    writer_target: bool = False,
+    extra_mcp_env: dict[str, str] | None = None,
+) -> Path:
     config = base_config(OUT / "planner/workspace", PLANNER_PORT, "${PLANNER_API_KEY}", restrict=True)
     args = ["-m", "nanobot_teams", "--config", str(OUT / "teams.json")]
     if caller:
@@ -325,6 +331,7 @@ def planner_config(caller: str | None = None, writer_target: bool = False) -> Pa
     mcp_env = {"TEAMS_RESEARCH_API_KEY": "${TEAMS_RESEARCH_API_KEY}"}
     if writer_target:
         mcp_env["TEAMS_WRITER_API_KEY"] = "${TEAMS_WRITER_API_KEY}"
+    mcp_env.update(extra_mcp_env or {})
     config["tools"]["mcpServers"] = {
         "teams": {
             "type": "stdio",
@@ -629,6 +636,189 @@ def scenario_plugin_manifest() -> None:
     log("PASS plugin_manifest")
 
 
+MID_PORT = 8904
+MID_KEY = secrets.token_urlsafe(24)
+
+
+def write_teams_chain() -> Path:
+    path = OUT / "teams.json"
+    write_json(
+        path,
+        {
+            "schema_version": 2,
+            "team_id": "e2e-chain",
+            "thread_key": "main",
+            "bots": [
+                {"id": "planner", "display_name": "Planner", "role": "planning"},
+                {
+                    "id": "mid",
+                    "display_name": "Mid",
+                    "role": "middle hop",
+                    "endpoint": f"http://127.0.0.1:{MID_PORT}/v1/chat/completions",
+                    "api_key_env": "TEAMS_MID_API_KEY",
+                    "allowed_callers": ["planner"],
+                },
+                {
+                    "id": "research",
+                    "display_name": "Research",
+                    "role": "research",
+                    "endpoint": f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions",
+                    "api_key_env": "TEAMS_RESEARCH_API_KEY",
+                    "allowed_callers": ["planner", "mid"],
+                },
+            ],
+        },
+    )
+    return path
+
+
+def mid_config() -> Path:
+    config = base_config(OUT / "mid/workspace", MID_PORT, "${MID_API_KEY}", restrict=True)
+    config["tools"]["mcpServers"] = {
+        "teams": {
+            "type": "stdio",
+            "command": str(PY_TEAMS),
+            "args": ["-m", "nanobot_teams", "--config", str(OUT / "teams.json"), "--caller", "mid"],
+            "cwd": str(ROOT),
+            "env": {"TEAMS_RESEARCH_API_KEY": "${TEAMS_RESEARCH_API_KEY}"},
+            "toolTimeout": 180,
+            "enabledTools": ["list_bots", "delegate_task"],
+        }
+    }
+    path = OUT / "mid/config.json"
+    write_json(path, config)
+    return path
+
+
+def chain_process_env() -> dict:
+    env = process_env()
+    env["MID_API_KEY"] = MID_KEY
+    env["TEAMS_MID_API_KEY"] = MID_KEY
+    return env
+
+
+def scenario_chain_abc() -> None:
+    reset()
+    nonce = f"C-{secrets.token_hex(4).upper()}"
+    (OUT / "research/workspace/secret.txt").write_text(nonce, encoding="utf-8")
+    shutil.copytree(
+        TEAMS / "agent-plugin/nanobot-teams",
+        OUT / "mid/workspace/plugins/nanobot-teams",
+    )
+    write_teams_chain()
+    research = research_config()
+    mid = mid_config()
+    planner = planner_config(
+        caller="planner", extra_mcp_env={"TEAMS_MID_API_KEY": "${TEAMS_MID_API_KEY}"}
+    )
+    env = chain_process_env()
+    research_proc = None
+    mid_proc = None
+    planner_proc = None
+    try:
+        research_proc = start_nanobot("research", OUT / "research", research, env)
+        wait_health(RESEARCH_PORT, research_proc, "research")
+        mid_proc = start_nanobot("mid", OUT / "mid", mid, env)
+        wait_health(MID_PORT, mid_proc, "mid")
+        planner_proc = start_nanobot("planner", OUT / "planner", planner, env)
+        wait_health(PLANNER_PORT, planner_proc, "planner")
+        answer = chat(
+            PLANNER_PORT,
+            PLANNER_KEY,
+            "planner-chain",
+            "You must use the Teams tools. Call mcp_teams_delegate_task once with "
+            "bot_id mid and exactly this task:\n\n"
+            "Your task text starts with a [teams-envelope] block. Call "
+            "mcp_teams_delegate_task with bot_id research and this task:\n"
+            "Read the file secret.txt in your workspace with your file tool. "
+            "Reply with only its exact contents and nothing else.\n"
+            "Copy root_task_id, hop, deadline_remaining_s, and chain exactly from "
+            "your [teams-envelope] block into the call, and pass parent_task_id "
+            "with the block's task_id value. Do not change any value.\n"
+            "After the tool returns, reply with only the returned content.\n\n"
+            "Do not answer from your own knowledge. After the tool returns, reply "
+            "with the returned content and nothing else.",
+            timeout=420,
+        )
+        assert nonce in answer, answer
+        log("PASS chain_abc")
+    finally:
+        stop(planner_proc)
+        stop(mid_proc)
+        stop(research_proc)
+
+
+async def _chain_mcp_calls(config: Path, calls: list[dict]) -> list[tuple[bool, dict]]:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    params = StdioServerParameters(
+        command=str(PY_TEAMS),
+        args=["-m", "nanobot_teams", "--config", str(config), "--caller", "mid"],
+        env={**os.environ, "TEAMS_RESEARCH_API_KEY": RESEARCH_KEY},
+        cwd=str(OUT),
+    )
+    results: list[tuple[bool, dict]] = []
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            for call in calls:
+                result = await session.call_tool("delegate_task", call)
+                results.append((result.isError, json.loads(result.content[0].text)))
+    return results
+
+
+def _chain_call(**overrides) -> dict:
+    call: dict = {
+        "bot_id": "research",
+        "task": "should not matter",
+        "parent_task_id": str(uuid.uuid4()),
+        "root_task_id": str(uuid.uuid4()),
+        "hop": 2,
+        "deadline_remaining_s": 60.0,
+        "chain": ["planner", "mid"],
+    }
+    call.update(overrides)
+    return call
+
+
+def scenario_chain_loop() -> None:
+    reset()
+    stub = start_stub(0.0, 200, "unused")
+    try:
+        config = write_teams_chain()
+        results = asyncio.run(_chain_mcp_calls(config, [
+            _chain_call(chain=["research", "mid"]),
+        ]))
+        error, payload = results[0]
+        assert error and payload["error_code"] == "loop_detected", payload
+        assert StubHandler.hits == 0, StubHandler.hits
+        log("PASS chain_loop")
+    finally:
+        stub.shutdown()
+
+
+def scenario_chain_budget() -> None:
+    reset()
+    stub = start_stub(3.0, 200, "unused")
+    try:
+        config = write_teams_chain()
+        results = asyncio.run(_chain_mcp_calls(config, [
+            _chain_call(deadline_remaining_s=0),
+            _chain_call(deadline_remaining_s=0.5),
+        ]))
+        error, exhausted = results[0]
+        assert error and exhausted["error_code"] == "budget_exhausted", exhausted
+        error, timed_out = results[1]
+        assert error and timed_out["status"] == "timed_out", timed_out
+        assert timed_out["error_code"] == "deadline_exceeded", timed_out
+        assert timed_out["status"] != "completed"
+        assert StubHandler.hits == 1, StubHandler.hits
+        log("PASS chain_budget")
+    finally:
+        stub.shutdown()
+
+
 SCENARIOS = {
     "research_direct": scenario_research_direct,
     "delegate_basic": scenario_delegate_basic,
@@ -637,6 +827,9 @@ SCENARIOS = {
     "unknown_block": scenario_unknown_block,
     "multi_bot": scenario_multi_bot,
     "unauthorized_pair": scenario_unauthorized_pair,
+    "chain_abc": scenario_chain_abc,
+    "chain_loop": scenario_chain_loop,
+    "chain_budget": scenario_chain_budget,
     "plugin_manifest": scenario_plugin_manifest,
 }
 
