@@ -256,7 +256,13 @@ async def test_list_bots_hides_target_details(tmp_path: Path) -> None:
         await transport.aclose()
 
     assert listed == [
-        {"id": "research", "display_name": "Research", "role": "research", "capabilities": []}
+        {
+            "id": "research",
+            "display_name": "Research",
+            "role": "research",
+            "capabilities": [],
+            "model_preset": None,
+        }
     ]
     assert "endpoint" not in json.dumps(listed)
 

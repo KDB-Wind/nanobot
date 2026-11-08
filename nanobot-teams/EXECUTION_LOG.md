@@ -309,3 +309,17 @@ S0–S6 全部交付。改动全部位于 `nanobot-teams/`(基线 `9c2e90082` �
 零私有文件读写(静态扫描测试持续生效)。仅本地提交,未 push、未打 tag。
 `BLOCKERS.md` 记录 4 项未验证子项(CI 未运行、WebUI 未在 Unix 复跑、
 只读页面按可选项未交付、wheel 未发布)。
+
+
+## 复审修复(2026-11-08)
+
+外部复审发现 6 项缺陷,已修复并补回归:
+
+1. 账本 `started_at` 误用 `time.monotonic()` 当墙钟(显示 1970 年)。改为进度用 monotonic、记录用 `datetime.now(UTC)`;`test_ledger_started_at_is_wall_clock`。
+2. `bot init` 的 registry allowlist 漏 `budgets`,合法的 schema 2 文件被拒。补齐,并把完整 registry 校验移到任何落盘之前;`test_bot_init_preserves_budgets`、`test_bot_init_invalid_capability_writes_nothing`。
+3. `bot init` 不带 `--role` 时用空串,校验失败且已写 home。`--role` 改为必填,函数层也拒绝空值;`test_bot_init_empty_role_writes_nothing`。
+4. `bot init` 把 provider 的明文 `apiKey` 复制进新配置。改为 `${PROVIDER_API_KEY}` 引用并写进 checklist;验收 harness 同样改为引用,进程环境注入真实值;`test_bot_init_creates_skeleton_and_extends_registry`、`test_bot_init_keeps_existing_provider_key_reference`。
+5. `audit`/`budget` 对不存在的 ledger 建库并报 total=0。改为跳过缺失文件并打印 `missing:`;`test_audit_missing_ledger_is_not_created`。
+6. `list_bots` 没有返回 `model_preset`,且 `bot init` 不写入该元数据。补上,并新增 `--capability`;`test_list_bots_surfaces_model_preset`。
+
+验收:`pytest -q` 152 passed;`ruff` clean;`run_e2e.py all` 16/16;`run_webui.py` PASS。`.e2e` 下的生成配置现在只含 env 引用,不再含明文 provider key。

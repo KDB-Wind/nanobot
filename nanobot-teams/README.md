@@ -244,7 +244,7 @@ Two CLI subcommands help set up and diagnose bots. Neither starts a process.
 ```bash
 nanobot-teams bot init writer2 --registry D:/BotData/teams/teams.json \
   --home D:/BotData/writer2 --port 8905 --preset step-5-preview \
-  --role "Drafting" --allow planner
+  --role "Drafting" --capability drafting --allow planner
 ```
 
 `bot init` writes `<home>/config.json` (a serve config bound to loopback, the
@@ -252,7 +252,9 @@ preset, workspace-restricted tools, no exec) plus `<home>/workspace`, appends
 the bot to the registry with `allowed_callers` you name, and prints a
 checklist with the API key variable and the serve command. It refuses a
 duplicate id, an unknown caller, a busy port, or a registry that stops
-validating; on refusal it writes nothing. It needs a schema 2 registry.
+validating; on a validation refusal it writes nothing. It needs a schema 2 registry.
+The generated provider block references the provider key as `${PROVIDER_API_KEY}`
+instead of copying it; export that variable before starting the bot.
 
 ```bash
 nanobot-teams check --config D:/BotData/teams/teams.json
@@ -349,6 +351,7 @@ To uninstall, remove the plugin directory and the `nanobot-teams` distribution. 
 - Each instance resolves credentials only for targets its caller is authorized to reach. A middle-hop bot never holds keys for bots it cannot call. Research holds no Planner key and no Teams outbound tools unless you register them.
 - The transport does not use environment proxies, does not follow redirects, and does not retry. The Bearer token and task cannot be forwarded to another host by the client. Endpoints stay pinned to loopback.
 - Envelope values (hop, deadline, chain) travel through the receiving model. The server validates their shape and enforces hop, loop, and budget bounds locally, but cannot prove they are the values the upstream generated. Treat them as caps, not as authenticated ancestry.
+- `bot init` writes the provider API key as an environment reference, not a literal key.
 - The ledger stores ids, counts, and timings only. Task text, answers, and credentials never enter it, and the acceptance scenario checks the database bytes for their absence.
 - Budgets count ledger rows, so they bound what this installation spent. They are not a distributed quota: two MCP processes sharing one ledger file have no cross-process lock.
 - `bot init` and `check` write and read only the paths the operator names. `check` probes endpoints with plain TCP connects.

@@ -57,11 +57,19 @@ def user_config() -> dict:
     return json.loads(USER_CONFIG.read_text(encoding="utf-8"))
 
 
+def _provider_env_name(name: str) -> str:
+    safe = "".join(char if char.isalnum() else "_" for char in name).upper()
+    return f"{safe}_API_KEY"
+
+
 def provider_config(preset: dict, source: dict) -> dict:
     provider = dict(source["providers"][preset["provider"]])
     override = os.environ.get("NANOBOT_TEAMS_API_BASE")
     if override:
         provider["apiBase"] = override
+    key = provider.get("apiKey")
+    if isinstance(key, str) and key and not (key.startswith("$" + "{") and key.endswith("}")):
+        provider["apiKey"] = "$" + "{" + _provider_env_name(preset["provider"]) + "}"
     return provider
 
 
@@ -180,6 +188,11 @@ def process_env() -> dict:
     env["WRITER_API_KEY"] = WRITER_KEY
     env["TEAMS_RESEARCH_API_KEY"] = RESEARCH_KEY
     env["TEAMS_WRITER_API_KEY"] = WRITER_KEY
+    for name, block in (user_config().get("providers") or {}).items():
+        if isinstance(block, dict):
+            key = block.get("apiKey")
+            if isinstance(key, str) and key and not key.startswith("$" + "{"):
+                env[_provider_env_name(name)] = key
     return env
 
 

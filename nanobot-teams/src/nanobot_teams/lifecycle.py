@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 from .config import BotConfig, ConfigError, load_teams_config
 
 TESTED_NANOBOT = "0.4.1"
-_REGISTRY_KEYS = ("schema_version", "team_id", "thread_key", "bots", "limits")
+_REGISTRY_KEYS = ("schema_version", "team_id", "thread_key", "bots", "limits", "budgets")
 _BOT_KEYS = ("id", "display_name", "role", "capabilities", "model_preset", "endpoint", "api_key_env", "allowed_callers")
 
 
@@ -71,14 +71,21 @@ def bot_init(
     display_name: str | None = None,
     role: str = "",
     allowed_callers: Sequence[str] = (),
+    capabilities: Sequence[str] = (),
+    user_config: Path | None = None,
 ) -> tuple[Scaffold, list[Finding]]:
     """Generate the bot skeleton, extend the registry, and return the checklist.
 
-    On any error finding nothing is written and the scaffold carries the
-    command shape only. The registry is rewritten only when the whole updated
-    document passes the schema 2 loader.
+    The registry is validated in full before anything is written, so a schema
+    refusal leaves no home directory behind. The generated provider block
+    references credentials through an environment variable instead of copying
+    the user's literal API key.
     """
     findings: list[Finding] = []
+    if not role.strip():
+        findings.append(
+            Finding("bad_role", "error", "role must be a non-empty one-line description")
+        )
     if port_in_use("127.0.0.1", port):
         findings.append(
             Finding("port_busy", "error", f"port {port} on 127.0.0.1 already answers connections")
@@ -109,28 +116,51 @@ def bot_init(
         return _scaffold(bot_id, home, port, registry_path, ()), findings
 
     api_key_env = api_key_env_for(bot_id)
-    user_config = _load_json(user_config_path())
+    source_config = user_config or user_config_path()
+    user = _load_json(source_config)
     preset_block = None
     provider_block: dict = {}
+    provider_key_env: str | None = None
     model = ""
-    if isinstance(user_config, dict):
-        presets = user_config.get("modelPresets") or {}
+    if isinstance(user, dict):
+        presets = user.get("modelPresets") or {}
         if preset in presets:
             preset_block = presets[preset]
-            model = preset_block.get("model", "")
-            provider_name = preset_block.get("provider")
-            providers = user_config.get("providers") or {}
-            if provider_name in providers:
-                provider_block = {provider_name: providers[provider_name]}
+            if isinstance(preset_block, dict):
+                model = preset_block.get("model", "")
+                provider_name = preset_block.get("provider")
+                providers = user.get("providers") or {}
+                if provider_name in providers:
+                    block, provider_key_env = _provider_for_scaffold(
+                        providers[provider_name], provider_name
+                    )
+                    provider_block = {provider_name: block}
         else:
             findings.append(
                 Finding(
                     "unknown_preset",
                     "warn",
-                    f"preset {preset!r} is not in {user_config_path()}; the generated config "
+                    f"preset {preset!r} is not in {source_config}; the generated config "
                     "still names it, fix the model blocks before starting",
                 )
             )
+
+    entry = {
+        "id": bot_id,
+        "display_name": display_name or bot_id.replace("-", " ").replace("_", " ").title(),
+        "role": role,
+        **({"capabilities": list(capabilities)} if capabilities else {}),
+        "model_preset": preset,
+        "endpoint": f"http://127.0.0.1:{port}/v1/chat/completions",
+        "api_key_env": api_key_env,
+        "allowed_callers": list(allowed_callers),
+    }
+    updated = {**registry, "bots": [*registry.get("bots", []), entry]}
+    try:
+        registry_text = _registry_text(updated)
+    except ConfigError as exc:
+        findings.append(Finding("registry_invalid", "error", str(exc)))
+        return _scaffold(bot_id, home, port, registry_path, ()), findings
 
     home.mkdir(parents=True, exist_ok=True)
     workspace = (home / "workspace").resolve()
@@ -159,7 +189,7 @@ def bot_init(
             "host": "127.0.0.1",
             "port": port,
             "timeout": 120,
-            "apiKey": f"${{{api_key_env}}}",
+            "apiKey": "$" + "{" + api_key_env + "}",
         },
         "gateway": {"host": "127.0.0.1", "port": port + 1000, "restartMode": "exit"},
         "tools": {"restrictToWorkspace": True, "exec": {"enable": False}, "mcpServers": {}},
@@ -167,18 +197,16 @@ def bot_init(
     }
     (home / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    entry = {
-        "id": bot_id,
-        "display_name": display_name or bot_id.replace("-", " ").replace("_", " ").title(),
-        "role": role,
-        "endpoint": f"http://127.0.0.1:{port}/v1/chat/completions",
-        "api_key_env": api_key_env,
-        "allowed_callers": list(allowed_callers),
-    }
     try:
-        _write_registry(registry_path, {**registry, "bots": [*registry.get("bots", []), entry]})
-    except ConfigError as exc:
-        findings.append(Finding("registry_invalid", "error", str(exc)))
+        registry_path.write_text(registry_text, encoding="utf-8")
+    except OSError as exc:
+        findings.append(
+            Finding(
+                "registry_write_failed",
+                "error",
+                f"cannot write {registry_path}: {exc.strerror or 'write failed'}",
+            )
+        )
         return _scaffold(bot_id, home, port, registry_path, ()), findings
 
     checklist = (
@@ -191,7 +219,30 @@ def bot_init(
         f"and --config {registry_path} in its config",
         f"model preset: {preset}",
     )
+    if provider_key_env:
+        checklist = (
+            *checklist,
+            f"export {provider_key_env} with the provider key before starting the bot",
+        )
     return _scaffold(bot_id, home, port, registry_path, checklist), findings
+
+
+def _provider_for_scaffold(
+    block: Mapping[str, object], provider_name: str
+) -> tuple[dict, str | None]:
+    """Copy a provider block, replacing a literal API key with an env reference."""
+    copied = json.loads(json.dumps(block))
+    if not isinstance(copied, dict):
+        return {}, None
+    key = copied.get("apiKey")
+    if not isinstance(key, str) or not key:
+        return copied, None
+    if key.startswith("$" + "{") and key.endswith("}"):
+        return copied, key[2:-1]
+    safe = "".join(char if char.isalnum() else "_" for char in provider_name).upper()
+    env_name = f"{safe}_API_KEY"
+    copied["apiKey"] = "$" + "{" + env_name + "}"
+    return copied, env_name
 
 
 def check(
@@ -303,7 +354,7 @@ def _read_registry(path: Path) -> dict:
     return raw
 
 
-def _write_registry(path: Path, updated: dict) -> None:
+def _registry_text(updated: dict) -> str:
     _reject_keys(updated, _REGISTRY_KEYS, "registry")
     for index, bot in enumerate(updated["bots"]):
         _reject_keys(bot, _BOT_KEYS, f"bots[{index}]")
@@ -311,7 +362,7 @@ def _write_registry(path: Path, updated: dict) -> None:
         probe_path = Path(tmp) / "probe.json"
         probe_path.write_text(json.dumps(updated), encoding="utf-8")
         load_teams_config(probe_path)
-    path.write_text(json.dumps(updated, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
 
 
 def _load_json(path: Path) -> dict | None:

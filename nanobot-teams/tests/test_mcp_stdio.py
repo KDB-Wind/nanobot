@@ -153,6 +153,7 @@ async def test_stdio_server_speaks_mcp(tmp_path: Path, target: tuple[Target, int
                             "display_name": "Research",
                             "role": "research",
                             "capabilities": [],
+                            "model_preset": None,
                         }
                     ]
                 }

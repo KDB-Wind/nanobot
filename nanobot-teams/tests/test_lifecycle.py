@@ -30,10 +30,29 @@ def write_registry(tmp_path: Path, data: dict | None = None) -> Path:
     return path
 
 
+def write_user_config(tmp_path: Path, key: str = "literal-secret") -> Path:
+    path = tmp_path / "user.json"
+    path.write_text(
+        json.dumps(
+            {
+                "modelPresets": {
+                    "step-5-preview": {"model": "step-5-preview", "provider": "demo"}
+                },
+                "providers": {
+                    "demo": {"apiKey": key, "apiBase": "https://example.invalid/v1"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_bot_init_creates_skeleton_and_extends_registry(tmp_path: Path) -> None:
     registry = write_registry(tmp_path)
     home = tmp_path / "writer2"
 
+    user_config = write_user_config(tmp_path)
     scaffold, findings = bot_init(
         "writer2",
         registry_path=registry,
@@ -42,12 +61,16 @@ def test_bot_init_creates_skeleton_and_extends_registry(tmp_path: Path) -> None:
         preset="step-5-preview",
         role="drafting",
         allowed_callers=["planner"],
+        capabilities=["draft"],
+        user_config=user_config,
     )
 
     assert [f for f in findings if f.severity == "error"] == []
     config = json.loads((home / "config.json").read_text(encoding="utf-8"))
     assert config["api"]["port"] == 59905
     assert config["api"]["apiKey"] == "${TEAMS_WRITER2_API_KEY}"
+    assert config["providers"]["demo"]["apiKey"] == "${DEMO_API_KEY}"
+    assert "literal-secret" not in json.dumps(config)
     assert (home / "workspace").is_dir()
     assert config["agents"]["defaults"]["workspace"] == str((home / "workspace").resolve())
 
@@ -56,7 +79,10 @@ def test_bot_init_creates_skeleton_and_extends_registry(tmp_path: Path) -> None:
     assert writer2 is not None
     assert writer2.api_key_env == "TEAMS_WRITER2_API_KEY"
     assert writer2.allowed_callers == ("planner",)
+    assert writer2.model_preset == "step-5-preview"
+    assert writer2.capabilities == ("draft",)
     assert "TEAMS_WRITER2_API_KEY" in "\n".join(scaffold.checklist)
+    assert "DEMO_API_KEY" in "\n".join(scaffold.checklist)
     assert "nanobot --home" in scaffold.serve_command
 
 
@@ -71,6 +97,7 @@ def test_bot_init_duplicate_refused_and_writes_nothing(tmp_path: Path) -> None:
         home=home,
         port=59906,
         preset="step-5-preview",
+        role="drafting",
     )
 
     assert any(f.code == "duplicate_bot" and f.severity == "error" for f in findings)
@@ -86,6 +113,7 @@ def test_bot_init_unknown_caller_refused(tmp_path: Path) -> None:
         home=tmp_path / "writer2",
         port=59907,
         preset="step-5-preview",
+        role="drafting",
         allowed_callers=["ghost"],
     )
     assert any(f.code == "bad_caller" for f in findings)
@@ -107,6 +135,7 @@ def test_bot_init_needs_schema_2(tmp_path: Path) -> None:
         home=tmp_path / "writer2",
         port=59908,
         preset="step-5-preview",
+        role="drafting",
     )
     assert any(f.code == "registry_invalid" for f in findings)
 
@@ -238,3 +267,85 @@ def test_cli_routing_smoke() -> None:
             timeout=30,
         )
         assert result.returncode == expected, (args, result.returncode, result.stderr)
+
+
+def test_bot_init_preserves_budgets(tmp_path: Path) -> None:
+    data = {**REGISTRY, "budgets": {"planner": {"delegations": 3}}}
+    registry = write_registry(tmp_path, data)
+
+    _, findings = bot_init(
+        "writer3",
+        registry_path=registry,
+        home=tmp_path / "writer3",
+        port=59909,
+        preset="step-5-preview",
+        role="drafting",
+        allowed_callers=["planner"],
+        user_config=write_user_config(tmp_path),
+    )
+
+    assert [f for f in findings if f.severity == "error"] == []
+    assert json.loads(registry.read_text(encoding="utf-8"))["budgets"] == {
+        "planner": {"delegations": 3}
+    }
+    assert load_teams_config(registry).bot("writer3") is not None
+
+
+def test_bot_init_empty_role_writes_nothing(tmp_path: Path) -> None:
+    registry = write_registry(tmp_path)
+    before = registry.read_text(encoding="utf-8")
+    home = tmp_path / "norole"
+
+    _, findings = bot_init(
+        "writer3",
+        registry_path=registry,
+        home=home,
+        port=59910,
+        preset="step-5-preview",
+        role="",
+    )
+
+    assert any(f.code == "bad_role" and f.severity == "error" for f in findings)
+    assert not home.exists()
+    assert registry.read_text(encoding="utf-8") == before
+
+
+def test_bot_init_invalid_capability_writes_nothing(tmp_path: Path) -> None:
+    registry = write_registry(tmp_path)
+    before = registry.read_text(encoding="utf-8")
+    home = tmp_path / "badcap"
+
+    _, findings = bot_init(
+        "writer3",
+        registry_path=registry,
+        home=home,
+        port=59911,
+        preset="step-5-preview",
+        role="drafting",
+        capabilities=["Bad Token"],
+        user_config=write_user_config(tmp_path),
+    )
+
+    assert any(f.code == "registry_invalid" and f.severity == "error" for f in findings)
+    assert not home.exists()
+    assert registry.read_text(encoding="utf-8") == before
+
+
+def test_bot_init_keeps_existing_provider_key_reference(tmp_path: Path) -> None:
+    registry = write_registry(tmp_path)
+    home = tmp_path / "writer4"
+
+    _, findings = bot_init(
+        "writer4",
+        registry_path=registry,
+        home=home,
+        port=59912,
+        preset="step-5-preview",
+        role="drafting",
+        allowed_callers=["planner"],
+        user_config=write_user_config(tmp_path, key="${STEPFUN_API_KEY}"),
+    )
+
+    assert [f for f in findings if f.severity == "error"] == []
+    config = json.loads((home / "config.json").read_text(encoding="utf-8"))
+    assert config["providers"]["demo"]["apiKey"] == "${STEPFUN_API_KEY}"

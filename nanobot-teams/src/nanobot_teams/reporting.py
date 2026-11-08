@@ -41,6 +41,7 @@ def render_budget(config: TeamConfig, ledger_paths: Sequence[Path]) -> str:
     rows: list[str] = []
     header = f"{'bot':<16} {'delegations':<16} {'result_bytes':<22} {'chain_seconds':<18}"
     rows.append(header)
+    missing = [str(path) for path in ledger_paths if not Path(path).exists()]
     usage = _combined_usage(ledger_paths)
     for bot in config.bots:
         budget = config.budgets.get(bot.id)
@@ -50,6 +51,8 @@ def render_budget(config: TeamConfig, ledger_paths: Sequence[Path]) -> str:
             f" {_pair(result_bytes, budget.result_bytes if budget else None, '')}"
             f" {_pair(round(seconds, 1), budget.chain_seconds if budget else None, 's')}"
         )
+    if missing:
+        rows.append("missing: " + ", ".join(missing))
     return "\n".join(rows)
 
 
@@ -61,7 +64,10 @@ def render_audit(
     status: str | None = None,
 ) -> str:
     rows: list[tuple[str, object]] = []
+    missing = [str(path) for path in ledger_paths if not Path(path).exists()]
     for path in ledger_paths:
+        if not Path(path).exists():
+            continue
         ledger = Ledger(path)
         try:
             for record in ledger.list_tasks(limit=limit, target=target, status=status):
@@ -81,6 +87,8 @@ def render_audit(
     for _, record in bounded:
         counts[record.status] = counts.get(record.status, 0) + 1
     summary = "  ".join(f"{name}={count}" for name, count in sorted(counts.items()))
+    if missing:
+        lines.append("missing: " + ", ".join(missing))
     lines.append(f"total={len(bounded)}  {summary}")
     return "\n".join(lines)
 
@@ -88,7 +96,8 @@ def render_audit(
 def _combined_usage(ledger_paths: Sequence[Path]) -> dict[str, tuple[int, int, float]]:
     usage: dict[str, tuple[int, int, float]] = {}
     callers: set[str] = set()
-    for path in ledger_paths:
+    existing = [path for path in ledger_paths if Path(path).exists()]
+    for path in existing:
         ledger = Ledger(path)
         try:
             ledger_callers = ledger.list_tasks(limit=500)
@@ -98,7 +107,7 @@ def _combined_usage(ledger_paths: Sequence[Path]) -> dict[str, tuple[int, int, f
             callers.add(record.caller)
     for caller in callers:
         total = [0, 0, 0.0]
-        for path in ledger_paths:
+        for path in existing:
             ledger = Ledger(path)
             try:
                 count, result_bytes, seconds = ledger.usage_for(caller)

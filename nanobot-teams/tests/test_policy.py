@@ -207,3 +207,50 @@ def test_usage_for_signals_unreadable_ledger() -> None:
     assert ledger.usage_for("planner") == (0, 0, 0.0)
     ledger._conn = BrokenConn()
     assert ledger.usage_for("planner") is None
+
+
+def test_ledger_started_at_is_wall_clock(tmp_path: Path) -> None:
+    from datetime import datetime
+
+    config = load(tmp_path, registry_data())
+    ledger = Ledger(tmp_path / "ledger.sqlite3")
+    transport = HttpTransport(config.limits, transport=httpx.MockTransport(_ok))
+    delegator = Delegator(config, transport, {"research": SECRET}, "planner", ledger=ledger)
+    try:
+        import asyncio
+
+        asyncio.run(delegator.delegate_task("research", "one"))
+    finally:
+        import asyncio
+
+        asyncio.run(transport.aclose())
+
+    record = ledger.list_tasks()[0]
+    ledger.close()
+    assert datetime.fromisoformat(record.started_at).year >= 2024
+
+
+def test_audit_missing_ledger_is_not_created(tmp_path: Path) -> None:
+    config = load(tmp_path, registry_data(budgets={"planner": {"delegations": 2}}))
+    missing = tmp_path / "missing.sqlite3"
+
+    audit = render_audit([missing])
+    budget = render_budget(config, [missing])
+
+    assert not missing.exists()
+    assert "missing:" in audit
+    assert "missing:" in budget
+
+
+def test_list_bots_surfaces_model_preset(tmp_path: Path) -> None:
+    data = registry_data()
+    data["bots"][1]["model_preset"] = "step-5-preview"
+    config = load(tmp_path, data)
+    transport = HttpTransport(config.limits, transport=httpx.MockTransport(_ok))
+    delegator = Delegator(config, transport, {"research": SECRET}, "planner")
+    try:
+        assert delegator.list_bots()[0]["model_preset"] == "step-5-preview"
+    finally:
+        import asyncio
+
+        asyncio.run(transport.aclose())

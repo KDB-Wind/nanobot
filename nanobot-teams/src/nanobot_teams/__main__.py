@@ -84,6 +84,7 @@ def _run_bot_init(args: argparse.Namespace) -> int:
         display_name=args.display_name,
         role=args.role,
         allowed_callers=args.allow,
+        capabilities=args.capability,
     )
     exit_code = print_findings(findings)
     if exit_code == 0:
@@ -197,7 +198,14 @@ def _parse_bot_init(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--port", required=True, type=int, help="API port for the bot")
     parser.add_argument("--preset", required=True, help="model preset name")
     parser.add_argument("--display-name", help="display name; defaults to the id")
-    parser.add_argument("--role", default="", help="one-line role description")
+    parser.add_argument("--role", required=True, help="one-line role description")
+    parser.add_argument(
+        "--capability",
+        action="append",
+        default=[],
+        dest="capability",
+        help="short capability token; repeatable",
+    )
     parser.add_argument(
         "--allow",
         action="append",

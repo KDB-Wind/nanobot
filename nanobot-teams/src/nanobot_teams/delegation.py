@@ -8,6 +8,7 @@ import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import BotConfig, TeamConfig
@@ -135,6 +136,7 @@ class Delegator:
                 "display_name": bot.display_name,
                 "role": bot.role,
                 "capabilities": list(bot.capabilities),
+                "model_preset": bot.model_preset,
             }
             for bot in self._config.targets_for(self._caller_id)
         ]
@@ -197,6 +199,7 @@ class Delegator:
 
         self._busy = True
         started = time.monotonic()
+        started_at = datetime.now(tz=timezone.utc).isoformat()
         try:
             outcome = await self._transport.send(
                 endpoint=_endpoint_of(target),
@@ -212,7 +215,7 @@ class Delegator:
             self._blocked = True
         result = _from_outcome(task_id, bot_id, outcome, envelope)
         duration_ms = int((time.monotonic() - started) * 1000)
-        self._record(result, envelope, outcome, started, duration_ms)
+        self._record(result, envelope, outcome, started_at, duration_ms)
         self._log(result, duration_ms, outcome)
         return result
 
@@ -232,11 +235,9 @@ class Delegator:
         result: DelegationResult,
         envelope: Any,
         outcome: TransportOutcome,
-        started: float,
+        started_at: str,
         duration_ms: int,
     ) -> None:
-        from datetime import datetime, timezone
-
         if not self._ledger.enabled:
             return
         self._ledger.record(
@@ -254,7 +255,7 @@ class Delegator:
                 request_bytes=outcome.request_bytes,
                 response_bytes=outcome.response_bytes,
                 result_bytes=len(result.content.encode("utf-8")),
-                started_at=datetime.fromtimestamp(started, tz=timezone.utc).isoformat(),
+                started_at=started_at,
                 finished_at=datetime.now(tz=timezone.utc).isoformat(),
                 duration_ms=duration_ms,
             )

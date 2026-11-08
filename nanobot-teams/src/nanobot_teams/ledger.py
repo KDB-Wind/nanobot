@@ -10,10 +10,13 @@ process saw, not what the remote bot eventually did.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+_LOGGER = logging.getLogger("nanobot_teams.ledger")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -132,7 +135,8 @@ class Ledger:
                     entry.duration_ms,
                 ),
             )
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _LOGGER.error("ledger write failed: %s", exc)
             return
 
     def list_tasks(self, limit: int = 50, target: str | None = None, status: str | None = None) -> list[TaskRecord]:
