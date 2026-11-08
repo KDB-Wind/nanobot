@@ -24,8 +24,10 @@ def test_no_nanobot_imports() -> None:
 
 
 def test_no_filesystem_writes_in_src() -> None:
-    # lifecycle.py is the operator-facing CLI: bot init writes the skeleton
-    # the operator asked for. Every runtime module stays write-free.
+    # lifecycle.py is the operator-facing CLI (bot init writes the skeleton the
+    # operator asked for) and ledger.py keeps the opt-in SQLite ledger; both
+    # write only where an operator points them. Every other module stays
+    # write-free.
     writes = re.compile(
         r"\.(?:write_text|write_bytes|mkdir|rmdir|unlink|rename|replace|touch)\s*\("
         r"|os\.(?:remove|rename|replace|makedirs|mkdir|rmdir|unlink)\s*\("
@@ -35,7 +37,7 @@ def test_no_filesystem_writes_in_src() -> None:
     offenders = [
         f"{path.name}:{number}"
         for path in sorted(SRC.glob("*.py"))
-        if path.name != "lifecycle.py"
+        if path.name not in {"lifecycle.py", "ledger.py"}
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
         if writes.search(line)
     ]

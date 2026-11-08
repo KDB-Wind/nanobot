@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .config import ConfigError, load_teams_config, resolve_api_keys, resolve_caller
+from .ledger import Ledger
 from .lifecycle import bot_init, check, print_findings
 from .server import serve
 
@@ -53,7 +54,12 @@ def _run_server(args: argparse.Namespace) -> int:
         print(f"nanobot-teams: {exc}", file=sys.stderr)
         return 2
 
-    asyncio.run(serve(config, api_keys, caller_id))
+    ledger = Ledger(args.ledger) if args.ledger else None
+    try:
+        asyncio.run(serve(config, api_keys, caller_id, ledger=ledger))
+    finally:
+        if ledger is not None:
+            ledger.close()
     return 0
 
 
@@ -86,6 +92,10 @@ def _parse_serve(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--caller",
         help="bot id this MCP instance acts for; required for schema 2 registries",
+    )
+    parser.add_argument(
+        "--ledger",
+        help="path to the SQLite ledger; without it no delegation is recorded",
     )
     parser.add_argument("--verbose", action="store_true", help="log debug detail")
     return parser.parse_args(argv)

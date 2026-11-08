@@ -19,6 +19,7 @@ from .envelope import (
     task_with_preamble,
     validate_continuation,
 )
+from .ledger import Ledger, TaskRecord
 from .transport import HttpTransport, OutcomeKind, TransportOutcome
 
 SEMANTIC_STATUS = "unverified"
@@ -90,14 +91,24 @@ class Delegator:
         api_keys: Mapping[str, str],
         caller_id: str,
         logger: logging.Logger | None = None,
+        ledger: Ledger | None = None,
     ) -> None:
         self._config = config
         self._transport = transport
         self._api_keys = dict(api_keys)
         self._caller_id = caller_id
         self._logger = logger or logging.getLogger("nanobot_teams.delegation")
+        self._ledger = ledger or Ledger(None)
         self._busy = False
         self._blocked = False
+
+    def list_tasks(
+        self, limit: int = 50, target: str | None = None, status: str | None = None
+    ) -> list[TaskRecord]:
+        return self._ledger.list_tasks(limit=limit, target=target, status=status)
+
+    def get_task(self, task_id: str) -> TaskRecord | None:
+        return self._ledger.get_task(task_id)
 
     def list_bots(self) -> list[dict[str, Any]]:
         return [
@@ -178,7 +189,9 @@ class Delegator:
         if outcome.blocks_future:
             self._blocked = True
         result = _from_outcome(task_id, bot_id, outcome, envelope)
-        self._log(result, (time.monotonic() - started) * 1000)
+        duration_ms = int((time.monotonic() - started) * 1000)
+        self._record(result, envelope, outcome, started, duration_ms)
+        self._log(result, duration_ms, outcome)
         return result
 
     def _refuse(self, task_id: str, bot_id: str, error_code: str, detail: str) -> DelegationResult:
@@ -189,19 +202,57 @@ class Delegator:
             error_code=error_code,
             detail=detail,
         )
-        self._log(result, 0.0)
+        self._log(result, 0.0, TransportOutcome(OutcomeKind.failed, error_code=error_code))
         return result
 
-    def _log(self, result: DelegationResult, duration_ms: float) -> None:
+    def _record(
+        self,
+        result: DelegationResult,
+        envelope: Any,
+        outcome: TransportOutcome,
+        started: float,
+        duration_ms: int,
+    ) -> None:
+        from datetime import datetime, timezone
+
+        if not self._ledger.enabled:
+            return
+        self._ledger.record(
+            TaskRecord(
+                task_id=result.task_id,
+                root_task_id=envelope.root_task_id,
+                parent_task_id=envelope.parent_task_id,
+                caller=self._caller_id,
+                target=result.bot_id,
+                hop=envelope.hop,
+                status=result.status.value,
+                error_code=result.error_code,
+                truncated=result.truncated,
+                http_sent=outcome.http_sent,
+                request_bytes=outcome.request_bytes,
+                response_bytes=outcome.response_bytes,
+                result_bytes=len(result.content.encode("utf-8")),
+                started_at=datetime.fromtimestamp(started, tz=timezone.utc).isoformat(),
+                finished_at=datetime.now(tz=timezone.utc).isoformat(),
+                duration_ms=duration_ms,
+            )
+        )
+
+    def _log(self, result: DelegationResult, duration_ms: float, outcome: TransportOutcome) -> None:
         self._logger.info(
-            "delegation task_id=%s root=%s hop=%s bot_id=%s duration_ms=%d status=%s error_code=%s",
+            "delegation task_id=%s root=%s caller=%s target=%s hop=%s duration_ms=%d "
+            "status=%s error_code=%s request_bytes=%d response_bytes=%d result_bytes=%d",
             result.task_id,
             result.root_task_id or "-",
-            result.hop if result.hop is not None else "-",
+            self._caller_id,
             result.bot_id,
+            result.hop if result.hop is not None else "-",
             duration_ms,
             result.status.value,
             result.error_code or "-",
+            outcome.request_bytes,
+            outcome.response_bytes,
+            len(result.content.encode("utf-8")),
         )
 
 

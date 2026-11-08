@@ -265,6 +265,28 @@ a warning, not an error), flags presets that are missing from
 the tested baseline. `--caller` scopes the check to one bot's view and
 `--no-probe` skips the socket probes.
 
+## Task ledger
+
+Pass `--ledger <path>` to the MCP server to record every delegation that gets
+as far as the transport: task and chain ids, caller, target, hop, status,
+error code, byte counts for the request, response, and returned content, plus
+timing. Two read-only tools expose it: `list_tasks` (with `limit`, `target`,
+and `status` filters) and `get_task`. Every row carries an `observation` note:
+it is the local process's view, and `completed` is not proof of remote
+success.
+
+The ledger stores ids, counts, and timings only. Task text, answers, and
+credentials never enter the database, and local refusals (unknown target, bad
+envelope, busy, blocked) are not recorded because no task started. Without
+`--ledger` nothing is written and both tools return empty results. Rows
+survive an MCP restart because they live in the SQLite file, not the process.
+
+Add the two tools to `enabledTools` when you pin the list:
+
+```json
+"enabledTools": ["list_bots", "delegate_task", "list_tasks", "get_task"]
+```
+
 ## Operate
 
 The server logs to stderr only. Each delegation logs the task id, bot id, duration, status, and error code. It does not log the task or the answer.

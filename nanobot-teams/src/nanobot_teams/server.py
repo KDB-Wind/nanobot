@@ -14,6 +14,7 @@ from mcp.server.stdio import stdio_server
 from . import __version__
 from .config import TeamConfig
 from .delegation import Delegator
+from .ledger import Ledger
 from .transport import HttpTransport, OutcomeKind
 
 _SERVER_NAME = "nanobot-teams"
@@ -21,6 +22,28 @@ _SERVER_NAME = "nanobot-teams"
 _LIST_BOTS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {},
+    "additionalProperties": False,
+}
+
+_LIST_TASKS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "limit": {"type": "integer", "description": "Rows to return, 1 to 500."},
+        "target": {"type": "string", "description": "Only rows for this bot id."},
+        "status": {
+            "type": "string",
+            "description": "completed, failed, timed_out, or outcome_unknown.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+_GET_TASK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {"type": "string", "description": "Task id from a delegation result."}
+    },
+    "required": ["task_id"],
     "additionalProperties": False,
 }
 
@@ -83,6 +106,30 @@ def build_server(delegator: Delegator) -> Server:
                     openWorldHint=True,
                 ),
             ),
+            types.Tool(
+                name="list_tasks",
+                description=(
+                    "List recent delegations from the local ledger. Local observation "
+                    "only; completed is not proof of remote success. Empty until the "
+                    "server runs with --ledger."
+                ),
+                inputSchema=_LIST_TASKS_SCHEMA,
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=True,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+            ),
+            types.Tool(
+                name="get_task",
+                description="Fetch one ledger row by task id. Local observation only.",
+                inputSchema=_GET_TASK_SCHEMA,
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=True,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+            ),
         ]
 
     @server.call_tool()
@@ -92,6 +139,33 @@ def build_server(delegator: Delegator) -> Server:
                 {"bots": delegator.list_bots()}, ensure_ascii=False, separators=(",", ":")
             )
             return _text_result(text, is_error=False)
+        if name == "list_tasks":
+            limit = arguments.get("limit", 50)
+            target = arguments.get("target")
+            status = arguments.get("status")
+            if (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or not 1 <= limit <= 500
+                or (target is not None and not isinstance(target, str))
+                or (status is not None and not isinstance(status, str))
+            ):
+                return _error_result("invalid_request", "limit, target, or status is malformed.")
+            rows = delegator.list_tasks(limit=limit, target=target, status=status)
+            text = json.dumps(
+                {"tasks": [json.loads(row.to_json()) for row in rows]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            return _text_result(text, is_error=False)
+        if name == "get_task":
+            task_id = arguments.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                return _error_result("invalid_request", "task_id must be a non-empty string.")
+            row = delegator.get_task(task_id)
+            if row is None:
+                return _error_result("not_found", "No ledger row for that task id.")
+            return _text_result(row.to_json(), is_error=False)
         if name == "delegate_task":
             bot_id = arguments.get("bot_id")
             task = arguments.get("task")
@@ -113,10 +187,16 @@ def build_server(delegator: Delegator) -> Server:
     return server
 
 
-async def serve(config: TeamConfig, api_keys: Mapping[str, str], caller_id: str) -> None:
+async def serve(
+    config: TeamConfig,
+    api_keys: Mapping[str, str],
+    caller_id: str,
+    ledger: Ledger | None = None,
+) -> None:
     transport = HttpTransport(config.limits)
+    book = ledger if ledger is not None else Ledger(None)
     try:
-        server = build_server(Delegator(config, transport, api_keys, caller_id))
+        server = build_server(Delegator(config, transport, api_keys, caller_id, ledger=book))
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
                 read_stream,
@@ -132,6 +212,7 @@ async def serve(config: TeamConfig, api_keys: Mapping[str, str], caller_id: str)
             )
     finally:
         await transport.aclose()
+        book.close()
 
 
 def _text_result(text: str, *, is_error: bool) -> types.CallToolResult:

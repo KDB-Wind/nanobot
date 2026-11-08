@@ -92,9 +92,17 @@ def write_config(tmp_path: Path, port: int) -> Path:
 
 async def test_stdio_server_speaks_mcp(tmp_path: Path, target: tuple[Target, int]) -> None:
     server, port = target
+    ledger_path = tmp_path / "ledger.sqlite3"
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "nanobot_teams", "--config", str(write_config(tmp_path, port))],
+        args=[
+            "-m",
+            "nanobot_teams",
+            "--config",
+            str(write_config(tmp_path, port)),
+            "--ledger",
+            str(ledger_path),
+        ],
         env={**os.environ, "TEAMS_RESEARCH_API_KEY": KEY, "PYTHONPATH": str(SRC)},
         cwd=str(ROOT),
     )
@@ -105,7 +113,7 @@ async def test_stdio_server_speaks_mcp(tmp_path: Path, target: tuple[Target, int
                 tools = (await session.list_tools()).tools
                 by_name = {tool.name: tool for tool in tools}
 
-                assert set(by_name) == {"list_bots", "delegate_task"}
+                assert set(by_name) == {"list_bots", "delegate_task", "list_tasks", "get_task"}
                 assert by_name["list_bots"].annotations.readOnlyHint is True
                 assert by_name["list_bots"].annotations.idempotentHint is True
                 assert by_name["list_bots"].annotations.openWorldHint is False
@@ -113,6 +121,8 @@ async def test_stdio_server_speaks_mcp(tmp_path: Path, target: tuple[Target, int
                 assert by_name["delegate_task"].annotations.idempotentHint is False
                 assert by_name["delegate_task"].annotations.destructiveHint is False
                 assert by_name["delegate_task"].annotations.openWorldHint is True
+                assert by_name["list_tasks"].annotations.readOnlyHint is True
+                assert by_name["get_task"].annotations.readOnlyHint is True
 
                 assert by_name["list_bots"].inputSchema["properties"] == {}
                 assert by_name["list_bots"].inputSchema["additionalProperties"] is False
@@ -161,6 +171,24 @@ async def test_stdio_server_speaks_mcp(tmp_path: Path, target: tuple[Target, int
                 headers, body = server.requests[0]
                 assert headers["Authorization"] == f"Bearer {KEY}"
                 assert "model" not in body
+
+                listed_tasks = await session.call_tool("list_tasks", {})
+                assert listed_tasks.isError is False
+                task_rows = json.loads(listed_tasks.content[0].text)["tasks"]
+                assert len(task_rows) == 1
+                assert task_rows[0]["task_id"] == payload["task_id"]
+                assert task_rows[0]["status"] == "completed"
+                assert task_rows[0]["http_sent"] is True
+
+                fetched = await session.call_tool(
+                    "get_task", {"task_id": payload["task_id"]}
+                )
+                assert fetched.isError is False
+                assert json.loads(fetched.content[0].text)["target"] == "research"
+
+                missing = await session.call_tool("get_task", {"task_id": "no-such"})
+                assert missing.isError is True
+                assert json.loads(missing.content[0].text)["error_code"] == "not_found"
 
                 server.statuses.append(500)
                 unknown = await session.call_tool(

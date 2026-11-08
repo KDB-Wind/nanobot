@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -29,6 +29,9 @@ class TransportOutcome:
     error_code: str | None = None
     detail: str | None = None
     blocks_future: bool = False
+    request_bytes: int = 0
+    response_bytes: int = 0
+    http_sent: bool = False
 
 
 async def read_bounded(chunks: AsyncIterator[bytes], max_bytes: int) -> bytes | None:
@@ -88,12 +91,20 @@ class HttpTransport:
             "Accept": "application/json",
         }
         budget = min(self._limits.total_timeout_s, deadline_s or self._limits.total_timeout_s)
+        request_bytes = len(
+            json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
         try:
             async with asyncio.timeout(budget):
                 async with self._client.stream(
                     "POST", endpoint, json=body, headers=headers
                 ) as response:
-                    return await self._classify(response)
+                    outcome = await self._classify(response)
+                    return replace(
+                        outcome,
+                        request_bytes=request_bytes,
+                        http_sent=True,
+                    )
         except TimeoutError:
             return TransportOutcome(
                 OutcomeKind.timed_out,
@@ -171,16 +182,24 @@ class HttpTransport:
                 error_code="response_too_large",
                 detail="The target response exceeded the size limit.",
                 blocks_future=True,
+                response_bytes=self._limits.response_max_bytes + 1,
             )
         try:
             payload: Any = json.loads(raw)
         except ValueError:
-            return _invalid("The target response was not valid JSON.")
+            return _with_bytes(_invalid("The target response was not valid JSON."), len(raw))
         content = _completion_content(payload)
         if content is None:
-            return _invalid("The target response did not match the completion shape.")
+            return _with_bytes(
+                _invalid("The target response did not match the completion shape."), len(raw)
+            )
         text, truncated = truncate_utf8(content, self._limits.result_max_bytes)
-        return TransportOutcome(OutcomeKind.completed, content=text, truncated=truncated)
+        return TransportOutcome(
+            OutcomeKind.completed,
+            content=text,
+            truncated=truncated,
+            response_bytes=len(raw),
+        )
 
 
 def _completion_content(payload: Any) -> str | None:
@@ -197,6 +216,10 @@ def _completion_content(payload: Any) -> str | None:
         return None
     content = message.get("content")
     return content if isinstance(content, str) else None
+
+
+def _with_bytes(outcome: TransportOutcome, response_bytes: int) -> TransportOutcome:
+    return replace(outcome, response_bytes=response_bytes)
 
 
 def _invalid(detail: str) -> TransportOutcome:

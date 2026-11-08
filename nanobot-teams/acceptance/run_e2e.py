@@ -942,6 +942,68 @@ def scenario_check_errors() -> None:
     log("PASS check_errors")
 
 
+async def _ledger_first_session(config: Path, ledger_path: Path) -> str:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    params = StdioServerParameters(
+        command=str(PY_TEAMS),
+        args=["-m", "nanobot_teams", "--config", str(config), "--ledger", str(ledger_path)],
+        env={**os.environ, "TEAMS_RESEARCH_API_KEY": RESEARCH_KEY},
+        cwd=str(OUT),
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "delegate_task", {"bot_id": "research", "task": "ledger-probe-task-alpha"}
+            )
+            payload = json.loads(result.content[0].text)
+            assert payload["status"] == "completed", payload
+            return payload["task_id"]
+
+
+async def _ledger_second_session(config: Path, ledger_path: Path, task_id: str) -> dict:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    params = StdioServerParameters(
+        command=str(PY_TEAMS),
+        args=["-m", "nanobot_teams", "--config", str(config), "--ledger", str(ledger_path)],
+        env={**os.environ, "TEAMS_RESEARCH_API_KEY": RESEARCH_KEY},
+        cwd=str(OUT),
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            listed = await session.call_tool("list_tasks", {"limit": 10})
+            rows = json.loads(listed.content[0].text)["tasks"]
+            assert len(rows) == 1, rows
+            assert rows[0]["task_id"] == task_id
+            assert rows[0]["status"] == "completed"
+            fetched = await session.call_tool("get_task", {"task_id": task_id})
+            return json.loads(fetched.content[0].text)
+
+
+def scenario_ledger_restart() -> None:
+    reset()
+    stub = start_stub(0.0, 200, "ledger-probe-answer-alpha")
+    try:
+        config = write_teams(f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions")
+        ledger_path = OUT / "ledger.sqlite3"
+        task_id = asyncio.run(_ledger_first_session(config, ledger_path))
+        row = asyncio.run(_ledger_second_session(config, ledger_path, task_id))
+        assert row["target"] == "research"
+        assert row["observation"]
+        blob = ledger_path.read_bytes()
+        assert b"ledger-probe-task-alpha" not in blob
+        assert b"ledger-probe-answer-alpha" not in blob
+        assert RESEARCH_KEY.encode() not in blob
+        log("PASS ledger_restart")
+    finally:
+        stub.shutdown()
+
+
 SCENARIOS = {
     "research_direct": scenario_research_direct,
     "delegate_basic": scenario_delegate_basic,
@@ -955,6 +1017,7 @@ SCENARIOS = {
     "chain_budget": scenario_chain_budget,
     "bot_init_live": scenario_bot_init_live,
     "check_errors": scenario_check_errors,
+    "ledger_restart": scenario_ledger_restart,
     "plugin_manifest": scenario_plugin_manifest,
 }
 
