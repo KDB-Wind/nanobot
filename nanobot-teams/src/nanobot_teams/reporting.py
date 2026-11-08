@@ -13,6 +13,9 @@ from .config import Budget, TeamConfig
 from .ledger import Ledger
 
 
+_MERMAQ_SAFE = str.maketrans({".": "_", "-": "_"})
+
+
 def render_graph(config: TeamConfig) -> str:
     lines: list[str] = []
     for bot in config.bots:
@@ -25,12 +28,11 @@ def render_graph(config: TeamConfig) -> str:
     lines.append("```mermaid")
     lines.append("flowchart LR")
     for bot in config.bots:
-        safe = bot.id.replace(".", "_").replace("-", "_")
-        lines.append(f"  {safe}[\"{bot.id}\"]")
+        lines.append(f"  {bot.id.translate(_MERMAQ_SAFE)}[\"{bot.id}\"]")
     for target in config.bots:
         for caller in target.allowed_callers:
-            src = caller.replace(".", "_").replace("-", "_")
-            dst = target.id.replace(".", "_").replace("-", "_")
+            src = caller.translate(_MERMAQ_SAFE)
+            dst = target.id.translate(_MERMAQ_SAFE)
             lines.append(f"  {src} --> {dst}")
     lines.append("```")
     return "\n".join(lines)
