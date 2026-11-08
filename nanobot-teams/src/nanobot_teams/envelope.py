@@ -10,6 +10,7 @@ hop bounds, chain shape, no revisited bot, and a deadline that only shrinks.
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from dataclasses import dataclass
@@ -104,6 +105,8 @@ def validate_continuation(
 
     if isinstance(deadline_remaining_s, bool) or not isinstance(deadline_remaining_s, int | float):
         raise EnvelopeError("envelope_invalid", "deadline_remaining_s must be a number.")
+    if not math.isfinite(deadline_remaining_s):
+        raise EnvelopeError("envelope_invalid", "deadline_remaining_s must be a finite number.")
     if deadline_remaining_s <= 0:
         raise EnvelopeError(
             "budget_exhausted", "The chain deadline is spent; no budget remains."

@@ -169,3 +169,41 @@ def test_render_budget_and_audit(tmp_path: Path) -> None:
     assert "planner -> research" in audit_text
     assert "completed=1" in audit_text
     ledger.close()
+
+
+async def test_budget_fails_closed_when_ledger_unreadable(tmp_path: Path) -> None:
+    import sqlite3
+
+    delegator, transport, ledger = build(tmp_path, {"planner": {"delegations": 5}})
+    try:
+        first = await delegator.delegate_task("research", "one")
+        assert first.status is OutcomeKind.completed
+
+        class BrokenConn:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+        original = ledger._conn
+        ledger._conn = BrokenConn()
+        second = await delegator.delegate_task("research", "two")
+        ledger._conn = original
+    finally:
+        await transport.aclose()
+        ledger.close()
+
+    assert second.status is OutcomeKind.failed
+    assert second.error_code == "budget_exceeded"
+    assert "unreadable" in (second.detail or "")
+
+
+def test_usage_for_signals_unreadable_ledger() -> None:
+    import sqlite3
+
+    class BrokenConn:
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("locked")
+
+    ledger = Ledger(None)
+    assert ledger.usage_for("planner") == (0, 0, 0.0)
+    ledger._conn = BrokenConn()
+    assert ledger.usage_for("planner") is None

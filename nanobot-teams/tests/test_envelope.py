@@ -289,3 +289,15 @@ def test_session_id_spans_callers(tmp_path: Path) -> None:
     assert session_id_for(config, "planner", "research") != session_id_for(
         config, "mid", "research"
     )
+
+
+async def test_nan_and_infinite_deadline_refused(tmp_path: Path) -> None:
+    _, delegator, transport = build(tmp_path, _unreachable, caller="mid")
+    try:
+        for bad in (float("nan"), float("inf")):
+            result = await delegator.delegate_task(
+                "research", "x", **continuation(deadline_remaining_s=bad)
+            )
+            assert result.error_code == "envelope_invalid", (bad, result.error_code)
+    finally:
+        await transport.aclose()

@@ -90,7 +90,8 @@ class TaskRecord:
 
 
 class Ledger:
-    """Append-only observations. A write failure logs and never fails a delegation."""
+    """Append-only observations. A write failure logs and never fails a delegation;
+    rows are never updated once written."""
 
     def __init__(self, path: str | Path | None) -> None:
         self._path = None if path is None else Path(path)
@@ -111,7 +112,7 @@ class Ledger:
             return
         try:
             self._conn.execute(
-                f"INSERT OR REPLACE INTO tasks ({_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO tasks ({_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     entry.task_id,
                     entry.root_task_id,
@@ -157,8 +158,9 @@ class Ledger:
             return []
         return [_row_to_record(row) for row in rows]
 
-    def usage_for(self, caller: str) -> tuple[int, int, float]:
-        """Delegations, cumulative result bytes, and cumulative seconds for one caller."""
+    def usage_for(self, caller: str) -> tuple[int, int, float] | None:
+        """Usage totals for one caller, or None when the ledger is unreadable
+        so budget checks can fail closed."""
         if self._conn is None:
             return (0, 0, 0.0)
         try:
@@ -168,7 +170,7 @@ class Ledger:
                 (caller,),
             ).fetchone()
         except sqlite3.Error:
-            return (0, 0, 0.0)
+            return None
         return (int(row[0]), int(row[1]), float(row[2]) / 1000.0)
 
     def get_task(self, task_id: str) -> TaskRecord | None:

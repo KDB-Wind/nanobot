@@ -167,3 +167,4 @@ async def test_json_row_carries_observation_note(tmp_path: Path) -> None:
     payload = json.loads(row.to_json())
     assert payload["observation"] == "local view; status is not proof of remote success"
     ledger.close()
+

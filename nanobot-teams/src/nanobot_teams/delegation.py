@@ -108,7 +108,10 @@ class Delegator:
             return None
         if not self._ledger.enabled:
             return "Budgets need --ledger; this instance runs without one."
-        used_count, used_bytes, used_seconds = self._ledger.usage_for(self._caller_id)
+        usage = self._ledger.usage_for(self._caller_id)
+        if usage is None:
+            return "The ledger is unreadable; budgets cannot be verified. Refusing."
+        used_count, used_bytes, used_seconds = usage
         if budget.delegations is not None and used_count >= budget.delegations:
             return f"Delegation budget spent: {used_count} of {budget.delegations}."
         if budget.result_bytes is not None and used_bytes >= budget.result_bytes:

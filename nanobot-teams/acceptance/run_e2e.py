@@ -14,6 +14,7 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -303,7 +304,30 @@ def start_stub(delay: float, status: int, content: str) -> ThreadingHTTPServer:
     return server
 
 
+def _wait_ports_bindable(timeout: float = 25.0) -> None:
+    """Block until every e2e port accepts a plain bind.
+
+    A stub or a killed listener can leave the port unable to rebind for a
+    short window even after nothing answers connections; probing with bind
+    mirrors what the next nanobot serve needs.
+    """
+    for port in (RESEARCH_PORT, PLANNER_PORT, WRITER_PORT, MID_PORT, WRITER2_PORT):
+        deadline = time.time() + timeout
+        while True:
+            probe = socket.socket()
+            try:
+                probe.bind(("127.0.0.1", port))
+                probe.close()
+                break
+            except OSError:
+                probe.close()
+                if time.time() > deadline:
+                    raise RuntimeError(f"port {port} stayed busy for {timeout}s")
+                time.sleep(0.5)
+
+
 def reset() -> None:
+    _wait_ports_bindable()
     for name in ("research", "planner", "writer", "mid", "logs"):
         shutil.rmtree(OUT / name, ignore_errors=True)
     (OUT / "research/workspace").mkdir(parents=True, exist_ok=True)
