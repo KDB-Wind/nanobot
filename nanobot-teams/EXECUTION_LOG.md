@@ -10,7 +10,7 @@
 | --- | --- | --- | --- |
 | S0 | MVP 收尾:Unix 复跑 + 阶段 6 发布准备 | 完成 | `361d9997f`、`289a13659` |
 | S1 | 多 Bot Registry(单跳、多目标) | 完成 | `ef5af2e28` |
-| S2 | 多跳与回复路由 | 未开始 | - |
+| S2 | 多跳与回复路由 | 完成 | `28a5cb476` |
 | S3 | Bot 生命周期工具 | 未开始 | - |
 | S4 | 任务账本与可观测性 | 未开始 | - |
 | S5 | 管理与策略 | 未开始 | - |
@@ -94,3 +94,45 @@ caller 身份改为每实例 `--caller` 参数指定,`list_bots` 按授权过滤
 
 S2:多跳与回复路由。信封(task/parent/root id、hop、deadline_remaining)、
 每跳预算扣减、环路检测、A→B→C 验收。
+
+## S2:多跳与回复路由(2026-11-09 完成)
+
+### 做了什么
+
+1. 信封(envelope.py):五元组 `root_task_id/parent_task_id/hop/
+   deadline_remaining_s/chain` + 任务 id。每次委派的任务文本顶部嵌入
+   `[teams-envelope]` 机器可读块,内容是"下一跳"视角(root 不变、
+   parent=本次任务、hop+1、deadline×0.9、chain 追加目标)。
+2. 中跳传播:中间 bot 的 Skill 指导它把块内 root/hop/deadline/chain 原样
+   复制进 delegate_task 参数,parent 填块内 task_id。MCP 端不信任这些值,
+   逐项校验:uuid 形状、hop∈[2, max_hops]、chain 全员在册且以 caller 结尾、
+   len(chain)==hop、目标不在 chain(环路→loop_detected)、deadline>0
+   (≤0→budget_exhausted)、部分信封→envelope_invalid。
+3. 预算扣减:本跳等待上限 = min(total_timeout, deadline);子跳预算=父×0.9
+   (单调递减,永不放大)。根调用(无信封参数)行为与 MVP 完全兼容。
+4. 结果 JSON 增加 root_task_id 与 hop;日志行增加 root/hop。
+
+### 验收记录
+
+| 命令 | 平台 | 输出摘要 |
+| --- | --- | --- |
+| `pytest -q` | Windows / Ubuntu | `116 passed`(新增 11 个信封测试) |
+| `ruff check src tests acceptance` | Windows | `All checks passed!` |
+| `run_e2e.py chain_abc` | Windows / Ubuntu | PASS(planner→mid→research 三真实实例,mid 的模型从信封块续传,nonce 沿链回传) |
+| `run_e2e.py chain_loop` | Windows / Ubuntu | PASS(loop_detected,stub HTTP 0 命中) |
+| `run_e2e.py chain_budget` | Windows / Ubuntu | PASS(budget_exhausted 不发 HTTP;0.5s 预算 + 3s stub → timed_out 而非 completed) |
+
+### 已知限制
+
+- 信封值经中跳模型转写,属结构化但不可信输入;MCP 只能强制上界与形状,
+  无法验证"这就是上游真实生成的值"(无账本前无跨实例对账)。
+- deadline 传递是尽力而为的上界:中跳模型上报的剩余时间可能偏大,
+  但每跳 ×0.9 且被本地 total_timeout 钳制,不会放大。
+- 排障发现并修复:e2h 场景 planner 的 MCP env 漏配中跳目标 key 时,
+  MCP 子进程启动即退、工具消失,模型侧表现为"没有该工具"。已在
+  planner_config 增加 extra_mcp_env 参数修正。
+
+### 下一步
+
+S3:Bot 生命周期工具。`nanobot-teams bot init` 生成骨架与清单,
+`nanobot-teams check` 校验 registry/端点/密钥/preset/端口。
