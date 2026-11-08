@@ -11,7 +11,7 @@
 | S0 | MVP 收尾:Unix 复跑 + 阶段 6 发布准备 | 完成 | `361d9997f`、`289a13659` |
 | S1 | 多 Bot Registry(单跳、多目标) | 完成 | `ef5af2e28` |
 | S2 | 多跳与回复路由 | 完成 | `28a5cb476` |
-| S3 | Bot 生命周期工具 | 未开始 | - |
+| S3 | Bot 生命周期工具 | 完成 | `b27a0acdf` |
 | S4 | 任务账本与可观测性 | 未开始 | - |
 | S5 | 管理与策略 | 未开始 | - |
 | S6 | 硬化与发布 | 未开始 | - |
@@ -136,3 +136,42 @@ S2:多跳与回复路由。信封(task/parent/root id、hop、deadline_remaining
 
 S3:Bot 生命周期工具。`nanobot-teams bot init` 生成骨架与清单,
 `nanobot-teams check` 校验 registry/端点/密钥/preset/端口。
+
+## S3:Bot 生命周期工具(2026-11-09 完成)
+
+### 做了什么
+
+1. `nanobot-teams bot init <id>`:生成 `<home>/config.json`(loopback API、
+   preset、workspace 受限、禁 exec)+ `<home>/workspace`,向 schema 2 registry
+   追加该 bot(endpoint/api_key_env/allowed_callers),打印操作清单(密钥变量名、
+   serve 命令、MCP 注册提示)。拒绝路径全部零写入:重复 id、未知 caller、
+   端口被占、更新后的 registry 无法通过 loader 校验。
+2. `nanobot-teams check --config ...`:逐行输出 `[severity] code: message`,
+   error 级存在时退出 1。检查项:registry 可加载、每个目标的 api_key_env
+   已设置、端点 socket 探测(up/down 均为 warn,停机不是错误)、
+   model_preset 在 ~/.nanobot/config.json 中存在、nanobot CLI 版本与
+   已测基线 0.4.1 的偏差(warn)。`--caller` 限定视角,`--no-probe` 跳过探测。
+3. CLI 路由:新增 `serve`/`bot init`/`check` 子命令,裸 `--config` 路径保持
+   原样(MCP 注册无需改动)。lifecycle.py 成为 src 中唯一允许文件写入的模块
+   (操作者指定路径的 CLI 生成器),静态扫描测试显式豁免并注明原因。
+
+### 验收记录
+
+| 命令 | 平台 | 输出摘要 |
+| --- | --- | --- |
+| `pytest -q` | Windows / Ubuntu | `126 passed`(新增 10 个 lifecycle 测试) |
+| `ruff check src tests acceptance` | Windows | `All checks passed!` |
+| `run_e2e.py bot_init_live` | Windows / Ubuntu | PASS(CLI init → 生成配置真实启动 → check 退出 0 → planner 委派新 bot → nonce 回传) |
+| `run_e2e.py check_errors` | Windows / Ubuntu | PASS(check 退出 1,报 missing_env 与 unknown_preset) |
+
+### 已知限制
+
+- init 生成的配置是保守基线(restrictToWorkspace、禁 exec、loopback);
+  用户仍需按需调整模型参数与工具面。
+- check 的端点探测只证明"有/无进程在监听",不证明服务语义正确。
+- 版本核对比较字符串与基线 0.4.1;nightly 构建会触发 warn。
+
+### 下一步
+
+S4:任务账本与可观测性。Teams 自有 SQLite(仅本地观察),list_tasks/get_task
+工具,结构化日志字段;重启后可查历史,账本不含提示词与密钥。
