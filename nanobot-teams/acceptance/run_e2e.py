@@ -27,9 +27,14 @@ ROOT = Path(__file__).resolve().parent
 TEAMS = ROOT.parent
 OUT = TEAMS / ".e2e"
 WT = TEAMS.parent
-PY_TEAMS = TEAMS / ".venv/Scripts/python.exe"
-PY_NB = WT / ".venv-nanobot/Scripts/python.exe"
-NANOBOT = WT / ".venv-nanobot/Scripts/nanobot.exe"
+if os.name == "nt":
+    PY_TEAMS = TEAMS / ".venv/Scripts/python.exe"
+    PY_NB = WT / ".venv-nanobot/Scripts/python.exe"
+    NANOBOT = WT / ".venv-nanobot/Scripts/nanobot.exe"
+else:
+    PY_TEAMS = TEAMS / ".venv/bin/python"
+    PY_NB = WT / ".venv-nanobot/bin/python"
+    NANOBOT = WT / ".venv-nanobot/bin/nanobot"
 USER_CONFIG = Path.home() / ".nanobot/config.json"
 
 RESEARCH_PORT = 8901
