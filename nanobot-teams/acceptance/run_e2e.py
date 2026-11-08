@@ -501,6 +501,7 @@ def scenario_long_timeout() -> None:
     finally:
         stop(planner_proc)
         stub.shutdown()
+        stub.server_close()
 
 
 async def _mcp_calls(config: Path, count: int) -> list[tuple[bool, dict]]:
@@ -543,6 +544,7 @@ def scenario_unknown_block() -> None:
         log("PASS unknown_block")
     finally:
         stub.shutdown()
+        stub.server_close()
 
 
 def scenario_multi_bot() -> None:
@@ -626,6 +628,7 @@ def scenario_unauthorized_pair() -> None:
         log("PASS unauthorized_pair")
     finally:
         stub.shutdown()
+        stub.server_close()
 
 
 def scenario_plugin_manifest() -> None:
@@ -821,6 +824,7 @@ def scenario_chain_loop() -> None:
         log("PASS chain_loop")
     finally:
         stub.shutdown()
+        stub.server_close()
 
 
 def scenario_chain_budget() -> None:
@@ -842,6 +846,7 @@ def scenario_chain_budget() -> None:
         log("PASS chain_budget")
     finally:
         stub.shutdown()
+        stub.server_close()
 
 
 WRITER2_PORT = 8905
@@ -1028,6 +1033,7 @@ def scenario_ledger_restart() -> None:
         log("PASS ledger_restart")
     finally:
         stub.shutdown()
+        stub.server_close()
 
 
 async def _budget_mcp_calls(config: Path, ledger_path: Path) -> list[dict]:
@@ -1117,6 +1123,7 @@ def scenario_budget_reject() -> None:
         log("PASS budget_reject")
     finally:
         stub.shutdown()
+        stub.server_close()
 
 
 def scenario_packaging_fresh() -> None:
@@ -1195,6 +1202,7 @@ def scenario_packaging_fresh() -> None:
         log("PASS packaging_fresh")
     finally:
         stub.shutdown()
+        stub.server_close()
 
 
 SCENARIOS = {
