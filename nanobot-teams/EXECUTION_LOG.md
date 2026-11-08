@@ -12,7 +12,7 @@
 | S1 | 多 Bot Registry(单跳、多目标) | 完成 | `ef5af2e28` |
 | S2 | 多跳与回复路由 | 完成 | `28a5cb476` |
 | S3 | Bot 生命周期工具 | 完成 | `b27a0acdf` |
-| S4 | 任务账本与可观测性 | 未开始 | - |
+| S4 | 任务账本与可观测性 | 完成 | `6f946043d` |
 | S5 | 管理与策略 | 未开始 | - |
 | S6 | 硬化与发布 | 未开始 | - |
 
@@ -175,3 +175,39 @@ S3:Bot 生命周期工具。`nanobot-teams bot init` 生成骨架与清单,
 
 S4:任务账本与可观测性。Teams 自有 SQLite(仅本地观察),list_tasks/get_task
 工具,结构化日志字段;重启后可查历史,账本不含提示词与密钥。
+
+## S4:任务账本与可观测性(2026-11-09 完成)
+
+### 做了什么
+
+1. `ledger.py`:单一 SQLite 文件(`--ledger <path>` 显式开启,缺省零写入,
+   现有 MCP 注册不受影响)。每条到达 transport 的委派记一行:
+   task/root/parent id、caller、target、hop、status、error_code、truncated、
+   http_sent、请求/响应/结果字节数、起止时间与耗时。WAL 模式;
+   写失败只记日志,绝不影响委派本身。
+2. 新增只读 MCP 工具 `list_tasks`(limit/target/status 过滤)与 `get_task`,
+   每行 JSON 携带 observation 注记("本地观察,不代表远端完成")。
+3. 结构化日志字段补齐:task_id、root、caller、target、hop、duration_ms、
+   status、error_code、request/response/result 字节数。
+4. 隐私边界:任务文本、回答内容、密钥一律不入库(e2e 直接扫描 sqlite
+   文件字节断言);本地拒绝(未成任务)不记录。
+
+### 验收记录
+
+| 命令 | 平台 | 输出摘要 |
+| --- | --- | --- |
+| `pytest -q` | Windows / Ubuntu | `133 passed`(新增 7 个账本测试,stdio 测试扩至 4 工具) |
+| `ruff check src tests acceptance` | Windows | `All checks passed!` |
+| `run_e2e.py ledger_restart` | Windows / Ubuntu | PASS(两个独立 MCP 进程生命周期;重启后 list_tasks/get_task 可查;DB 字节级无任务文本/回答/密钥) |
+
+### 已知限制
+
+- 账本只在启用 `--ledger` 的实例上累积;每个 MCP 实例一个文件,
+  跨实例聚合属 S5 audit 的读取范围(多文件并列)。
+- http_sent 仅在"收到 HTTP 响应"时为 True;超时/传输错误的行显示 False,
+   含义是"无证据表明请求到达",不是"确认未到达"。
+
+### 下一步
+
+S5:管理与策略。CLI graph/budget/audit;每 bot、每链路的调用预算
+(次数、字节、时间);超预算明确拒绝。
