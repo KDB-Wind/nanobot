@@ -32,6 +32,13 @@ A `completed` status means only that a response arrived. `semantic_status` is al
 
 Do not retry after `failed`, `timed_out`, or `outcome_unknown`. Report the `error_code`. A `blocked` result means an earlier delegation may have reached the remote bot. Ask the user to check the remote bot's own logs and side effects before restarting the MCP server.
 
+## Inspect the ledger
+
+When the MCP server runs with `--ledger`, `mcp_teams_list_tasks` and
+`mcp_teams_get_task` show what this installation submitted and observed.
+`completed` there is still a local observation, not proof of remote success.
+Use them to check an earlier attempt instead of retrying.
+
 ## Limits
 
 - One delegation at a time. A second call returns `busy`.

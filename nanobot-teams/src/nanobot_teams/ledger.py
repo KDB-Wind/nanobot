@@ -96,15 +96,25 @@ class Ledger:
     """Append-only observations. A write failure logs and never fails a delegation;
     rows are never updated once written."""
 
-    def __init__(self, path: str | Path | None) -> None:
+    def __init__(self, path: str | Path | None, *, read_only: bool = False) -> None:
         self._path = None if path is None else Path(path)
         self._conn: sqlite3.Connection | None = None
-        if self._path is not None:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(self._path, isolation_level=None)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.executescript(_SCHEMA)
+        if self._path is None:
+            return
+        if read_only:
+            if not self._path.exists():
+                return
+            try:
+                uri = self._path.resolve().as_uri() + "?mode=ro"
+                self._conn = sqlite3.connect(uri, uri=True)
+            except sqlite3.Error:
+                self._conn = None
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(self._path, isolation_level=None)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.executescript(_SCHEMA)
 
     @property
     def enabled(self) -> bool:

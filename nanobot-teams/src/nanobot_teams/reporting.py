@@ -68,7 +68,7 @@ def render_audit(
     for path in ledger_paths:
         if not Path(path).exists():
             continue
-        ledger = Ledger(path)
+        ledger = Ledger(path, read_only=True)
         try:
             for record in ledger.list_tasks(limit=limit, target=target, status=status):
                 rows.append((str(path), record))
@@ -98,7 +98,7 @@ def _combined_usage(ledger_paths: Sequence[Path]) -> dict[str, tuple[int, int, f
     callers: set[str] = set()
     existing = [path for path in ledger_paths if Path(path).exists()]
     for path in existing:
-        ledger = Ledger(path)
+        ledger = Ledger(path, read_only=True)
         try:
             ledger_callers = ledger.list_tasks(limit=500)
         finally:
@@ -108,7 +108,7 @@ def _combined_usage(ledger_paths: Sequence[Path]) -> dict[str, tuple[int, int, f
     for caller in callers:
         total = [0, 0, 0.0]
         for path in existing:
-            ledger = Ledger(path)
+            ledger = Ledger(path, read_only=True)
             try:
                 count, result_bytes, seconds = ledger.usage_for(caller)
             finally:

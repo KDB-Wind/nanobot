@@ -304,7 +304,9 @@ A schema 2 registry can cap what one caller may spend:
 ```
 
 Enforcement counts what the ledger recorded for that caller: total
-delegations, cumulative returned bytes, cumulative seconds. A delegation past
+delegations, cumulative returned bytes, cumulative seconds. The seconds figure
+sums recorded delegation durations for that caller; nested hops can overlap, so
+it is not wall-clock chain time. A delegation past
 any cap fails locally with `budget_exceeded` and no HTTP request. Budgets
 require `--ledger`; an instance with budgets configured but no ledger refuses
 every delegation instead of guessing.
@@ -350,7 +352,7 @@ To uninstall, remove the plugin directory and the `nanobot-teams` distribution. 
 - The Registry, the executable, and the MCP environment are the control plane. Do not let model output create or edit them. `--caller`, `--config`, and `--ledger` are launch configuration, never tool arguments.
 - Each instance resolves credentials only for targets its caller is authorized to reach. A middle-hop bot never holds keys for bots it cannot call. Research holds no Planner key and no Teams outbound tools unless you register them.
 - The transport does not use environment proxies, does not follow redirects, and does not retry. The Bearer token and task cannot be forwarded to another host by the client. Endpoints stay pinned to loopback.
-- Envelope values (hop, deadline, chain) travel through the receiving model. The server validates their shape and enforces hop, loop, and budget bounds locally, but cannot prove they are the values the upstream generated. Treat them as caps, not as authenticated ancestry.
+- Envelope values (hop, deadline, chain) travel through the receiving model. The server validates their shape and enforces hop, loop, and budget bounds locally, but cannot prove they are the values the upstream generated. Treat them as caps, not as authenticated ancestry. A middle bot that omits the fields entirely is treated as a new root; the server cannot distinguish that from a legitimate planner, so rely on the authorization graph and caller budgets for hard limits.
 - `bot init` writes the provider API key as an environment reference, not a literal key.
 - The ledger stores ids, counts, and timings only. Task text, answers, and credentials never enter it, and the acceptance scenario checks the database bytes for their absence.
 - Budgets count ledger rows, so they bound what this installation spent. They are not a distributed quota: two MCP processes sharing one ledger file have no cross-process lock.

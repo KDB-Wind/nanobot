@@ -89,8 +89,8 @@ Research workspace can read comes back through the Planner.
 ## Output
 
 Everything lands in `.e2e/` and is gitignored: `logs/` for process output,
-`shots/` for WebUI screenshots. The generated `config.json` files contain
-resolved API keys; delete them after a run.
+`shots/` for WebUI screenshots. Generated `config.json` files reference
+credentials through environment variables; delete them after a run anyway.
 
 ```bash
 find .e2e -name config.json -delete
