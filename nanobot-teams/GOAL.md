@@ -21,7 +21,8 @@
 
 **从第一个动作到最终报告，全程启用 `/poteto-mode`，不要中途退出。**
 
-- 开始前读取并启用 `C:/Users/KDB/.codebuddy/skills/poteto-mode/SKILL.md`。
+- 开始前启用 `/poteto-mode`。若当前环境不允许模型自行调用该 skill，就直接读取
+  `C:/Users/KDB/.codebuddy/skills/poteto-mode/SKILL.md` 并严格按其规则执行，视为已启用。
 - 上下文被压缩、会话恢复或换阶段时，重读一次 SKILL.md，恢复触发条件与原则，
   不要假设它仍然生效。
 - 按触发条件调用该系列的 skills，不要机械地全部打开：
