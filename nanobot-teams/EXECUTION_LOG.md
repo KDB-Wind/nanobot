@@ -14,7 +14,7 @@
 | S3 | Bot 生命周期工具 | 完成 | `b27a0acdf` |
 | S4 | 任务账本与可观测性 | 完成 | `6f946043d` |
 | S5 | 管理与策略 | 完成 | `7ad04c42a`+`0073794da`+`5fddcb87d` |
-| S6 | 硬化与发布 | 完成 | `c2dda9b16` |
+| S6 | 硬化与发布 | 完成 | `c2dda9b16`+`44209624b`+`79b9d406a`+`d8967f1b0`+`8a00fdd` |
 
 ## S0:MVP 收尾(2026-11-08 完成)
 
@@ -282,3 +282,30 @@ S6:硬化与发布。契约回归(mock+真实基线)、版本矩阵、wheel 构�
 - CI workflow 提供但未运行(仓库本地、未发布)。
 - WebUI 验收场景未在 Unix 复跑(需要 Edge);服务端全场景两平台覆盖。
 - wheel 发布(PyPI 上传)与包名可用性核验按用户授权另行执行。
+
+## 最终验收(2026-11-09,提交 `8a00fdd` 树上)
+
+| 项 | 平台 | 结果 |
+| --- | --- | --- |
+| `pytest -q` | Windows | `145 passed` |
+| `pytest -q` | Ubuntu/WSL2 | `145 passed` |
+| `ruff check src tests acceptance` | Windows | `All checks passed!` |
+| `run_e2e.py all`(16 场景) | Windows | 16/16 PASS(long_timeout elapsed=38.6s) |
+| `run_e2e.py all`(16 场景) | Ubuntu/WSL2 | 16/16 PASS(long_timeout elapsed=41.1s;packaging_fresh 首跑缺 build 模块,装入后单独复跑 PASS,plugin_manifest 复跑 PASS) |
+| `run_webui.py` | Windows | PASS(plugin 在 Apps 启用,nonce 经 planner 回传) |
+
+审计与修复闭环:交叉评审 10 项发现,3 项代码缺陷(NaN 信封穿透、预算
+fail-open、INSERT OR REPLACE 违背 append-only)已修复并带回归测试
+(`79b9d406a`);7 项记录/权衡项补入 decisions.tsv 与本日志。套件自身的
+三处不稳(stub 残留监听、双平台并行负载下的时序、端口 TIME_WAIT 竞态)
+在 `d8967f1b0` 与 `8a00fdd` 修复:stub 专用 8906 端口、finally 中
+server_close、SO_REUSEADDR 探测 + 90s 上限、chain_budget 时间参数与
+负载解耦。
+
+## 结束状态
+
+S0–S6 全部交付。改动全部位于 `nanobot-teams/`(基线 `9c2e90082` 以来
+`git diff -- ':!nanobot-teams'` 为空)。Nanobot 核心零改动、零私有导入、
+零私有文件读写(静态扫描测试持续生效)。仅本地提交,未 push、未打 tag。
+`BLOCKERS.md` 记录 4 项未验证子项(CI 未运行、WebUI 未在 Unix 复跑、
+只读页面按可选项未交付、wheel 未发布)。
