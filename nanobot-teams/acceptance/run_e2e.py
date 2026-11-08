@@ -40,6 +40,7 @@ else:
 USER_CONFIG = Path.home() / ".nanobot/config.json"
 
 RESEARCH_PORT = 8901
+STUB_PORT = 8906
 PLANNER_PORT = 8902
 WRITER_PORT = 8903
 RESEARCH_KEY = secrets.token_urlsafe(24)
@@ -294,22 +295,22 @@ class StubHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_stub(delay: float, status: int, content: str) -> ThreadingHTTPServer:
+def start_stub(delay: float, status: int, content: str, port: int = STUB_PORT) -> ThreadingHTTPServer:
     StubHandler.delay = delay
     StubHandler.status = status
     StubHandler.body = content.encode("utf-8")
     StubHandler.hits = 0
-    server = ThreadingHTTPServer(("127.0.0.1", RESEARCH_PORT), StubHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), StubHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
 def _wait_ports_bindable(timeout: float = 25.0) -> None:
-    """Block until every e2e port accepts a plain bind.
+    """Block until no e2e port still has a live listener.
 
-    A stub or a killed listener can leave the port unable to rebind for a
-    short window even after nothing answers connections; probing with bind
-    mirrors what the next nanobot serve needs.
+    The probe binds with SO_REUSEADDR so short-lived TIME_WAIT sockets from a
+    just-closed peer do not stall the run: they never blocked a real server,
+    only a plain bind. A process that still holds the port does.
     """
     for port in (RESEARCH_PORT, PLANNER_PORT, WRITER_PORT, MID_PORT, WRITER2_PORT):
         deadline = time.time() + timeout
@@ -478,7 +479,7 @@ def scenario_session_persistence() -> None:
 def scenario_long_timeout() -> None:
     reset()
     stub = start_stub(35.0, 200, "SLOW-OK")
-    write_teams(f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions")
+    write_teams(f"http://127.0.0.1:{STUB_PORT}/v1/chat/completions")
     planner = planner_config()
     env = process_env()
     planner_proc = None
@@ -532,7 +533,7 @@ def scenario_unknown_block() -> None:
     reset()
     stub = start_stub(0.0, 500, "boom")
     try:
-        config = write_teams(f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions")
+        config = write_teams(f"http://127.0.0.1:{STUB_PORT}/v1/chat/completions")
         results = asyncio.run(_mcp_calls(config, 2))
         first_error, first = results[0]
         second_error, second = results[1]
@@ -615,7 +616,7 @@ def scenario_unauthorized_pair() -> None:
     stub = start_stub(0.0, 200, "unused")
     try:
         config = write_teams_v2(
-            f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions",
+            f"http://127.0.0.1:{STUB_PORT}/v1/chat/completions",
             f"http://127.0.0.1:{WRITER_PORT}/v1/chat/completions",
         )
         listed, refused = asyncio.run(_unauthorized_mcp_calls(config))
@@ -664,7 +665,7 @@ MID_PORT = 8904
 MID_KEY = secrets.token_urlsafe(24)
 
 
-def write_teams_chain() -> Path:
+def write_teams_chain(research_port: int = RESEARCH_PORT) -> Path:
     path = OUT / "teams.json"
     write_json(
         path,
@@ -686,7 +687,7 @@ def write_teams_chain() -> Path:
                     "id": "research",
                     "display_name": "Research",
                     "role": "research",
-                    "endpoint": f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions",
+                    "endpoint": f"http://127.0.0.1:{research_port}/v1/chat/completions",
                     "api_key_env": "TEAMS_RESEARCH_API_KEY",
                     "allowed_callers": ["planner", "mid"],
                 },
@@ -810,7 +811,7 @@ def scenario_chain_loop() -> None:
     reset()
     stub = start_stub(0.0, 200, "unused")
     try:
-        config = write_teams_chain()
+        config = write_teams_chain(research_port=STUB_PORT)
         results = asyncio.run(_chain_mcp_calls(config, [
             _chain_call(chain=["research", "mid"]),
         ]))
@@ -826,7 +827,7 @@ def scenario_chain_budget() -> None:
     reset()
     stub = start_stub(3.0, 200, "unused")
     try:
-        config = write_teams_chain()
+        config = write_teams_chain(research_port=STUB_PORT)
         results = asyncio.run(_chain_mcp_calls(config, [
             _chain_call(deadline_remaining_s=0),
             _chain_call(deadline_remaining_s=0.5),
@@ -1014,7 +1015,7 @@ def scenario_ledger_restart() -> None:
     (OUT / "ledger.sqlite3").unlink(missing_ok=True)
     stub = start_stub(0.0, 200, "ledger-probe-answer-alpha")
     try:
-        config = write_teams(f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions")
+        config = write_teams(f"http://127.0.0.1:{STUB_PORT}/v1/chat/completions")
         ledger_path = OUT / "ledger.sqlite3"
         task_id = asyncio.run(_ledger_first_session(config, ledger_path))
         row = asyncio.run(_ledger_second_session(config, ledger_path, task_id))
@@ -1066,7 +1067,7 @@ def scenario_budget_reject() -> None:
     stub = start_stub(0.0, 200, "budget-answer")
     try:
         config = write_teams_v2(
-            f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions",
+            f"http://127.0.0.1:{STUB_PORT}/v1/chat/completions",
             f"http://127.0.0.1:{WRITER_PORT}/v1/chat/completions",
         )
         registry = json.loads(config.read_text(encoding="utf-8"))
@@ -1156,7 +1157,7 @@ def scenario_packaging_fresh() -> None:
         assert probe.returncode == 0, probe.stderr
         assert probe.stdout.strip() == "0.2.0", probe.stdout
 
-        config = write_teams(f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions")
+        config = write_teams(f"http://127.0.0.1:{STUB_PORT}/v1/chat/completions")
 
         async def fresh_session() -> dict:
             from mcp import ClientSession, StdioServerParameters
