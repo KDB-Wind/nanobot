@@ -825,12 +825,12 @@ def scenario_chain_loop() -> None:
 
 def scenario_chain_budget() -> None:
     reset()
-    stub = start_stub(3.0, 200, "unused")
+    stub = start_stub(8.0, 200, "unused")
     try:
         config = write_teams_chain(research_port=STUB_PORT)
         results = asyncio.run(_chain_mcp_calls(config, [
             _chain_call(deadline_remaining_s=0),
-            _chain_call(deadline_remaining_s=1.5),
+            _chain_call(deadline_remaining_s=5.0),
         ]))
         error, exhausted = results[0]
         assert error and exhausted["error_code"] == "budget_exhausted", exhausted
