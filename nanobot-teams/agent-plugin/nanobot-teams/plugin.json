@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "nanobot-teams",
+  "description": "Delegate a self-contained task to another Nanobot bot over its public HTTP API.",
+  "extensions": {
+    "dev.nanobot": {
+      "displayName": "Nanobot Teams",
+      "category": "Collaboration",
+      "permissions": ["network"]
+    }
+  }
+}

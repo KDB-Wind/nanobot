@@ -1,0 +1,17 @@
+{
+  "tools": {
+    "mcpServers": {
+      "teams": {
+        "type": "stdio",
+        "command": "<absolute path to the nanobot-teams venv python>",
+        "args": ["-m", "nanobot_teams", "--config", "<absolute path to teams.json>"],
+        "cwd": "<absolute path to the directory that holds teams.json>",
+        "env": {
+          "TEAMS_RESEARCH_API_KEY": "${TEAMS_RESEARCH_API_KEY}"
+        },
+        "toolTimeout": 180,
+        "enabledTools": ["list_bots", "delegate_task"]
+      }
+    }
+  }
+}
