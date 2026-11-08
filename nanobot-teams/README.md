@@ -156,6 +156,8 @@ The package is skills-only. It contains no `mcp.json`, because a plugin MCP entr
 
 A 200 response is not proof that the research succeeded. The result carries `semantic_status: unverified` for that reason.
 
+`acceptance/README.md` describes the two harnesses that replay these checks against live processes, including the WebUI path.
+
 ## Operate
 
 The server logs to stderr only. Each delegation logs the task id, bot id, duration, status, and error code. It does not log the task or the answer.
