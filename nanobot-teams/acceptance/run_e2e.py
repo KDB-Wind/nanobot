@@ -494,7 +494,7 @@ async def _mcp_calls(config: Path, count: int) -> list[tuple[bool, dict]]:
             await session.initialize()
             tools = await session.list_tools()
             names = {tool.name for tool in tools.tools}
-            assert names == {"list_bots", "delegate_task"}, names
+            assert names == {"list_bots", "delegate_task", "list_tasks", "get_task"}, names
             for index in range(count):
                 result = await session.call_tool(
                     "delegate_task",

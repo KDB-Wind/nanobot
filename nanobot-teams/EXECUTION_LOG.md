@@ -14,7 +14,7 @@
 | S3 | Bot 生命周期工具 | 完成 | `b27a0acdf` |
 | S4 | 任务账本与可观测性 | 完成 | `6f946043d` |
 | S5 | 管理与策略 | 完成 | `7ad04c42a`+`0073794da`+`5fddcb87d` |
-| S6 | 硬化与发布 | 未开始 | - |
+| S6 | 硬化与发布 | 完成 | `c2dda9b16` |
 
 ## S0:MVP 收尾(2026-11-08 完成)
 
@@ -249,3 +249,36 @@ S5:管理与策略。CLI graph/budget/audit;每 bot、每链路的调用预算
 
 S6:硬化与发布。契约回归(mock+真实基线)、版本矩阵、wheel 构建、
 全新环境安装/升级/卸载、文档"已实现/已测试/不支持"三分。
+
+## S6:硬化与发布(2026-11-09 完成)
+
+### 做了什么
+
+1. 版本 0.1.0 → 0.2.0(pyproject + `__init__`)。
+2. wheel 构建与全新环境验收(`packaging_fresh` 场景):build 出 wheel →
+   干净 venv 安装(依赖从 PyPI 解析)→ 版本断言 → 从新环境起 stdio MCP
+   完成一次真实委派 → pip 卸载后 import 失败断言。升级语义 = 覆盖安装,
+   不触碰任何 Nanobot home(包对 Nanobot 数据零写入,静态扫描+场景双证)。
+3. README:新增"Implemented, tested, unsupported"三态矩阵(逐能力标注);
+   Security boundaries 扩充信封不可信、账本内容策略、预算语义、
+   lifecycle CLI 写入范围;支持矩阵记录包版本 0.2.0。
+4. CI 工作流(`.github/workflows/ci.yml`,ubuntu+windows 矩阵跑 ruff+pytest)
+   作为交付物入库;仓库未发布,workflow 未执行,如实记录。
+5. 密钥审计:`git grep` 全仓库扫描模式(api_key/token/secret/password 赋值),
+   无命中;示例与文档只含 `${ENV}` 引用。
+
+### 验收记录
+
+| 命令 | 平台 | 输出摘要 |
+| --- | --- | --- |
+| `pytest -q` | Windows | `141 passed` |
+| `ruff check src tests acceptance` | Windows | `All checks passed!` |
+| `run_e2e.py packaging_fresh` | Windows | PASS(wheel→干净 venv→委派→卸载全链路) |
+| `run_e2e.py all` | Windows / Ubuntu | 见下方"最终验收" |
+| `run_webui.py` | Windows | 见下方"最终验收" |
+
+### 已知限制
+
+- CI workflow 提供但未运行(仓库本地、未发布)。
+- WebUI 验收场景未在 Unix 复跑(需要 Edge);服务端全场景两平台覆盖。
+- wheel 发布(PyPI 上传)与包名可用性核验按用户授权另行执行。

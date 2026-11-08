@@ -38,11 +38,12 @@ def _dispatch(args: list[str]) -> int:
         return _run_graph(_parse_graph(args[1:]))
     if args[0] == "budget":
         return _run_budget(_parse_budget(args[1:]))
+    if args[0] == "bot":
+        if len(args) >= 2 and args[1] == "init":
+            return _run_bot_init(_parse_bot_init(args[2:]))
+        print("nanobot-teams bot: expected 'bot init ...'", file=sys.stderr)
+        return 2
     return _run_audit(_parse_audit(args[1:]))
-    if len(args) >= 2 and args[1] == "init":
-        return _run_bot_init(_parse_bot_init(args[2:]))
-    print("nanobot-teams bot: expected 'bot init ...'", file=sys.stderr)
-    return 2
 
 
 def _run_server(args: argparse.Namespace) -> int:

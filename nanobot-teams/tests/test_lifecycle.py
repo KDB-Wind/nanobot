@@ -217,3 +217,24 @@ def test_port_in_use_detects_listener() -> None:
         assert port_in_use("127.0.0.1", port + 1) is False
     finally:
         server.close()
+
+
+def test_cli_routing_smoke() -> None:
+    import subprocess
+    import sys
+
+    for args, expected in (
+        (["bot"], 2),
+        (["bot", "init", "--help"], 0),
+        (["check", "--help"], 0),
+        (["graph", "--help"], 0),
+        (["budget", "--help"], 0),
+        (["audit", "--help"], 0),
+    ):
+        result = subprocess.run(
+            [sys.executable, "-m", "nanobot_teams", *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == expected, (args, result.returncode, result.stderr)
