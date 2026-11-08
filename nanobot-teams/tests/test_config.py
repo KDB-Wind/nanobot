@@ -5,7 +5,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from nanobot_teams.config import ConfigError, Limits, load_teams_config, resolve_api_keys
+from nanobot_teams.config import (
+    ConfigError,
+    Limits,
+    load_teams_config,
+    resolve_api_keys,
+    resolve_caller,
+)
 
 ENDPOINT = "http://127.0.0.1:8901/v1/chat/completions"
 
@@ -43,16 +49,18 @@ def test_valid_config_loads(tmp_path: Path) -> None:
 
     assert config.schema_version == 1
     assert config.team_id == "personal-research"
-    assert config.caller_bot_id == "planner"
+    assert config.default_caller_id == "planner"
     assert config.thread_key == "main"
-    assert config.allowed_targets == ("research",)
     assert config.limits == Limits()
     assert config.bot("planner") is not None
     target = config.bot("research")
     assert target is not None
     assert target.endpoint == ENDPOINT
     assert target.api_key_env == "TEAMS_RESEARCH_API_KEY"
-    assert [bot.id for bot in config.targets()] == ["research"]
+    assert target.allowed_callers == ("planner",)
+    assert config.can_delegate("planner", "research") is True
+    assert config.can_delegate("research", "planner") is False
+    assert [bot.id for bot in config.targets_for("planner")] == ["research"]
 
 
 def test_limits_override(tmp_path: Path) -> None:
@@ -201,7 +209,7 @@ def test_missing_file(tmp_path: Path) -> None:
 
 def test_resolve_api_keys(tmp_path: Path) -> None:
     config = load_teams_config(write_config(tmp_path, config_data()))
-    keys = resolve_api_keys(config, {"TEAMS_RESEARCH_API_KEY": "value"})
+    keys = resolve_api_keys(config, "planner", {"TEAMS_RESEARCH_API_KEY": "value"})
 
     assert keys == {"research": "value"}
 
@@ -209,16 +217,175 @@ def test_resolve_api_keys(tmp_path: Path) -> None:
 def test_resolve_api_keys_missing(tmp_path: Path) -> None:
     config = load_teams_config(write_config(tmp_path, config_data()))
     with pytest.raises(ConfigError, match="TEAMS_RESEARCH_API_KEY"):
-        resolve_api_keys(config, {})
+        resolve_api_keys(config, "planner", {})
 
 
 def test_resolve_api_keys_empty(tmp_path: Path) -> None:
     config = load_teams_config(write_config(tmp_path, config_data()))
     with pytest.raises(ConfigError, match="missing or empty"):
-        resolve_api_keys(config, {"TEAMS_RESEARCH_API_KEY": ""})
+        resolve_api_keys(config, "planner", {"TEAMS_RESEARCH_API_KEY": ""})
 
 
 def test_config_carries_no_secret(tmp_path: Path) -> None:
     config = load_teams_config(write_config(tmp_path, config_data()))
     assert "value" not in repr(config)
     assert all(not hasattr(bot, "api_key") for bot in config.bots)
+
+
+WRITER_ENDPOINT = "http://127.0.0.1:8903/v1/chat/completions"
+
+
+def v2_data(**overrides: Any) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "schema_version": 2,
+        "team_id": "personal-research",
+        "thread_key": "main",
+        "bots": [
+            {
+                "id": "planner",
+                "display_name": "Planner",
+                "role": "planning",
+                "capabilities": ["plan", "synthesize"],
+                "model_preset": "step-5-preview",
+            },
+            {
+                "id": "research",
+                "display_name": "Research",
+                "role": "research",
+                "capabilities": ["search"],
+                "model_preset": "glm-5.3-flash",
+                "endpoint": ENDPOINT,
+                "api_key_env": "TEAMS_RESEARCH_API_KEY",
+                "allowed_callers": ["planner", "writer"],
+            },
+            {
+                "id": "writer",
+                "display_name": "Writer",
+                "role": "drafting",
+                "endpoint": WRITER_ENDPOINT,
+                "api_key_env": "TEAMS_WRITER_API_KEY",
+                "allowed_callers": ["planner"],
+            },
+        ],
+    }
+    data.update(overrides)
+    return data
+
+
+def test_v2_config_loads_and_builds_the_graph(tmp_path: Path) -> None:
+    config = load_teams_config(write_config(tmp_path, v2_data()))
+
+    assert config.schema_version == 2
+    assert config.default_caller_id is None
+    assert config.can_delegate("planner", "research") is True
+    assert config.can_delegate("planner", "writer") is True
+    assert config.can_delegate("writer", "research") is True
+    assert config.can_delegate("research", "planner") is False
+    assert config.can_delegate("research", "writer") is False
+    assert config.can_delegate("planner", "planner") is False
+    research = config.bot("research")
+    assert research is not None
+    assert research.capabilities == ("search",)
+    assert research.model_preset == "glm-5.3-flash"
+    assert {bot.id for bot in config.targets_for("planner")} == {"research", "writer"}
+    assert {bot.id for bot in config.targets_for("writer")} == {"research"}
+    assert config.targets_for("research") == ()
+
+
+def test_v2_rejects_v1_top_level_keys(tmp_path: Path) -> None:
+    data = v2_data(caller_bot_id="planner")
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_teams_config(write_config(tmp_path, data))
+
+
+def test_v2_rejects_allowed_targets(tmp_path: Path) -> None:
+    data = v2_data(allowed_targets=["research"])
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_teams_config(write_config(tmp_path, data))
+
+
+def test_v1_rejects_v2_bot_keys(tmp_path: Path) -> None:
+    data = config_data()
+    data["bots"][1]["allowed_callers"] = ["planner"]
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_teams_config(write_config(tmp_path, data))
+
+
+def test_v2_self_caller_rejected(tmp_path: Path) -> None:
+    data = v2_data()
+    data["bots"][1]["allowed_callers"] = ["research"]
+    with pytest.raises(ConfigError, match="must not list itself"):
+        load_teams_config(write_config(tmp_path, data))
+
+
+def test_v2_unknown_caller_rejected(tmp_path: Path) -> None:
+    data = v2_data()
+    data["bots"][2]["allowed_callers"] = ["ghost"]
+    with pytest.raises(ConfigError, match="unknown caller"):
+        load_teams_config(write_config(tmp_path, data))
+
+
+def test_v2_target_without_endpoint_rejected(tmp_path: Path) -> None:
+    data = v2_data()
+    del data["bots"][2]["endpoint"]
+    with pytest.raises(ConfigError, match="needs endpoint"):
+        load_teams_config(write_config(tmp_path, data))
+
+
+def test_v2_non_target_cannot_carry_endpoint(tmp_path: Path) -> None:
+    data = v2_data()
+    data["bots"][0]["endpoint"] = ENDPOINT
+    data["bots"][0]["api_key_env"] = "TEAMS_PLANNER_API_KEY"
+    with pytest.raises(ConfigError, match="cannot set endpoint"):
+        load_teams_config(write_config(tmp_path, data))
+
+
+def test_v2_duplicate_caller_rejected(tmp_path: Path) -> None:
+    data = v2_data()
+    data["bots"][1]["allowed_callers"] = ["planner", "planner"]
+    with pytest.raises(ConfigError, match="must not repeat"):
+        load_teams_config(write_config(tmp_path, data))
+
+
+def test_v2_bad_capability_rejected(tmp_path: Path) -> None:
+    data = v2_data()
+    data["bots"][0]["capabilities"] = ["Search!"]
+    with pytest.raises(ConfigError, match="capabilities"):
+        load_teams_config(write_config(tmp_path, data))
+
+
+def test_v2_too_many_capabilities_rejected(tmp_path: Path) -> None:
+    data = v2_data()
+    data["bots"][0]["capabilities"] = [f"c{index}" for index in range(9)]
+    with pytest.raises(ConfigError, match="at most 8"):
+        load_teams_config(write_config(tmp_path, data))
+
+
+def test_resolve_caller_v2_requires_argument(tmp_path: Path) -> None:
+    config = load_teams_config(write_config(tmp_path, v2_data()))
+    with pytest.raises(ConfigError, match="--caller"):
+        resolve_caller(config, None)
+    assert resolve_caller(config, "planner") == "planner"
+    assert resolve_caller(config, "writer") == "writer"
+
+
+def test_resolve_caller_v2_unknown_bot(tmp_path: Path) -> None:
+    config = load_teams_config(write_config(tmp_path, v2_data()))
+    with pytest.raises(ConfigError, match="not present in bots"):
+        resolve_caller(config, "ghost")
+
+
+def test_resolve_caller_v1_defaults_and_pins(tmp_path: Path) -> None:
+    config = load_teams_config(write_config(tmp_path, config_data()))
+    assert resolve_caller(config, None) == "planner"
+    assert resolve_caller(config, "planner") == "planner"
+    with pytest.raises(ConfigError, match="must match caller_bot_id"):
+        resolve_caller(config, "research")
+
+
+def test_resolve_api_keys_scopes_to_caller(tmp_path: Path) -> None:
+    config = load_teams_config(write_config(tmp_path, v2_data()))
+    keys = resolve_api_keys(
+        config, "writer", {"TEAMS_RESEARCH_API_KEY": "research-value"}
+    )
+    assert keys == {"research": "research-value"}

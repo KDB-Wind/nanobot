@@ -84,10 +84,10 @@ def build_server(delegator: Delegator) -> Server:
     return server
 
 
-async def serve(config: TeamConfig, api_keys: Mapping[str, str]) -> None:
+async def serve(config: TeamConfig, api_keys: Mapping[str, str], caller_id: str) -> None:
     transport = HttpTransport(config.limits)
     try:
-        server = build_server(Delegator(config, transport, api_keys))
+        server = build_server(Delegator(config, transport, api_keys, caller_id))
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
                 read_stream,

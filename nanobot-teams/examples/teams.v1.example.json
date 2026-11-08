@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "team_id": "personal-research",
+  "caller_bot_id": "planner",
+  "thread_key": "main",
+  "allowed_targets": ["research"],
+  "bots": [
+    {
+      "id": "planner",
+      "display_name": "Planner",
+      "role": "Planning and synthesis"
+    },
+    {
+      "id": "research",
+      "display_name": "Research",
+      "role": "Retrieval with evidence and uncertainty",
+      "endpoint": "http://127.0.0.1:8901/v1/chat/completions",
+      "api_key_env": "TEAMS_RESEARCH_API_KEY"
+    }
+  ]
+}

@@ -8,7 +8,7 @@ import logging
 import sys
 from collections.abc import Sequence
 
-from .config import ConfigError, load_teams_config, resolve_api_keys
+from .config import ConfigError, load_teams_config, resolve_api_keys, resolve_caller
 from .server import serve
 
 
@@ -21,18 +21,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     try:
         config = load_teams_config(args.config)
-        api_keys = resolve_api_keys(config)
+        caller_id = resolve_caller(config, args.caller)
+        api_keys = resolve_api_keys(config, caller_id)
     except ConfigError as exc:
         print(f"nanobot-teams: {exc}", file=sys.stderr)
         return 2
 
-    asyncio.run(serve(config, api_keys))
+    asyncio.run(serve(config, api_keys, caller_id))
     return 0
 
 
-def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="nanobot-teams")
     parser.add_argument("--config", required=True, help="path to teams.json")
+    parser.add_argument(
+        "--caller",
+        help="bot id this MCP instance acts for; required for schema 2 registries",
+    )
     parser.add_argument("--verbose", action="store_true", help="log debug detail")
     return parser.parse_args(argv)
 

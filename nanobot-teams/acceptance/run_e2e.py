@@ -39,8 +39,10 @@ USER_CONFIG = Path.home() / ".nanobot/config.json"
 
 RESEARCH_PORT = 8901
 PLANNER_PORT = 8902
+WRITER_PORT = 8903
 RESEARCH_KEY = secrets.token_urlsafe(24)
 PLANNER_KEY = secrets.token_urlsafe(24)
+WRITER_KEY = secrets.token_urlsafe(24)
 PRESET = os.environ.get("NANOBOT_TEAMS_PRESET", "step-5-preview")
 
 
@@ -129,11 +131,52 @@ def write_teams(endpoint: str) -> Path:
     return path
 
 
+def write_teams_v2(research_endpoint: str, writer_endpoint: str) -> Path:
+    path = OUT / "teams.json"
+    write_json(
+        path,
+        {
+            "schema_version": 2,
+            "team_id": "e2e",
+            "thread_key": "main",
+            "bots": [
+                {
+                    "id": "planner",
+                    "display_name": "Planner",
+                    "role": "planning",
+                    "capabilities": ["plan"],
+                },
+                {
+                    "id": "research",
+                    "display_name": "Research",
+                    "role": "research",
+                    "capabilities": ["search"],
+                    "endpoint": research_endpoint,
+                    "api_key_env": "TEAMS_RESEARCH_API_KEY",
+                    "allowed_callers": ["planner"],
+                },
+                {
+                    "id": "writer",
+                    "display_name": "Writer",
+                    "role": "drafting",
+                    "capabilities": ["write"],
+                    "endpoint": writer_endpoint,
+                    "api_key_env": "TEAMS_WRITER_API_KEY",
+                    "allowed_callers": ["planner"],
+                },
+            ],
+        },
+    )
+    return path
+
+
 def process_env() -> dict:
     env = os.environ.copy()
     env["RESEARCH_API_KEY"] = RESEARCH_KEY
     env["PLANNER_API_KEY"] = PLANNER_KEY
+    env["WRITER_API_KEY"] = WRITER_KEY
     env["TEAMS_RESEARCH_API_KEY"] = RESEARCH_KEY
+    env["TEAMS_WRITER_API_KEY"] = WRITER_KEY
     return env
 
 
@@ -260,10 +303,11 @@ def start_stub(delay: float, status: int, content: str) -> ThreadingHTTPServer:
 
 
 def reset() -> None:
-    for name in ("research", "planner", "logs"):
+    for name in ("research", "planner", "writer", "logs"):
         shutil.rmtree(OUT / name, ignore_errors=True)
     (OUT / "research/workspace").mkdir(parents=True, exist_ok=True)
     (OUT / "planner/workspace").mkdir(parents=True, exist_ok=True)
+    (OUT / "writer/workspace").mkdir(parents=True, exist_ok=True)
 
 
 def research_config() -> Path:
@@ -273,20 +317,33 @@ def research_config() -> Path:
     return path
 
 
-def planner_config() -> Path:
+def planner_config(caller: str | None = None, writer_target: bool = False) -> Path:
     config = base_config(OUT / "planner/workspace", PLANNER_PORT, "${PLANNER_API_KEY}", restrict=True)
+    args = ["-m", "nanobot_teams", "--config", str(OUT / "teams.json")]
+    if caller:
+        args += ["--caller", caller]
+    mcp_env = {"TEAMS_RESEARCH_API_KEY": "${TEAMS_RESEARCH_API_KEY}"}
+    if writer_target:
+        mcp_env["TEAMS_WRITER_API_KEY"] = "${TEAMS_WRITER_API_KEY}"
     config["tools"]["mcpServers"] = {
         "teams": {
             "type": "stdio",
             "command": str(PY_TEAMS),
-            "args": ["-m", "nanobot_teams", "--config", str(OUT / "teams.json")],
+            "args": args,
             "cwd": str(ROOT),
-            "env": {"TEAMS_RESEARCH_API_KEY": "${TEAMS_RESEARCH_API_KEY}"},
+            "env": mcp_env,
             "toolTimeout": 180,
             "enabledTools": ["list_bots", "delegate_task"],
         }
     }
     path = OUT / "planner/config.json"
+    write_json(path, config)
+    return path
+
+
+def writer_config() -> Path:
+    config = base_config(OUT / "writer/workspace", WRITER_PORT, "${WRITER_API_KEY}", restrict=True)
+    path = OUT / "writer/config.json"
     write_json(path, config)
     return path
 
@@ -456,6 +513,89 @@ def scenario_unknown_block() -> None:
         stub.shutdown()
 
 
+def scenario_multi_bot() -> None:
+    reset()
+    research_nonce = f"R-{secrets.token_hex(4).upper()}"
+    writer_nonce = f"W-{secrets.token_hex(4).upper()}"
+    (OUT / "research/workspace/secret.txt").write_text(research_nonce, encoding="utf-8")
+    (OUT / "writer/workspace/secret.txt").write_text(writer_nonce, encoding="utf-8")
+    write_teams_v2(
+        f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions",
+        f"http://127.0.0.1:{WRITER_PORT}/v1/chat/completions",
+    )
+    research = research_config()
+    writer = writer_config()
+    planner = planner_config(caller="planner", writer_target=True)
+    env = process_env()
+    research_proc = None
+    writer_proc = None
+    planner_proc = None
+    try:
+        research_proc = start_nanobot("research", OUT / "research", research, env)
+        wait_health(RESEARCH_PORT, research_proc, "research")
+        writer_proc = start_nanobot("writer", OUT / "writer", writer, env)
+        wait_health(WRITER_PORT, writer_proc, "writer")
+        planner_proc = start_nanobot("planner", OUT / "planner", planner, env)
+        wait_health(PLANNER_PORT, planner_proc, "planner")
+        answer = chat(
+            PLANNER_PORT,
+            PLANNER_KEY,
+            "planner-multi",
+            "You must use the Teams tools. Call mcp_teams_list_bots once, then call "
+            "mcp_teams_delegate_task twice: first with bot_id research, then with "
+            "bot_id writer. Give both this exact task:\n\n"
+            "Read the file secret.txt in your workspace with your file tool. "
+            "Reply with only its exact contents and nothing else.\n\n"
+            "Do not answer from your own knowledge. After both tools return, reply "
+            "with only RESEARCH=<research answer> WRITER=<writer answer>.",
+            timeout=420,
+        )
+        assert research_nonce in answer, answer
+        assert writer_nonce in answer, answer
+        log("PASS multi_bot")
+    finally:
+        stop(planner_proc)
+        stop(writer_proc)
+        stop(research_proc)
+
+
+async def _unauthorized_mcp_calls(config: Path) -> tuple[dict, dict]:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    params = StdioServerParameters(
+        command=str(PY_TEAMS),
+        args=["-m", "nanobot_teams", "--config", str(config), "--caller", "writer"],
+        env={**os.environ, "TEAMS_RESEARCH_API_KEY": RESEARCH_KEY},
+        cwd=str(OUT),
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            listed = await session.call_tool("list_bots", {})
+            refused = await session.call_tool(
+                "delegate_task", {"bot_id": "research", "task": "should never send"}
+            )
+            return json.loads(listed.content[0].text), json.loads(refused.content[0].text)
+
+
+def scenario_unauthorized_pair() -> None:
+    reset()
+    stub = start_stub(0.0, 200, "unused")
+    try:
+        config = write_teams_v2(
+            f"http://127.0.0.1:{RESEARCH_PORT}/v1/chat/completions",
+            f"http://127.0.0.1:{WRITER_PORT}/v1/chat/completions",
+        )
+        listed, refused = asyncio.run(_unauthorized_mcp_calls(config))
+        assert listed == {"bots": []}, listed
+        assert refused["error_code"] == "invalid_target", refused
+        assert StubHandler.hits == 0, StubHandler.hits
+        log("PASS unauthorized_pair")
+    finally:
+        stub.shutdown()
+
+
 def scenario_plugin_manifest() -> None:
     reset()
     target = OUT / "planner/workspace/plugins/nanobot-teams"
@@ -495,6 +635,8 @@ SCENARIOS = {
     "session_persistence": scenario_session_persistence,
     "long_timeout": scenario_long_timeout,
     "unknown_block": scenario_unknown_block,
+    "multi_bot": scenario_multi_bot,
+    "unauthorized_pair": scenario_unauthorized_pair,
     "plugin_manifest": scenario_plugin_manifest,
 }
 

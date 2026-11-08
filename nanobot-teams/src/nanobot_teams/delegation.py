@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from .config import BotConfig, TeamConfig
 from .transport import HttpTransport, OutcomeKind, TransportOutcome
@@ -44,13 +45,13 @@ class DelegationResult:
         )
 
 
-def session_id_for(config: TeamConfig, target_bot_id: str) -> str:
-    """Map a team thread and target to a stable session id; the hash only names a session."""
+def session_id_for(config: TeamConfig, caller_id: str, target_bot_id: str) -> str:
+    """Map a team thread, caller, and target to a stable session id; the hash only names a session."""
     canonical = json.dumps(
         [
             config.schema_version,
             config.team_id,
-            config.caller_bot_id,
+            caller_id,
             target_bot_id,
             config.thread_key,
         ],
@@ -76,25 +77,32 @@ class Delegator:
         config: TeamConfig,
         transport: HttpTransport,
         api_keys: Mapping[str, str],
+        caller_id: str,
         logger: logging.Logger | None = None,
     ) -> None:
         self._config = config
         self._transport = transport
         self._api_keys = dict(api_keys)
+        self._caller_id = caller_id
         self._logger = logger or logging.getLogger("nanobot_teams.delegation")
         self._busy = False
         self._blocked = False
 
-    def list_bots(self) -> list[dict[str, str]]:
+    def list_bots(self) -> list[dict[str, Any]]:
         return [
-            {"id": bot.id, "display_name": bot.display_name, "role": bot.role}
-            for bot in self._config.targets()
+            {
+                "id": bot.id,
+                "display_name": bot.display_name,
+                "role": bot.role,
+                "capabilities": list(bot.capabilities),
+            }
+            for bot in self._config.targets_for(self._caller_id)
         ]
 
     async def delegate_task(self, bot_id: str, task: str) -> DelegationResult:
         task_id = str(uuid.uuid4())
         target = self._config.bot(bot_id)
-        if target is None or bot_id not in self._config.allowed_targets:
+        if target is None or not self._config.can_delegate(self._caller_id, bot_id):
             return self._refuse(task_id, bot_id, "invalid_target", _INVALID_TARGET)
         if not task or len(task.encode("utf-8")) > self._config.limits.task_max_bytes:
             return self._refuse(task_id, bot_id, "task_invalid", _INVALID_TASK)
@@ -110,7 +118,7 @@ class Delegator:
                 endpoint=_endpoint_of(target),
                 api_key=self._api_keys[bot_id],
                 task=task,
-                session_id=session_id_for(self._config, bot_id),
+                session_id=session_id_for(self._config, self._caller_id, bot_id),
             )
         finally:
             self._busy = False

@@ -5,13 +5,14 @@ description: Delegate one self-contained task to another Nanobot bot and use the
 
 # Teams
 
-Use the Teams tools when the user asks for work that a separate, persistent bot should own. The team is a fixed single thread. The caller is the Planner. The allowed targets are listed by `mcp_teams_list_bots`.
+Use the Teams tools when the user asks for work that a separate, persistent bot should own. The team is a fixed single thread. The targets you may delegate to are listed by `mcp_teams_list_bots`, each with its role and capabilities. Any other bot id is refused.
 
 ## Delegate
 
-1. Call `mcp_teams_list_bots` when you do not know the allowed target.
-2. Call `mcp_teams_delegate_task` with `bot_id` and a self-contained `task`.
-3. Wait for the result in the same turn. There is no background delivery.
+1. Call `mcp_teams_list_bots` when you do not know which target fits the task.
+2. Pick the target by its role and capabilities, not by guessing ids.
+3. Call `mcp_teams_delegate_task` with `bot_id` and a self-contained `task`.
+4. Wait for the result in the same turn. There is no background delivery.
 
 Write the task as a brief for a stranger. Include the goal, the relevant background, the scope, the expected output, and any constraints. Do not forward the full chat history, the system prompt, credentials, or unrelated personal data.
 

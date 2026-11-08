@@ -129,7 +129,14 @@ async def test_stdio_server_speaks_mcp(tmp_path: Path, target: tuple[Target, int
                 assert listed.isError is False
                 listed_text = listed.content[0].text
                 assert json.loads(listed_text) == {
-                    "bots": [{"id": "research", "display_name": "Research", "role": "research"}]
+                    "bots": [
+                        {
+                            "id": "research",
+                            "display_name": "Research",
+                            "role": "research",
+                            "capabilities": [],
+                        }
+                    ]
                 }
                 assert "endpoint" not in listed_text
 

@@ -53,8 +53,8 @@ def build(
 ) -> tuple[Delegator, HttpTransport]:
     config = load(tmp_path, data or config_data())
     transport = HttpTransport(config.limits, transport=httpx.MockTransport(handler))
-    keys = {bot.id: SECRET for bot in config.targets()}
-    return Delegator(config, transport, keys), transport
+    keys = {bot.id: SECRET for bot in config.targets_for("planner")}
+    return Delegator(config, transport, keys, "planner"), transport
 
 
 def completion(content: str) -> dict[str, Any]:
@@ -246,14 +246,16 @@ async def test_empty_task_is_refused(tmp_path: Path) -> None:
 async def test_list_bots_hides_target_details(tmp_path: Path) -> None:
     config = load(tmp_path, config_data())
     transport = HttpTransport(Limits(), transport=httpx.MockTransport(_unreachable))
-    delegator = Delegator(config, transport, {})
+    delegator = Delegator(config, transport, {}, "planner")
 
     try:
         listed = delegator.list_bots()
     finally:
         await transport.aclose()
 
-    assert listed == [{"id": "research", "display_name": "Research", "role": "research"}]
+    assert listed == [
+        {"id": "research", "display_name": "Research", "role": "research", "capabilities": []}
+    ]
     assert "endpoint" not in json.dumps(listed)
 
 
@@ -261,9 +263,9 @@ def test_session_id_is_deterministic(tmp_path: Path) -> None:
     config = load(tmp_path, config_data())
     again = load(tmp_path, config_data())
 
-    assert session_id_for(config, "research") == session_id_for(again, "research")
-    assert session_id_for(config, "research").startswith("teams-v1-")
-    assert len(session_id_for(config, "research")) == 41
+    assert session_id_for(config, "planner", "research") == session_id_for(again, "planner", "research")
+    assert session_id_for(config, "planner", "research").startswith("teams-v1-")
+    assert len(session_id_for(config, "planner", "research")) == 41
 
 
 def test_session_id_differs_per_thread_and_target(tmp_path: Path) -> None:
@@ -271,8 +273,10 @@ def test_session_id_differs_per_thread_and_target(tmp_path: Path) -> None:
     other_thread = load(tmp_path, config_data(thread_key="other"))
     two_targets = load(tmp_path, config_data(allowed=["research", "analyst"]))
 
-    assert session_id_for(main, "research") != session_id_for(other_thread, "research")
-    assert session_id_for(two_targets, "research") != session_id_for(two_targets, "analyst")
+    assert session_id_for(main, "planner", "research") != session_id_for(
+        other_thread, "planner", "research"
+    )
+    assert session_id_for(two_targets, "planner", "research") != session_id_for(two_targets, "planner", "analyst")
 
 
 async def _unreachable(request: httpx.Request) -> httpx.Response:

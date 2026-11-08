@@ -54,15 +54,23 @@ def test_config_has_no_secret_fields() -> None:
     bot_fields = {field.name for field in fields(BotConfig)}
     team_fields = {field.name for field in fields(TeamConfig)}
 
-    assert bot_fields == {"id", "display_name", "role", "endpoint", "api_key_env"}
+    assert bot_fields == {
+        "id",
+        "display_name",
+        "role",
+        "capabilities",
+        "model_preset",
+        "endpoint",
+        "api_key_env",
+        "allowed_callers",
+    }
     assert team_fields == {
         "schema_version",
         "team_id",
-        "caller_bot_id",
         "thread_key",
-        "allowed_targets",
         "bots",
         "limits",
+        "default_caller_id",
     }
     assert not (bot_fields | team_fields) & {"api_key", "token", "secret", "authorization"}
 
@@ -70,5 +78,12 @@ def test_config_has_no_secret_fields() -> None:
 def test_example_teams_config_loads() -> None:
     config = load_teams_config(ROOT / "examples" / "teams.example.json")
 
-    assert config.caller_bot_id == "planner"
-    assert [bot.id for bot in config.targets()] == ["research"]
+    assert config.schema_version == 2
+    assert {bot.id for bot in config.targets_for("planner")} == {"research", "writer"}
+
+
+def test_example_v1_config_loads() -> None:
+    config = load_teams_config(ROOT / "examples" / "teams.v1.example.json")
+
+    assert config.default_caller_id == "planner"
+    assert [bot.id for bot in config.targets_for("planner")] == ["research"]

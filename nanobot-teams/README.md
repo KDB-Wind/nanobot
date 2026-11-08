@@ -53,33 +53,61 @@ Copy `examples/teams.example.json` to a directory outside every model-writable w
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "team_id": "personal-research",
-  "caller_bot_id": "planner",
   "thread_key": "main",
-  "allowed_targets": ["research"],
   "bots": [
-    {"id": "planner", "display_name": "Planner", "role": "Planning and synthesis"},
+    {
+      "id": "planner",
+      "display_name": "Planner",
+      "role": "Planning and synthesis",
+      "capabilities": ["plan", "synthesize"],
+      "model_preset": "step-5-preview"
+    },
     {
       "id": "research",
       "display_name": "Research",
       "role": "Retrieval with evidence and uncertainty",
+      "capabilities": ["search"],
       "endpoint": "http://127.0.0.1:8901/v1/chat/completions",
-      "api_key_env": "TEAMS_RESEARCH_API_KEY"
+      "api_key_env": "TEAMS_RESEARCH_API_KEY",
+      "allowed_callers": ["planner"]
+    },
+    {
+      "id": "writer",
+      "display_name": "Writer",
+      "role": "Drafting long-form answers",
+      "endpoint": "http://127.0.0.1:8903/v1/chat/completions",
+      "api_key_env": "TEAMS_WRITER_API_KEY",
+      "allowed_callers": ["planner"]
     }
   ]
 }
 ```
 
+Authorization is a graph: a delegation from caller to target is allowed only
+when the target lists the caller in `allowed_callers`. One registry can serve
+every bot's MCP instance; each instance states who it acts for with
+`--caller <bot id>` on the command line, which is trusted control-plane
+configuration, never model input. `capabilities` and `model_preset` are
+advisory metadata surfaced through `list_bots` so the caller can choose a
+target; they do not configure the target instance itself.
+
 Rules enforced at startup:
 
-- `schema_version` must be `1`.
-- `caller_bot_id` must name a bot in `bots`, and that bot cannot appear in `allowed_targets`.
-- Every allowed target must exist in `bots` and must carry an `endpoint` and an `api_key_env`.
-- Bot ids are lowercase letters, digits, dots, underscores, and hyphens, up to 64 characters.
+- `schema_version` must be `2` (or `1` for the legacy single-caller shape; see below).
+- Bot ids are lowercase letters, digits, dots, underscores, and hyphens, up to 64 characters, unique.
+- A bot with `allowed_callers` must carry an `endpoint` and an `api_key_env`; a bot without them must not.
+- `allowed_callers` entries must be bot ids in the registry, unique, and never the bot itself.
+- `--caller` must name a bot in the registry. Schema 2 refuses to start without it; schema 1 defaults to `caller_bot_id` and pins `--caller` to that value.
 - The endpoint must be `http://127.0.0.1:<port>/v1/chat/completions`. No other host, scheme, path, query, userinfo, or fragment is accepted.
-- The environment variable named by `api_key_env` must be set and non-empty when the server starts.
+- The environment variable named by `api_key_env` must be set and non-empty for every target the caller can reach.
 - Unknown fields are rejected. A bad config writes one line to stderr and exits with code 2.
+
+Schema 1 files (`caller_bot_id` plus `allowed_targets` at the top level) keep
+loading: each allowed target is normalized to `allowed_callers: [<caller>]` and
+the fixed caller becomes the instance default. `examples/teams.v1.example.json`
+shows the legacy shape.
 
 Add an optional `limits` object to override the defaults:
 
@@ -127,7 +155,7 @@ Give Research its own model preset, its own tools, and its own workspace. The AP
 
 ## Register the MCP server
 
-Add this to the Planner config. Keep the timeout above the Research request timeout.
+Add this to the Planner config. Keep the timeout above the Research request timeout. The `--caller` argument tells this MCP instance which bot it acts for.
 
 ```json
 {
@@ -136,7 +164,14 @@ Add this to the Planner config. Keep the timeout above the Research request time
       "teams": {
         "type": "stdio",
         "command": "D:/Tools/nanobot-teams/.venv/Scripts/python.exe",
-        "args": ["-m", "nanobot_teams", "--config", "D:/BotData/teams/teams.json"],
+        "args": [
+          "-m",
+          "nanobot_teams",
+          "--config",
+          "D:/BotData/teams/teams.json",
+          "--caller",
+          "planner"
+        ],
         "cwd": "D:/BotData/teams",
         "env": {
           "TEAMS_RESEARCH_API_KEY": "${TEAMS_RESEARCH_API_KEY}"
@@ -148,6 +183,11 @@ Add this to the Planner config. Keep the timeout above the Research request time
   }
 }
 ```
+
+A bot that can itself delegate (a middle hop) registers the same server with
+`--caller <its own id>` in its own Nanobot config. One registry file serves
+every instance; each instance resolves only the credentials for the targets its
+caller is authorized to reach.
 
 The explicit `env` entry matters. A custom MCP server does not inherit the plugin variables or every parent environment variable. Set `TEAMS_RESEARCH_API_KEY` in the process that starts the Planner.
 

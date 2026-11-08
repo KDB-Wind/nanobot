@@ -32,6 +32,8 @@ NANOBOT_TEAMS_PRESET=glm-5.3-flash python acceptance/run_e2e.py all
 | `session_persistence` | The deterministic session id survives a Research restart. |
 | `long_timeout` | A 35 second task outlives the 30 second default and returns at ~48 s. |
 | `unknown_block` | A 500 marks the target and a retry never reaches HTTP. |
+| `multi_bot` | A schema 2 registry with three bots; Planner delegates to two authorized targets. |
+| `unauthorized_pair` | A caller not in `allowed_callers` is refused before any HTTP. |
 | `plugin_manifest` | Real `discover_agent_plugins` accepts the package. |
 
 ## Unix path
