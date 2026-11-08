@@ -13,7 +13,7 @@
 | S2 | 多跳与回复路由 | 完成 | `28a5cb476` |
 | S3 | Bot 生命周期工具 | 完成 | `b27a0acdf` |
 | S4 | 任务账本与可观测性 | 完成 | `6f946043d` |
-| S5 | 管理与策略 | 未开始 | - |
+| S5 | 管理与策略 | 完成 | `7ad04c42a`+`0073794da`+`5fddcb87d` |
 | S6 | 硬化与发布 | 未开始 | - |
 
 ## S0:MVP 收尾(2026-11-08 完成)
@@ -211,3 +211,41 @@ S4:任务账本与可观测性。Teams 自有 SQLite(仅本地观察),list_tasks
 
 S5:管理与策略。CLI graph/budget/audit;每 bot、每链路的调用预算
 (次数、字节、时间);超预算明确拒绝。
+
+## S5:管理与策略(2026-11-09 完成)
+
+### 做了什么
+
+1. 预算(schema 2 新增 `budgets` 段):按 caller 配 `delegations` / `result_bytes` /
+   `chain_seconds` 三项可选上限。强制力来自账本累计(可跨重启);配置了
+   预算但没有 --ledger 的实例拒绝一切委派(不猜)。超限本地拒绝,
+   错误码 `budget_exceeded`,不发 HTTP。
+2. CLI 只读视图:`graph`(授权图文本 + mermaid)、`budget`(各 bot 用量
+   used/limit,超限标 OVER)、`audit`(跨多个账本文件的行级审计 +
+   状态汇总,支持 target/status/limit 过滤)。
+3. 只读 Web 页面:按 ROADMAP"可选"条款明确不做,CLI 覆盖验收语义;
+   决策记录于 decisions.tsv。
+
+### 验收记录
+
+| 命令 | 平台 | 输出摘要 |
+| --- | --- | --- |
+| `pytest -q` | Windows / Ubuntu | `141 passed`(新增 8 个策略测试) |
+| `ruff check src tests acceptance` | Windows | `All checks passed!` |
+| `run_e2e.py budget_reject` | Windows / Ubuntu | PASS(上限 2:第 1、2 次 completed,第 3 次 budget_exceeded,stub 命中恰 2 次;graph/budget/audit CLI 输出断言通过) |
+| `run_e2e.py ledger_restart`(回归) | Windows / Ubuntu | PASS |
+
+### 已知限制
+
+- 预算按 caller 计,不按 (caller,target) 对;配图里的"每链路"预算需
+  账本按 target 聚合的扩展,当前 audit --target 可人工查看。
+- 预算检查点在 busy/blocked 之后;同一进程内串行无竞态,多实例并行
+  (同一账本文件)不做跨进程锁,与 ROADMAP"不做跨进程幂等"一致。
+- 修复两处自身缺陷:str.replace 误触静态写扫描(改用 str.translate 保持
+  扫描严格);e2e 场景残留在 .e2e 根下的账本文件未随 reset 清理(场景
+  开头显式删除)。
+
+### 下一步
+
+S6:硬化与发布。契约回归(mock+真实基线)、版本矩阵、wheel 构建、
+全新环境安装/升级/卸载、文档"已实现/已测试/不支持"三分。
