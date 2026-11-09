@@ -238,7 +238,6 @@ async def main() -> int:
         for bot_id, marker in (("research", "FINDINGS-alpha-7391"),
                                ("writer", "DRAFT-beta-2531")):
             payload = terminal.get(bot_id, {})
-            result_text = payload.get("result_available") and "" or ""
             status, result = http_json(
                 "GET",
                 f"http://127.0.0.1:{coord_port}/v1/teams/tasks/{task_ids[bot_id]}",
