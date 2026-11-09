@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import random
 from datetime import timedelta
+from typing import Any
 
 from .client import BotRunClient, BotUnreachableError
-from .models import TERMINAL_RUN_STATES
+from .models import TERMINAL_RUN_STATES, DeliveryState
 from .store import CoordinatorStore, utc_now
 
 log = logging.getLogger("nanobot_teams.coordinator.worker")
@@ -50,9 +52,15 @@ class ClientFactory:
 
 
 class DispatchWorker:
-    def __init__(self, store: CoordinatorStore, clients: ClientFactory) -> None:
+    def __init__(
+        self,
+        store: CoordinatorStore,
+        clients: ClientFactory,
+        planner: Any | None = None,
+    ) -> None:
         self._store = store
         self._clients = clients
+        self._planner = planner
         self._running = False
 
     async def run_loop(self, *, poll_s: float = 0.5) -> None:
@@ -73,6 +81,7 @@ class DispatchWorker:
         progressed = False
         progressed |= await self._dispatch_due()
         progressed |= await self._observe_accepted()
+        progressed |= await self._deliver_results()
         return progressed
 
     # ---- dispatch ----
@@ -237,6 +246,81 @@ class DispatchWorker:
         self._store.mark_indeterminate(
             task.task_id, f"Instance identity changed from {expected} to {actual}."
         )
+
+    # ---- delivery ----
+
+    async def _deliver_results(self) -> bool:
+        """Deliver terminal auto_resume results to the fixed planner inbox."""
+        tasks = self._store.auto_resume_ready_tasks()
+        if not tasks:
+            return False
+        for task in tasks:
+            await self._deliver_one(task)
+        return True
+
+    async def _deliver_one(self, task) -> None:
+        import httpx
+
+        planner = self._planner
+        if planner is None or not task.reply_capability:
+            self._store.set_delivery_state(task.task_id, DeliveryState.FAILED)
+            return
+        delivery_id = "del_" + hashlib.sha256(
+            f"{task.task_id}:{task.remote_revision}".encode("utf-8")
+        ).hexdigest()[:24]
+        inbox_key = os.environ.get(planner.inbox_key_env, "").strip()
+        if not inbox_key:
+            self._store.set_delivery_state(task.task_id, DeliveryState.PENDING)
+            return
+        payload = {
+            "delivery_id": delivery_id,
+            "reply_capability": task.reply_capability,
+            "operation_key": task.operation_key,
+            "workflow_id": task.workflow_id,
+            "bot_id": task.bot_id,
+            "instance_id": task.remote_instance_id or "",
+            "task_id": task.task_id,
+            "run_id": task.remote_run_id or "",
+            "terminal_revision": task.remote_revision,
+            "outcome": {"code": task.outcome_code or task.run_state},
+            "result_text": task.result_text,
+            "result_truncated": task.result_truncated,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    planner.inbox_url.rstrip("/") + "/v1/agent-inbox",
+                    headers={"Authorization": f"Bearer {inbox_key}"},
+                    json=payload,
+                )
+                if response.status_code in (200, 202):
+                    self._store.set_delivery_state(
+                        task.task_id, DeliveryState.PERSISTED
+                    )
+                    receipt = await client.get(
+                        planner.inbox_url.rstrip("/") + f"/v1/agent-inbox/{delivery_id}",
+                        headers={"Authorization": f"Bearer {inbox_key}"},
+                    )
+                    if receipt.status_code == 200:
+                        state = str(receipt.json().get("state", ""))
+                        mapping = {
+                            "injected": DeliveryState.INJECTED,
+                            "orphaned": DeliveryState.ORPHANED,
+                            "card_only": DeliveryState.CARD_ONLY,
+                        }
+                        if state in mapping:
+                            self._store.set_delivery_state(task.task_id, mapping[state])
+                    return
+                if response.status_code == 410:
+                    self._store.set_delivery_state(task.task_id, DeliveryState.ORPHANED)
+                    return
+                if response.status_code == 409:
+                    self._store.set_delivery_state(task.task_id, DeliveryState.FAILED)
+                    return
+        except httpx.HTTPError:
+            pass
+        # Retryable: keep pending; the next pump retries the same delivery id.
+        self._store.set_delivery_state(task.task_id, DeliveryState.PENDING)
 
     # ---- observation ----
 

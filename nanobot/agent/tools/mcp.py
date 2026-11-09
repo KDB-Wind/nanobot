@@ -698,10 +698,31 @@ def _mcp_image_tool_result(text_parts: list[str], artifacts: list[dict[str, Any]
     return json.dumps(payload, ensure_ascii=False)
 
 
+_TEAMS_ASYNC_META_HOOK: Callable[[str], Callable[[], dict[str, str]]] | None = None
+
+
+def set_teams_async_meta_hook(
+    hook: Callable[[str], Callable[[], dict[str, str]]] | None,
+) -> None:
+    """Gateway assembly injects the capability mint; other hosts stay inert."""
+    global _TEAMS_ASYNC_META_HOOK
+    _TEAMS_ASYNC_META_HOOK = hook
+
+
+def _teams_async_meta_provider(server_name: str) -> Callable[[], dict[str, str]] | None:
+    if _TEAMS_ASYNC_META_HOOK is None:
+        return None
+    return _TEAMS_ASYNC_META_HOOK(server_name)
+
+
 class MCPToolWrapper(_MCPWrapperBase):
     """Wraps a single MCP server tool as a nanobot Tool."""
 
     _plugin_discoverable = False
+
+    _RESERVED_TRUSTED_ARGS = frozenset(
+        {"reply_capability", "reply_workflow", "coordinator_principal"}
+    )
 
     def __init__(
         self,
@@ -709,7 +730,9 @@ class MCPToolWrapper(_MCPWrapperBase):
         server_name: str,
         tool_def: MCPToolDefinition,
         tool_timeout: int = 30,
+        trusted_meta_provider: Callable[[], dict[str, str]] | None = None,
     ):
+        self._trusted_meta_provider = trusted_meta_provider
         self._original_name = tool_def.name
         self._name = _sanitize_mcp_tool_name(f"mcp_{server_name}_{tool_def.name}")
         self._description = tool_def.description or tool_def.name
@@ -741,8 +764,18 @@ class MCPToolWrapper(_MCPWrapperBase):
         return self._parameters
 
     async def execute(self, **kwargs: Any) -> str:
+        meta: dict[str, str] | None = None
+        if self._trusted_meta_provider is not None:
+            forged = sorted(set(kwargs) & self._RESERVED_TRUSTED_ARGS)
+            if forged:
+                return ToolResult.error(
+                    f"Rejected model-supplied routing fields: {', '.join(forged)}"
+                )
+            meta = self._trusted_meta_provider()
         result = await self._request_with_recovery(
-            lambda session: session.call_tool(self._original_name, arguments=kwargs),
+            lambda session: session.call_tool(
+                self._original_name, arguments=kwargs, meta=meta
+            ),
             self._tool_timeout,
             "tool",
         )
@@ -1144,7 +1177,13 @@ async def connect_mcp_servers(
                         name,
                     )
                     continue
-                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                meta_provider = (
+                    _teams_async_meta_provider(name) if cfg.teams_async else None
+                )
+                wrapper = MCPToolWrapper(
+                    session, name, tool_def, tool_timeout=cfg.tool_timeout,
+                    trusted_meta_provider=meta_provider,
+                )
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
                 registered_count += 1

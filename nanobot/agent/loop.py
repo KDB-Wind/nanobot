@@ -1860,6 +1860,14 @@ class AgentLoop:
         session: Session | None = None,
     ) -> OutboundMessage | None:
         kind = TurnKind.USER if msg.is_user_input else TurnKind.SYSTEM
+        if kind is TurnKind.USER:
+            inbox = getattr(self, "external_inbox", None)
+            if inbox is not None and session_key:
+                # A real user turn ends older workflows' auto-continue grants.
+                try:
+                    inbox.revoke_session_workflows(session_key)
+                except Exception:
+                    logger.debug("external inbox revocation skipped for {}", session_key)
         if kind is TurnKind.SYSTEM:
             destination = (
                 msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)

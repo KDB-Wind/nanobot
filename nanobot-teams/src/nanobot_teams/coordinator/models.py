@@ -98,6 +98,7 @@ class Task:
     delivery_state: DeliveryState = DeliveryState.NOT_READY
     finished_at: datetime | None = None
     last_error: str = ""
+    reply_capability: str = ""
 
     @property
     def open(self) -> bool:

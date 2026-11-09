@@ -127,12 +127,53 @@ def build_app(
         if delivery_mode not in (DeliveryMode.WORKBENCH_ONLY, DeliveryMode.AUTO_RESUME):
             return api_error(400, "invalid_field", "delivery_mode must be workbench_only or auto_resume.")
         if delivery_mode is DeliveryMode.AUTO_RESUME:
-            # P4 wires the capability handshake; until then admission is refused.
-            return api_error(
-                422,
-                "origin_required",
-                "auto_resume requires a validated reply capability (not yet enabled here).",
-            )
+            planner = config.planner
+            capability = str(body.get("reply_capability", "")).strip()
+            if planner is None or not capability:
+                return api_error(
+                    422,
+                    "origin_required",
+                    "auto_resume requires a planner binding and a reply capability.",
+                )
+            import os
+
+            import httpx
+
+            inbox_key = os.environ.get(planner.inbox_key_env, "").strip()
+            if not inbox_key:
+                return api_error(
+                    503, "planner_key_missing",
+                    f"{planner.inbox_key_env} is not set in the coordinator environment.",
+                )
+            validate_body = {
+                "capability": capability,
+                "workflow": str(body.get("workflow", "wf-default")),
+                "operation_key": str(body["operation_key"]),
+                "bot_id": str(body["bot"]),
+                "instance_id": str(body.get("instance_id", "")),
+            }
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    validation = await client.post(
+                        planner.inbox_url.rstrip("/") + "/v1/agent-inbox/capabilities/validate",
+                        headers={"Authorization": f"Bearer {inbox_key}"},
+                        json=validate_body,
+                    )
+            except httpx.HTTPError:
+                return api_error(
+                    503, "planner_unavailable",
+                    "The planner inbox did not answer; new remote tasks are refused.",
+                )
+            if validation.status_code != 200:
+                detail = ""
+                try:
+                    detail = str(validation.json().get("code", ""))
+                except ValueError:
+                    pass
+                return api_error(
+                    422, detail or "capability_invalid",
+                    "The planner rejected the reply capability.",
+                )
         bot = store.get_bot(str(body["bot"]))
         if bot is None:
             return api_error(400, "bot_unavailable", "No registered bot with that id.")
@@ -145,6 +186,7 @@ def build_app(
                 deadline = datetime.fromisoformat(str(deadline_raw))
             except ValueError:
                 return api_error(400, "invalid_field", "deadline_at must be RFC 3339.")
+        reply_capability = str(body.get("reply_capability", "")).strip()
         try:
             task, created = store.admit_task(
                 caller_principal=principal_for(request),
@@ -156,6 +198,7 @@ def build_app(
                 deadline_at=deadline,
                 delivery_mode=delivery_mode,
                 bot=bot,
+                reply_capability=reply_capability,
             )
         except IdempotencyConflictError as exc:
             return api_error(409, exc.code, exc.detail)

@@ -50,7 +50,7 @@ class CoordinatorService:
             log.error("cannot listen on %s:%s: %s", self.config.host, self.config.port, exc)
             await runner.cleanup()
             return 1
-        worker = DispatchWorker(self.store, self.clients)
+        worker = DispatchWorker(self.store, self.clients, planner=self.config.planner)
         worker_task = asyncio.create_task(worker.run_loop())
         log.info(
             "coordinator listening on http://%s:%s (control dir %s)",

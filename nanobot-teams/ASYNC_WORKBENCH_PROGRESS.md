@@ -29,7 +29,7 @@
 | P1 持久运行领域 | in_progress | §4 P1:20 tests + 强杀恢复 3/3 + pyright/ruff 绿 | P2 执行器适配后复验 A01–A06/A15 公开行为 | P2 |
 | P2 运行 HTTP + 执行器 | pending | - | - | - |
 | P3 Coordinator + 异步 MCP | verified | §4 P3:29 项新测试(210 总通过)+ 真实进程强杀恢复 | A08 库级故障(只读/满盘)与 stdio MCP 实测留给 Q2/P7 | P4 |
-| P4 可信回传 + 续接 | pending | - | - | - |
+| P4 可信回传 + 续接 | verified | §4 P4:inbox 领域 4 + P4 链路 3 + Teams 210/parent 99 全绿 | A09 wrapper 单测、A10 进程级交错、A12 → Q1/Q2/P5/P7 | P5 |
 | P5 WebUI 工作台 | pending | - | - | - |
 | P6 cron 定时任务 | pending | - | - | - |
 | P7 真实验收/迁移/交付 | pending | - | - | - |
@@ -139,6 +139,19 @@
 - 修复记录:启动快照 secrets 导致后注册 bot 空密钥且无限退避 → ClientFactory 实时读环境 + MissingSecret 快速 indeterminate;HTTPException 状态烘焙、AppKey 警告、异常命名等清理。
 - 检查:`pytest -q` **210 passed in 53s**(基线 181 + 新 29);ruff(src+tests)通过;`coordinator` extra 声明 aiohttp。
 - 剩余(记入 Q2/P7):A08 的 DB 只读/满盘/写盘失败注入;A16 真实 stdio MCP 进程往返;A19 的 home 路径越界在 P5 scaffold 覆盖。
+
+### P4
+
+- 2026-11-09 实现并通过:
+  - `nanobot/session/sqlite_store.py` schema v5:reply_capabilities / external_workflows / external_inbox 三表(v1–v4 兼容保留)。
+  - `nanobot/session/external_inbox.py`:capability 铸造(只存 SHA-256 摘要,原值随受信 MCP meta 外传)、首次使用绑定 workflow/op_key/bot/instance、会话存在与 generation 校验(stale_origin)、receipt 持久去重(同 ID 同体幂等、同 ID 异体 409)、`apply_pending` 在 `_change` 同一事务内插入带确定性 `external_delivery_id` 标记的消息并置 injected(崩溃重放不重复插入)、`revoke_session_workflows`(新用户轮次撤销旧 workflow 自动继续 → 晚到报告 card_only)。
+  - `nanobot/api/agent_inbox.py`:capabilities/validate + POST /v1/agent-inbox + GET receipt;专用 runs 密钥,普通聊天凭据 401;未知字段拒绝;result 32KiB 上限;stale_origin → 410。
+  - gateway 装配(`cli/gateway_runtime.py`):`api.runs.enabled + inbox_enabled` 时同进程启动 aiohttp sidecar(绑 api.host:api.port,占用即启动失败),注册 MCP meta 钩子(`MCPServerConfig.teams_async` 显式启用;RequestContext 铸 capability),启动恢复扫描未注入投递;`agent/loop.py` 真实用户轮次起手撤销旧 workflow(4 行,经 external_inbox 属性注入)。
+  - MCPToolWrapper:受信服务调用附 `meta=`,模型 arguments 携带保留字段(reply_capability/reply_workflow/coordinator_principal)直接拒绝;async_mcp 读取 `server.request_context...params.meta`,auto_resume 无 capability → origin_required,模型参数出现保留字段 → forged_routing_fields。
+  - Coordinator:`tasks.reply_capability` 列(旧库 ALTER 兼容);auto_resume 准入实时向固定 Planner inbox 校验 capability(planner 不可用 → 拒新任务);worker 投递泵:确定性 delivery_id(task_id+terminal_revision 派生)、202→persisted、receipt 轮询→injected/orphaned/card_only、410→orphaned、409→failed、网络错误同 ID 重试。
+- 测试:`tests/session/test_external_inbox.py` **4 passed**(绑定/过期/撤销/伪造、原子注入+重放不重复、会话替换 orphaned、新轮次 card_only);`tests/runs/test_p4_chain.py` **3 passed**(同进程真实 HTTP 全链:capability→Coordinator 校验准入→派发→假 Bot 终态→投递→inbox 注入历史恰一次;伪造/撤销/缺 capability 拒绝+普通凭据 401;会话重置晚到结果不进新会话);Teams 全量 **210 passed**;parent(runs+inbox+API 回归)**99 passed**;两包 ruff 通过。
+- 修复记录:capability 首次使用绑定(mint 时模型尚未给 op_key/bot);外部 workflows INSERT 列序错位(auto_continue 收到时间戳);aiohttp AppKey/RequestKey;异常命名。
+- 剩余(记入 Q1/Q2/P7):A09 wrapper 层保留字段拒绝的专门单测;A10 receipt/历史提交点强杀交错(Q2);A12 浏览器关闭/重启/多 tab(P5/P7);A18 loop 撤销钩子的运行时验证(P7 live);Coordinator 向 planner inbox 的网络断线重试真实进程验证(Q2/P7)。
 
 ## 5. 运行中进程与待恢复状态
 

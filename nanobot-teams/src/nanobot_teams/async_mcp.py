@@ -195,12 +195,38 @@ def build_async_server(client: CoordinatorClient) -> Server:
             isError=is_error,
         )
 
+    def _trusted_meta() -> dict[str, str]:
+        """Read host-minted routing meta; never accepted from model arguments."""
+        try:
+            context = server.request_context.get()
+        except LookupError:
+            return {}
+        params = getattr(context.request, "params", None)
+        meta = getattr(params, "meta", None)
+        if not isinstance(meta, dict):
+            return {}
+        return {
+            str(k): str(v)
+            for k, v in meta.items()
+            if k in ("reply_capability", "reply_workflow", "coordinator_principal")
+        }
+
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
         try:
             if name == "list_bots":
                 return _text({"bots": await client.list_bots()})
             if name == "submit_task":
+                meta = _trusted_meta()
+                forged = sorted(set(arguments) & {
+                    "reply_capability", "reply_workflow", "coordinator_principal"
+                })
+                if forged:
+                    return _text(
+                        {"error_code": "forged_routing_fields",
+                         "detail": f"Model arguments must not carry: {', '.join(forged)}"},
+                        is_error=True,
+                    )
                 body = {
                     "project": arguments.get("project"),
                     "bot": arguments.get("bot"),
@@ -210,6 +236,16 @@ def build_async_server(client: CoordinatorClient) -> Server:
                 for optional in ("workflow", "deadline_at", "delivery_mode"):
                     if arguments.get(optional) is not None:
                         body[optional] = arguments[optional]
+                if not body.get("workflow") and meta.get("reply_workflow"):
+                    body["workflow"] = meta["reply_workflow"]
+                if arguments.get("delivery_mode") == "auto_resume":
+                    if not meta.get("reply_capability"):
+                        return _text(
+                            {"error_code": "origin_required",
+                             "detail": "auto_resume requires a host-minted reply capability."},
+                            is_error=True,
+                        )
+                    body["reply_capability"] = meta["reply_capability"]
                 task = await client.submit_task(body)
                 return _text(task)
             if name == "get_async_task":

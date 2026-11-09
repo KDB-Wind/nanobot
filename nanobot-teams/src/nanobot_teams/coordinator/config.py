@@ -28,6 +28,8 @@ class PlannerBinding:
     inbox_url: str
     instance_id: str
     principal_id: str
+    inbox_key_env: str = "TEAMS_PLANNER_INBOX_KEY"
+    inbox_key_env: str = "TEAMS_PLANNER_INBOX_KEY"
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,7 @@ def load_coordinator_config(path: str | Path) -> CoordinatorConfig:
             inbox_url=str(planner_raw["inbox_url"]),
             instance_id=str(planner_raw["instance_id"]),
             principal_id=str(planner_raw["principal_id"]),
+            inbox_key_env=str(planner_raw.get("inbox_key_env", "TEAMS_PLANNER_INBOX_KEY")),
         )
     control_dir = Path(raw.get("control_dir") or (file_path.parent / "coordinator-data")).resolve()
     homes = raw.get("bot_homes_root")

@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TEXT NOT NULL,
     finished_at TEXT,
     last_error TEXT NOT NULL DEFAULT '',
+    reply_capability TEXT NOT NULL DEFAULT '',
     migrated_usage INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_operation_key
@@ -144,7 +145,8 @@ TASK_COLUMNS = (
     "request_digest, input_text, deadline_at, delivery_mode, dispatch_state, remote_run_id, "
     "remote_instance_id, remote_revision, run_state, stop_confirmed, effects_uncertain, "
     "outcome_code, outcome_message, result_text, result_truncated, result_available, "
-    "cancel_state, delivery_state, created_at, finished_at, last_error, migrated_usage"
+    "cancel_state, delivery_state, created_at, finished_at, last_error, reply_capability, "
+    "migrated_usage"
 )
 
 
@@ -232,6 +234,16 @@ class CoordinatorStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.executescript(SCHEMA)
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(tasks)")}
+            if "reply_capability" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN reply_capability TEXT NOT NULL DEFAULT ''"
+                )
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(tasks)")}
+            if "reply_capability" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN reply_capability TEXT NOT NULL DEFAULT ''"
+                )
         except (OSError, sqlite3.Error, StoreError) as exc:
             self.close()
             raise StoreError("Cannot open the coordinator store (another writer?)") from exc
@@ -523,6 +535,7 @@ class CoordinatorStore:
         delivery_mode: DeliveryMode,
         bot: Bot,
         quotas: dict[str, int] | None = None,
+        reply_capability: str = "",
     ) -> tuple[Task, bool]:
         """Validate, reserve, and persist one task plus its dispatch outbox entry.
 
@@ -605,7 +618,7 @@ class CoordinatorStore:
                     digest, input_text, iso(effective_deadline), delivery_mode.value,
                     DispatchState.PENDING.value, None, None, 0, "unobserved", 0, 0, None, "",
                     "", 0, 0, CancelState.NONE.value, DeliveryState.NOT_READY.value, iso(now),
-                    None, "", 0,
+                    None, "", reply_capability, 0,
                 ),
             )
             self._conn.execute(
@@ -811,6 +824,15 @@ class CoordinatorStore:
             self._emit("task_cancel_requested", task_id, {})
             return self._load_task(task_id)
 
+    def auto_resume_ready_tasks(self) -> list[Task]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT task_id FROM tasks WHERE delivery_mode='auto_resume' AND "
+            "run_state IN ('succeeded','failed','cancelled','interrupted') AND "
+            "delivery_state IN ('not_ready','pending')"
+        ).fetchall()
+        return [self._load_task(r[0]) for r in rows]
+
     def set_delivery_state(self, task_id: str, state: DeliveryState) -> None:
         with self._transaction():
             assert self._conn is not None
@@ -900,4 +922,5 @@ def _row_to_task(values: dict) -> Task:
         finished_at=None if values["finished_at"] is None
         else datetime.fromisoformat(values["finished_at"]),
         last_error=values["last_error"] or "",
+        reply_capability=values.get("reply_capability") or "",
     )

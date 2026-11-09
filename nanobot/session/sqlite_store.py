@@ -117,9 +117,59 @@ def _create_schema_v4(db: sqlite3.Connection) -> None:
     db.execute("ALTER TABLE session_archives_v4 RENAME TO session_archives")
 
 
+def _create_schema_v5(db: sqlite3.Connection) -> None:
+    # Durable external inbox: reply capabilities, workflow control state, and
+    # delivery receipts for the async Teams protocol. Bodies live only here.
+    db.execute("""CREATE TABLE reply_capabilities (
+        capability_id TEXT PRIMARY KEY,
+        digest TEXT NOT NULL UNIQUE,
+        session_key TEXT NOT NULL,
+        session_generation TEXT NOT NULL,
+        workflow_id TEXT NOT NULL,
+        operation_key TEXT NOT NULL,
+        bot_id TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        principal_id TEXT NOT NULL,
+        auto_continue INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    )""")
+    db.execute("""CREATE TABLE external_workflows (
+        workflow_id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        session_generation TEXT NOT NULL,
+        auto_continue INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    )""")
+    db.execute("""CREATE TABLE external_inbox (
+        delivery_id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        session_generation TEXT NOT NULL,
+        workflow_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        bot_id TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        terminal_revision INTEGER NOT NULL,
+        outcome_code TEXT NOT NULL,
+        result_text TEXT NOT NULL,
+        result_truncated INTEGER NOT NULL DEFAULT 0,
+        body_digest TEXT NOT NULL,
+        state TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        injected_at TEXT,
+        last_error TEXT NOT NULL DEFAULT ''
+    )""")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS external_inbox_session ON external_inbox(session_key, state)"
+    )
+
+
 # Entries upgrade version N to N+1. Preserve released entries and append upgrades.
 _SCHEMA_MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _create_schema_v1, _create_schema_v2, _create_schema_v3, _create_schema_v4,
+    _create_schema_v5,
 )
 
 

@@ -59,6 +59,9 @@ from nanobot.webui.context_source_hook import create_context_source_hook
 from nanobot.webui.dev import WebUIDevError, WebUIDevServer
 from nanobot.webui.sidebar_state import ensure_webui_session_archives
 
+# Set by the inbox sidecar assembly; read once by the startup recovery scan.
+_PENDING_EXTERNAL_INBOX: dict[str, object] = {}
+
 if TYPE_CHECKING:
     from nanobot.update_profiles import ProfileReceipt
     from nanobot.update_restart import GatewayStartup
@@ -577,6 +580,65 @@ def _run_claimed_gateway(
     cron = CronService(cron_store_path, admission=bus.admission)
     trigger_store = LocalTriggerStore(config.workspace_path)
 
+    runs_cfg = config.api.runs
+    inbox_sidecar_coro = None
+    if runs_cfg.enabled and runs_cfg.inbox_enabled:
+        from nanobot.api.agent_inbox import register_inbox_routes
+        from nanobot.session.external_inbox import ExternalInbox
+
+        external_inbox = ExternalInbox(session_manager.state)
+        _PENDING_EXTERNAL_INBOX["inbox"] = external_inbox
+
+        def _teams_meta_provider(server_name: str):
+            def provider() -> dict[str, str]:
+                from nanobot.agent.tools.context import current_request_context
+
+                ctx = current_request_context()
+                capability = external_inbox.mint_capability(
+                    session_key=ctx.session_key,
+                    session_generation=ctx.session_generation,
+                    workflow_id=f"wf_{ctx.turn_id or ctx.session_generation[:8]}",
+                    operation_key="*",
+                    bot_id="*",
+                    instance_id="*",
+                    principal_id=runs_cfg.principal_id,
+                )
+                return {
+                    "reply_capability": capability.token,
+                    "reply_workflow": capability.workflow_id,
+                    "coordinator_principal": runs_cfg.principal_id,
+                }
+
+            return provider
+
+        from nanobot.agent.tools.mcp import set_teams_async_meta_hook
+
+        set_teams_async_meta_hook(_teams_meta_provider)
+
+        async def _run_inbox_sidecar() -> None:
+            from aiohttp import web
+
+            app = web.Application()
+            register_inbox_routes(app, external_inbox, runs_cfg)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(
+                runner, config.api.host, config.api.port, reuse_address=False
+            )
+            try:
+                await site.start()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"The planner inbox sidecar cannot bind "
+                    f"{config.api.host}:{config.api.port}: {exc}"
+                ) from exc
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await runner.cleanup()
+
+        inbox_sidecar_coro = _run_inbox_sidecar
+
     webui_route_policy = WebuiTurnRoutePolicy(session_manager)
     turn_delivery_factory = TurnDeliveryFactory(
         bus,
@@ -1013,6 +1075,15 @@ def _run_claimed_gateway(
             # accepting new input.  That makes a new user message reliably
             # supersede an old recoverable turn instead of racing its queue.
             await recovery.scan()
+            pending_inbox = _PENDING_EXTERNAL_INBOX.get("inbox")
+            if pending_inbox is not None:
+                for delivery_id in pending_inbox.pending_deliveries():
+                    try:
+                        await pending_inbox.apply_pending(delivery_id)
+                    except Exception:
+                        logger.warning(
+                            "external delivery {} failed to apply on recovery", delivery_id
+                        )
             if update_startup is not None:
                 # Recovery may reconstruct queued work, but no consumer or
                 # external listener has started. Keep that work parked too.
@@ -1083,6 +1154,11 @@ def _run_claimed_gateway(
                 tasks.append(asyncio.create_task(
                     watch_gateway_stop(update_profile, agent.maintenance, shutdown_event, startup_gate),
                     name="nanobot-update-stop",
+                ))
+            if inbox_sidecar_coro is not None:
+                tasks.append(asyncio.create_task(
+                    inbox_sidecar_coro(),
+                    name="nanobot-teams-inbox-sidecar",
                 ))
             if health_server_enabled:
                 tasks.append(asyncio.create_task(
