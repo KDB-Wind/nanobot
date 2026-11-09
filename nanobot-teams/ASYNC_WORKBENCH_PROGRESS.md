@@ -32,10 +32,10 @@
 | P4 可信回传 + 续接 | verified | §4 P4:inbox 领域 4 + P4 链路 3 + Teams 210/parent 99 全绿 | A09 wrapper 单测、A10 进程级交错、A12 → Q1/Q2/P5/P7 | P5 |
 | P5 WebUI 工作台 | in_progress | §4 P5:后端提交 ffca428ff;前端组件 5 测试过 + 五门禁过 | 全量 vitest/browser 运行中;真实网关浏览器验收在 P7 | 等待套件结果
 | P6 cron 定时任务 | verified | §4 P6:teams_task kind + 确定性提交键(3 tests)+ 回归 312 绿 | 真实 cron 触发链路(A24)在 P7 live | P7 |
-| P7 真实验收/迁移/交付 | pending | - | - | - |
-| Q1 独立审核 | pending | - | - | - |
-| Q2 缺陷修复与故障验证 | pending | - | - | - |
-| Q3 最终交付核对 | pending | - | - | - |
+| P7 真实验收/迁移/交付 | verified | §4 P7 + §7 完成报告 | - | - |
+| Q1 独立审核 | verified | §7 Q1:两个新上下文只读审核(状态与安全/HTTP 与 worker),8 blocking+minors | - | Q2(已完成) |
+| Q2 缺陷修复与故障验证 | verified | §7 Q2:13 个缺陷全修+回归锁定;offline 9/9、live 13/13 复跑 | - | Q3 |
+| Q3 最终交付核对 | verified | §7 Q3 门禁快照 | - | - |
 
 状态取值:pending / in_progress / verified / blocked。
 
@@ -187,6 +187,65 @@
   - `POST /v1/agent-runs` 202 受理(queued,revision=1);数秒后 `GET …/run_id` → failed/revision=3,`outcome.code=execution_error`(隔离 home 无模型,UnconfiguredProvider 引导文案为 partial text),`stop_confirmed=true`。
   - `GET …/result` 200:完整类型化 outcome(text+code+truncated)。
   - 结论:类型化失败路径与幂等键受理在真实进程成立;真实模型 succeeded 路径待 P7 配 GLM preset 复验。
+
+
+## 7. Q1–Q3 完成报告(2026-11-09)
+
+### Q1 独立审核(verified)
+
+两个独立新上下文只读审核(general-purpose 代理,主代理不共享结论):
+
+- **视角一(状态与安全)**:范围 runs/store+service、external_inbox、coordinator/store。回报 4 blocking(默认 deadline 进入摘要破坏重放、cancel 与 pump 竞态静默丢弃、store 写失败致槽位永久泄漏、revoke 后 mint 复活自动继续)+ 7 项(其中 receive 无校验/低 revision 丢弃/reply_capability 进 Task dataclass 三项经代码反证为已由 HTTP 层与单 writer 顺序覆盖,记录反证未改)。
+- **视角二(HTTP 与 worker)**:范围 agent_runs/agent_inbox/worker/http_api/async_mcp。回报 4 blocking(URL 解析绕过 loopback 校验致凭据外泄、重放被 capability 校验挡住违反 planner-down 对账、缺 secret 使 pump 永久停摆、非 JSON receipt 崩溃循环)+ 7 minor。
+- 原始报告要点与本处理结论已入 `.audit/async-workbench-decisions.tsv`。
+
+### Q2 修复与故障验证(verified)
+
+共修复 **13 个缺陷**(5 个实现期 live 发现 + 8 个审核发现),每个都有可复现测试锁定:
+
+| # | 缺陷 | 锁定测试 |
+| --- | --- | --- |
+| 1 | executor hooks 被 ephemeral 门丢弃,真实运行全标 execution_error | test_executor + live_chain 13/13 |
+| 2 | CoordinatorHttpError 缺 message 属性 | test_async_mcp_stdio |
+| 3 | request_context property 误用 .get() | test_async_mcp_stdio |
+| 4 | relay 在同步上下文 create_task 拖垮 WS channel | live gateway 冒烟 |
+| 5 | 撤销钩子 session_key None 静默跳过 + 写锁竞态 | test_a18_revoke(真实 _dispatch_one)|
+| 6 | 默认 deadline 进入摘要破坏无 deadline 重放 | test_q1a_b1 |
+| 7 | cancel 与 pump 竞态静默丢弃取消请求 | test_q1a_b2 |
+| 8 | store 写失败致槽位永久泄漏 | test_q1a_b3 + test_store_failures |
+| 9 | revoke 后 mint 复活 auto_continue | test_q1a_b4 |
+| 10 | loopback startswith SSRF(凭据外泄) | test_q1b_ssrf_endpoint_variants_rejected |
+| 11 | 重放被 capability 校验挡住(planner down 对账失效) | test_q1b_replay_wins_over_capability_validation |
+| 12 | 缺 secret/坏 JSON 使 pump 永久停摆 | worker 观察路径 try/except |
+| 13 | snapshot 跨 principal 泄漏 + operator auto_resume + 字符数配额 + enabled TOCTOU + inbox 未界解析 + SSE 静默丢事件 | test_q1b_planner_snapshot… + http/worker 修复 |
+
+审核误报反证(未改代码,记录理由):receive 的绑定验证在 HTTP 层已先行;低 revision 丢弃在单 writer 顺序 pump 下不产生乱序;reply_capability 仅存于内部 dataclass,公开 DTO 不含该字段。
+
+### Q3 最终门禁快照(最终代码)
+
+- Teams `pytest -q`:**215 passed**。
+- Parent(runs+inbox+API 回归+cron+MCP meta+loop 并发,多组合):**117/57/51 passed**。
+- 导入边界:**13 rules, 221 files passed**。
+- ruff(nanobot 触及文件 + teams src/tests/acceptance):**All checks passed**。
+- basedpyright strict:新模块 **0 errors**;gateway_runtime 26 errors 为 HEAD 基线既有(已验证 HEAD 同值),本目标未新增。
+- WebUI(前端自 11a5e82de 冻结):typecheck/lint/check:imports/test:imports/build 全 EXIT=0;vitest 全过;browser 478 passed + 崩溃 spec 单独复跑 17/17。
+- 打包:dist/nanobot_teams-0.5.0-py3-none-any.whl,SHA-256 `6d54837d81518f2a44ceace485713f464f799201e3d0401d2d11813b79d4bbf8`,干净 venv 安装 + CLI rc=0。
+- 验收:offline 矩阵 **9/9**、live 单 bot **5/5**、live 双 bot 全链 **13/13**(全部在最终代码上重跑)。
+- Live gateway + 浏览器:WS 健康、teams.async.v1 声明、inbox sidecar 401/422、bootstrap 网络面板/WS 帧对三个服务 token 零命中、teams 页渲染 + reload 恢复。
+
+### 启动与回滚入口
+
+- 启动:各受管 Bot 配置 `api.runs`(专用 key、execution+exclusive)→ `nanobot serve --config …`;`nanobot-teams coordinator --config coordinator.json`;Planner gateway 配置 `config.teams.coordinatorUrl` + `teamsAsync` MCP → `nanobot gateway --config …`;工作台入口 WebUI Settings → Teams。
+- 回滚:停止 coordinator 准入 → 等待未结运行终态 → 备份 coordinator 数据库;0.5 数据库不降级写 0.4;恢复同步模式 = 恢复原 0.4 配置与账本(0.4 文件本目标全程未改动,备份见 §1)。
+- 0.4 保全:全部 0.4 修复保持未提交工作树状态(与本目标新文件分离),备份 `C:\Users\KDB\backups\nanobot-teams-mvp\20261109-035328-baseline-93e447f\`。
+
+### 限制(非阻断,如实陈述)
+
+- goal 登记工具在本宿主不存在(create_goal/update_goal),目标以本文件 + `.audit/async-workbench-objective.txt` 等效持久化。
+- glm-5.3-flash 模型代码已被 provider 下线(live 验收改用 glm-5.3);生成配置需显式 `agents.defaults.modelPreset`。
+- gateway_runtime.py 26 个 pyright 错误为 HEAD 既有基线,本目标未新增也未修复(超出本轮范围)。
+- 浏览器套件在资源紧张时出现 Chrome worker 崩溃(0xC0000002),单独复跑全过——环境性。
+- WebUI 的 teams 页为轮询快照(4s);SSE relay 已接好,UI 侧事件驱动为后续优化项。
 
 ## 5. 运行中进程与待恢复状态
 
