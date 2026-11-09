@@ -82,6 +82,7 @@ class CoordinatorHttpError(Exception):
         super().__init__(message)
         self.status = status
         self.code = code
+        self.message = message
 
 
 class CoordinatorClient:
@@ -198,7 +199,7 @@ def build_async_server(client: CoordinatorClient) -> Server:
     def _trusted_meta() -> dict[str, str]:
         """Read host-minted routing meta; never accepted from model arguments."""
         try:
-            context = server.request_context.get()
+            context = server.request_context
         except LookupError:
             return {}
         params = getattr(context.request, "params", None)
@@ -263,6 +264,8 @@ def build_async_server(client: CoordinatorClient) -> Server:
         except CoordinatorHttpError as exc:
             log.info("coordinator rejected call: %s %s", exc.code, exc.message)
             return _text({"error_code": exc.code, "detail": exc.message}, is_error=True)
+
+    return server
 
 
 async def serve_async(base_url: str, token_env: str) -> None:
