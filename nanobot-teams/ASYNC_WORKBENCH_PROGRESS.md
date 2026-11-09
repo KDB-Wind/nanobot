@@ -52,7 +52,7 @@
 | A07 | pass | test_alias_shares_isolation + test_unreachable_bot_does_not_block_the_other | - |
 | A08 | pass | tests/runs/test_store_failures 2/2(只读拒绝写、观察写失败保持非终态可恢复) | - |
 | A09 | pass | tests/tools/test_mcp_teams_meta 4/4(伪造参数拒绝且不执行、受信 meta 传递、未配置无 meta)+ chain forged capability 422 | - |
-| A10 | partial | 单测:receive 幂等+同体/异体+注入后重放不重复;gateway 重启恢复扫描已实现。强杀交错(receipt 前后杀进程)留 Q2 补 | Q2 补强项 |
+| A10 | pass | tests/runs/test_a10_kill.py:receipt 持久化后模拟崩溃(重开 store)→ pending 存活 → 注入恰一次 → 重放不重复;叠加 receive 幂等/异体 409 单测 | - |
 | A11 | pass | test_session_replacement_routes_delivery_orphaned(process)+ chain live 同场景 | - |
 | A12 | pass | live browser(连真实 gateway):teams 页渲染、reload 恢复、WS/HTTP 零泄漏 | Q2 补强项 |
 | A13 | pass | test_identity_change_goes_indeterminate_and_quarantines(派发前校验+不在新实例执行+重绑后恢复) | - |
