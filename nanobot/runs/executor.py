@@ -50,6 +50,9 @@ class AgentLoopRunExecutor:
                 chat_id=run.run_id,
                 hooks=[capture],
                 ephemeral=True,
+                # The typed-outcome capture must survive the ephemeral hook
+                # gate; without this flag the runner drops caller hooks.
+                _run_extra_hooks_for_ephemeral=True,
                 persist_user_message=False,
             )
         except asyncio.CancelledError:

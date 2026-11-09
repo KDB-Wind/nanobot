@@ -24,7 +24,12 @@ class StubLoop:
 
     async def process_direct(self, *, content, session_key, channel, chat_id, hooks, **kwargs):
         self.calls.append(
-            {"content": content, "session_key": session_key, "ephemeral": kwargs.get("ephemeral")}
+            {
+                "content": content,
+                "session_key": session_key,
+                "ephemeral": kwargs.get("ephemeral"),
+                "extra_hooks": kwargs.get("_run_extra_hooks_for_ephemeral"),
+            }
         )
         if self.raise_exc is not None:
             raise self.raise_exc
@@ -73,6 +78,7 @@ async def test_success_maps_to_succeeded_with_text():
     assert result.text == "final answer"
     assert loop.calls[0]["session_key"] == "run:run_x"
     assert loop.calls[0]["ephemeral"] is True
+    assert loop.calls[0]["extra_hooks"] is True
     assert loop.calls[0]["content"] == "job body"
 
 
