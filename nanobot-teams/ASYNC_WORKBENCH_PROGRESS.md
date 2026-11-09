@@ -1,0 +1,124 @@
+# 异步多 Bot 工作台进度记录
+
+日期:2026-11-09。执行分支 `feat/nanobot-teams-mvp`。本文是唯一进度清单,续跑先读本文与 `git diff`,再读 `.audit/async-workbench-decisions.tsv`。
+
+## 0. 退出谓词(完成条件,可核验)
+
+全部满足才算完成,任何一项缺失不得宣布完成:
+
+1. P0–P7 每阶段在本文标记 `verified`,且其"完成信号"有对应证据条目。
+2. Q1 两条审核视角(状态与安全、用户路径与兼容)均有独立上下文审核记录;Q2 全部阻断性发现修复并复验;Q3 最终代码逐项核对完成。
+3. A01–A25 每项有适用于最终代码的实际证据(命令、退出码、证据路径),mock/offline 不冒充 live。
+4. 项目必要检查通过:两包 pytest、两包 ruff check、basedpyright、导入边界、WebUI 全套(含 browser test)、打包安装复验。
+5. 本目标导致的缺陷与阻断性审核发现全部解决;非阻断限制列明证据。
+6. 文档(README、CHANGELOG、skill、示例)与实际行为一致,启动与回滚入口明确。
+
+## 1. 基线
+
+- 仓库:`C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp`,HEAD `93e447f91798cb4ca426a32bbb7272419e70188c`(2026-11-08 docs(teams))。
+- 工作区含 0.4.0 未提交修复:29 个 tracked 文件(+1507/−1255)与 13 个 untracked 文件,详见备份。
+- 备份(workspace 外,已核验):`C:\Users\KDB\backups\nanobot-teams-mvp\20261109-035328-baseline-93e447f\`,含 `tracked.patch`(已验证可对当前工作树 reverse-apply)、untracked 全量拷贝、`SHA256SUMS`(17 文件全部 OK)。
+- goal 登记状态:本宿主(ZCode CLI)无 `create_goal`/`update_goal` 工具,数据库无 goals 表,无法按原指令登记持久 goal。已将目标正文原样保存至 `.audit/async-workbench-objective.txt`,以本文为唯一进度真相。此为环境事实,不是目标完成的替代宣称。
+- 解释器:父仓库 `.venv`(uv 管理),Teams 包 `.venv`/editable 安装。0.4 证据:Teams pytest 181 passed、API pytest 51 passed、basedpyright 0 错误(见 REPAIR_STATUS.md,属旧版本,不作为本目标验收)。
+
+## 2. 阶段状态
+
+| 阶段 | 状态 | 证据 | 剩余问题 | 下一动作 |
+| --- | --- | --- | --- | --- |
+| P0 入口/依赖/基线 | verified | §4 P0:四份探针 + MCP 探针 + 基线 pytest + 备份 | 无 | P1(已开始) |
+| P1 持久运行领域 | in_progress | §4 P1:20 tests + 强杀恢复 3/3 + pyright/ruff 绿 | P2 执行器适配后复验 A01–A06/A15 公开行为 | P2 |
+| P2 运行 HTTP + 执行器 | pending | - | - | - |
+| P3 Coordinator + 异步 MCP | pending | - | - | - |
+| P4 可信回传 + 续接 | pending | - | - | - |
+| P5 WebUI 工作台 | pending | - | - | - |
+| P6 cron 定时任务 | pending | - | - | - |
+| P7 真实验收/迁移/交付 | pending | - | - | - |
+| Q1 独立审核 | pending | - | - | - |
+| Q2 缺陷修复与故障验证 | pending | - | - | - |
+| Q3 最终交付核对 | pending | - | - | - |
+
+状态取值:pending / in_progress / verified / blocked。
+
+## 3. 验收矩阵 A01–A25
+
+| ID | 状态 | 证据(命令/退出码/路径) | 备注 |
+| --- | --- | --- | --- |
+| A01 | pending | - | - |
+| A02 | pending | - | - |
+| A03 | pending | - | - |
+| A04 | pending | - | - |
+| A05 | pending | - | - |
+| A06 | pending | - | - |
+| A07 | pending | - | - |
+| A08 | pending | - | - |
+| A09 | pending | - | - |
+| A10 | pending | - | - |
+| A11 | pending | - | - |
+| A12 | pending | - | - |
+| A13 | pending | - | - |
+| A14 | pending | - | - |
+| A15 | pending | - | - |
+| A16 | pending | - | - |
+| A17 | pending | - | - |
+| A18 | pending | - | - |
+| A19 | pending | - | - |
+| A20 | pending | - | - |
+| A21 | pending | - | - |
+| A22 | pending | - | - |
+| A23 | pending | - | - |
+| A24 | pending | - | - |
+| A25 | pending | - | - |
+
+## 4. 阶段证据日志(追加式)
+
+### P0
+
+- 2026-11-09 03:53 UTC 备份完成并核验(见 §1)。
+- MCP SDK 探针(`./.venv-nanobot/Scripts/python.exe`):`mcp==1.30.0`;`ClientSession.call_tool` 参数含 `meta`;`CallToolRequestParams.model_fields` 含 `meta`;服务端 `Context.request_context.request.params.meta` 可读取。`meta` 为 dict 透传。架构第 9 节的 SDK 能力成立,最低版本按 1.30.0 固定(P2/P4 再做端到端实测)。
+- 基线聚焦检查(2026-11-09,当前工作树,含 0.4 未提交修复):API pytest `tests/test_openai_api.py` **51 passed,exit 0**;Teams pytest **181 passed in 40.22s,exit 0**。与 REPAIR_STATUS 0.4 证据一致。
+- serve/gateway 生命周期探针(只读代理,引文件:行号):
+  - gateway 组装在 `cli/gateway_runtime.py` `_run_claimed_gateway`(459+):`tasks` 列表 + `asyncio.gather`(1037-1102),健康服务器(1087-1091)是可选 sidecar 的既有模式;关闭序在 finally(1125-1151)与 `_close_gateway_runtime`(358-407)。实例归属锁 = `run/gateway.json` 状态文件 + FileLock(`gateway/runtime.py:443-492`),一键一 (config-dir,workspace) 实例。
+  - serve = `cli/commands.py:337-434`:自建 MessageBus/SessionManager/ToolRegistry/MCPProvider/AgentLoop,`create_app(agent_loop, model_name, request_timeout, api_key, prepare_agent)`(api/server.py:421-521),路由仅 `/v1/chat/completions`、`/v1/models`、`/health`(518-520),auth_middleware 498-513(`/health` 豁免,空 key 放行,hmac 比较 Bearer)。serve 无锁无状态文件;gateway 与 serve 同 home 今天不被禁止(仅端口分默认 18790/8900)→ 受管 Bot 需靠 `api.runs` 配置强制 exclusive。
+  - 配置:`ApiConfig` 在 `config/schema.py:383-400`(host/port/timeout/api_key,`wildcard_host_requires_auth` 校验);新增 `runs` 子节 = ApiConfig 新字段;校验入口 `load_config`→`Config.model_validate`。
+  - SubagentManager 完成通知路径(回传唤醒的模型):`_announce_result`(agent/subagent.py:876-940)发布 `InboundMessage(channel="system", sender_id="subagent", session_key_override=owner, require_existing_session=True, metadata={"injected_event":"subagent_result",...})`;取消走 `cancel`→`task.cancel()`+5 秒有界等待(`CANCEL_WAIT_SECONDS=5.0`)。
+- Session 层探针(只读代理):
+  - `SqliteSessionStore`:版本化 `_SCHEMA_MIGRATIONS`(sqlite_store.py:121-123,`_create_schema_v1..v4`),`transaction()` BEGIN IMMEDIATE 线程本地可重入(213-238),`PRAGMA synchronous=FULL`、WAL。新表 = 新 `_create_schema_vN`。
+  - `SessionState`:单 writer 线程 + per-key tail 串行(`_submit` 141-207);`record_delivery`(state.py:747-769)按 `expected_generation` 门控追加 assistant 消息;`queue_followup`(771-806)写 `pending_user_followups`;`reset`(1160-1182)换新 generation(旧 workflow 自动失效的天然机制)。
+  - 唤醒:subagent 注入即 InboundMessage + `WebuiTurnRoutePolicy.__call__`(webui_turns.py:466-529)升级为可见轮次;`admit`(531-548)绑定 generation 或 `SessionConflictError`。重启恢复 `restart_requires_confirmation`(webui/recovery.py:379-392)只针对中断模型轮次,不影响外部投递注入。
+  - 会话层现无 workflow 概念;`session_messages.py` 的 `message_id` 正则 `^[A-Za-z0-9._:-]{1,128}$` 可用作确定性投递消息 ID。
+- AgentLoop 结果契约探针(只读代理):
+  - `process_direct`(agent/loop.py:2619-2640)返回 `OutboundMessage|None`,未预期异常上抛;provider 错误不是异常而是 `AgentRunResult.stop_reason="error"`+`failure_error_kind`(runner.py:787-806);iteration limit = `"max_iterations"`;CancelledError 一路上抛不被吞。stop_reason 全部是字符串、无枚举 → 执行适配在边界白名单映射,未知一律 `failed/execution_error`。
+  - `RequestContext`(agent/tools/context.py:30-50)含 `session_key/session_generation/turn_id/can_receive_background_results`;`current_request_context()` 走 ContextVar。
+  - 停止确认可观察点:`TurnDelivery.completed` + `turn_completed` 总线事件 + run-status idle(turn_delivery.py:431-456);subagent 取消模式 = task.cancel() + 5 秒有界等待(subagent.py:411-425)。
+  - 原子写历史 = `SessionState.finish_turn` → `_apply_turn` → `store.save`(单事务);`store.run_write`/`transaction()` BEGIN IMMEDIATE。
+- WebUI 扩展点探针(只读代理):
+  - 能力契约 `nanobot/webui/client_contract.py`:`WEBUI_PROTOCOL=1`,核心 `webui.core.v1`,可选能力常量 + `webui_contract()` 列表;客户端 `assess_webui_contract`。
+  - 浏览器 `/api/*` 由 gateway 同进程 `GatewayHTTPHandler`(webui/ws_http.py:407,`_dispatch_resolved` 620-677)服务;读操作 `check_api_token`(Bearer);**变更操作必须走 WS `webui_request`**(直接 HTTP 变更路径 405,`_WEBUI_MUTATION_PATHS` ws_http.py:170-251)→ `/api/teams/*` 写操作按 `settings_routes.py` 模式挂载 + WS action。
+  - 事件:宿主 `broadcast_webui_event`(webui/inbound_commands.py:224-226)/`webui_send_event`;前端 `webui/src/lib/types.ts:1535` 事件联合;新事件 = 宿主 emit + types.ts 变体 + UI 消费。
+  - 前端:React context 无 redux;`App.tsx` hash 路由 ShellView;API 客户端 `src/lib/api.ts`(Bearer);i18n `src/i18n/locales/<code>/common.json`(fallback en,新页面需 en+zh-CN 全量键)。测试:单元 `vitest`(`bun run test`),浏览器 Playwright(`browser/*.spec.ts` + fixture 模式,`test:browser` = tsc + playwright);构建产物进 `nanobot/web/dist` 由 gateway 静态服务。
+- 运行控制库落点:`<instance data_dir>/runs/`(config 目录下,与 sessions/cron 同级,在模型可写 workspace 之外;session/location.py 强制 session root 在 workspace 外的先例)。
+- P0 入口落点清单(实现落点,全部来自上面探针):
+  - P1 领域:`nanobot/runs/types.py`、`store.py`、`service.py`(新包,不依赖 API/WebUI);测试 `tests/runs/`。
+  - P2 HTTP:`nanobot/api/agent_runs.py` 挂进 `create_app`(api/server.py:421-521)路由表;`cli/commands.py serve`(337-434)装配 RunService;gateway inbox sidecar 按 `cli/gateway_runtime.py:1087-1091` 健康服务器模式;`ApiConfig`(config/schema.py:383-400)加 `runs` 子字段。
+  - P2 执行器:AgentLoop 适配层把 `stop_reason` 白名单映射为类型化 outcome(字符串边界解析),取消 = task.cancel + TurnDelivery.completed 观察。
+  - P3 Coordinator:`nanobot-teams/src/nanobot_teams/coordinator/`;`__main__.py` 加 `coordinator`、`async-mcp` 子命令。
+  - P4 inbox:`SessionState.record_delivery` 附近新增 apply_external_delivery;唤醒复用 subagent InboundMessage 模式;schema 迁移加 `_create_schema_vN`。
+  - P5 WebUI:`client_contract.py` 加 `teams.async.v1`;`ws_http.py _dispatch_resolved` 挂 `/api/teams/*` 读;写走 `webui_request` action + `_WEBUI_MUTATION_PATHS`;事件 `teams_event` 经 `broadcast_webui_event`。
+  - P6 cron:`nanobot/cron/`(CronService 已有 agent-turn 任务与 session_delivery)。
+
+### P1
+
+- 2026-11-09 实现完成并通过:`nanobot/runs/{__init__,types,store,service}.py` + `tests/runs/{test_run_service,test_kill_recovery,kill_child}.py`。
+- 领域测试 `tests/runs/test_run_service.py`:**17 passed**(同键幂等串行/并发、改体 409、过期键对账、输入超限前置拒绝、queued 取消确认、完成先于取消保留成功、运行中取消确认、抗取消保持 cancelling+槽位不释放+晚到确认、provider/iteration 类型化失败、执行异常→execution_error、执行 deadline→deadline_exceeded、effects_uncertain 隔离+同键幂等豁免+解除、结果 32KiB 字符边界截断+原始字节数、事件流+floor 410、14/30/90 天清理+tombstone 永久拒同键)。
+- 真实强杀恢复 `tests/runs/test_kill_recovery.py`:**3 passed**(子进程在 running 标记已提交后、preresult 已信号后、queued 持槽后各被 `proc.kill()`(Windows TerminateProcess)强杀;新进程 recover():active→interrupted+effects_uncertain=1 且不再执行,queued 保留并恢复执行)。退出码 0,耗时 1.35s。
+- 修复记录:digest 含 deadline 微秒 → 重放必须复用原 RunSubmit(协议要求 Coordinator 原样重放);断言失败跳过 aclose 导致 worker 残留 → 测试 fixture 保证清理;`_apply_result` 增加 CANCELLED/INTERRUPTED → 同名终态;`events_floor` 仅在实际删除事件后推进;`store.get` 对缺失行返回 None。
+- 检查:`basedpyright --pythonpath .venv-nanobot nanobot/runs` **0 errors, 0 warnings, 0 notes**;`ruff check nanobot/runs tests/runs` 通过;`pytest tests/runs/ -q` **20 passed**。
+- 剩余:P1 的 A01/A02/A04/A05/A06/A15 为领域层证据,公开 HTTP 面在 P2 复验(A01–A06、A14、A17)。
+
+## 5. 运行中进程与待恢复状态
+
+- 无。
+
+## 6. 决策日志
+
+见 `.audit/async-workbench-decisions.tsv`(ts/phase/decision/why/evidence/result 六列)。
