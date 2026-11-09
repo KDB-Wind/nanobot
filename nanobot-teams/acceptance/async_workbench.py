@@ -19,6 +19,7 @@ import socket
 import sys
 import tempfile
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -263,13 +264,182 @@ async def offline_matrix() -> int:
     return 0 if passed == len(RESULTS) else 1
 
 
+
+
+async def live_matrix() -> int:
+    """P7 live acceptance: real serve processes under a configured GLM preset.
+
+    Requires: the operator's config carries a working model preset and its
+    provider credentials resolve from the environment (as in 0.4 acceptance).
+    Starts one managed bot serve; drives a real Planner conversation through
+    the coordinator MCP to dispatch Research and Writer tasks.
+    """
+    import json as _json
+    import subprocess
+    import time
+    import urllib.request
+
+    from nanobot.config.loader import load_config, resolve_config_env_vars
+
+    source = load_config()
+    preset_name = os.environ.get("TEAMS_ACCEPT_PRESET", "glm-5.3-flash")
+    if preset_name not in source.model_presets:
+        print(f"FAIL preset {preset_name} not configured in the operator config")
+        return 2
+    preset = resolve_config_env_vars(source.model_presets[preset_name])
+    extra = getattr(source.providers, preset.provider, None) if source.providers else None
+    provider = extra.model_dump(by_alias=True, mode="json", exclude_none=True)         if extra is not None else None
+    if provider is None:
+        print(f"FAIL provider {preset.provider} missing")
+        return 2
+    provider = resolve_config_env_vars(provider)
+
+    tmp = Path(tempfile.mkdtemp(prefix="teams-live-"))
+    (tmp / "bot-workspace").mkdir()
+    bot_port = free_port()
+    runs_key = os.environ.get("TEAMS_ACCEPT_RUNS_KEY", uuid.uuid4().hex)
+    bot_key_env = "TEAMS_ACCEPT_BOT_KEY"
+    os.environ[bot_key_env] = runs_key
+
+    bot_config: dict = {
+        "agents": {
+            "defaults": {
+                "workspace": str(tmp / "bot-workspace"),
+                "modelPreset": preset_name,
+            }
+        },
+        "model_presets": {
+            preset_name: preset.model_dump(by_alias=True, mode="json", exclude_none=True)
+        },
+        "providers": {preset.provider: provider},
+        "api": {
+            "host": "127.0.0.1",
+            "port": bot_port,
+            "runs": {
+                "enabled": True,
+                "apiKey": runs_key,
+                "principalId": "teams-coordinator",
+                "executionEnabled": True,
+                "exclusiveExecution": True,
+            },
+        },
+    }
+    bot_home = tmp / "bot-home"
+    bot_home.mkdir()
+    config_path = bot_home / "nanobot.json"
+    config_path.write_text(_json.dumps(bot_config, indent=2), encoding="utf-8")
+
+    env = dict(os.environ)
+    serve_log = open(tmp / "serve.log", "w", encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "nanobot", "serve", "--config", str(config_path)],
+        cwd=str(tmp), env=env,
+        stdout=serve_log, stderr=subprocess.STDOUT,
+    )
+    try:
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{bot_port}/health", timeout=2
+                ) as response:
+                    if response.status == 200:
+                        break
+            except OSError:
+                time.sleep(0.5)
+        else:
+            record("live bot serve up", False)
+            return 1
+        record("live bot serve up", True, f"pid={proc.pid} port={bot_port}")
+
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{bot_port}/v1/agent-capabilities",
+            headers={"Authorization": f"Bearer {runs_key}"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            capabilities = _json.loads(response.read())
+        record(
+            "A17 live capabilities",
+            capabilities.get("execution") is True and capabilities.get("protocol") == 1,
+            f"instance={capabilities.get('instance_id', '')[:16]}",
+        )
+
+        submit_body = {
+            "protocol": 1,
+            "task_id": "live-research",
+            "workflow_id": "wf-live",
+            "input_text": (
+                "Reply with exactly the word READY and nothing else. "
+                "Do not use any tools."
+            ),
+            "deadline_at": (
+                datetime.now(tz=timezone.utc) + timedelta(minutes=10)
+            ).isoformat(),
+        }
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{bot_port}/v1/agent-runs",
+            data=_json.dumps(submit_body).encode(),
+            headers={
+                "Authorization": f"Bearer {runs_key}",
+                "Idempotency-Key": str(uuid.uuid4()),
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                accepted = _json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            record("A06 live submit", False, exc.read().decode("utf-8", "replace")[:300])
+            return 1
+        run_id = accepted["run_id"]
+        record("A06 live submit", accepted["state"] in ("queued", "running"), run_id)
+
+        final = None
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            status_req = urllib.request.Request(
+                f"http://127.0.0.1:{bot_port}/v1/agent-runs/{run_id}",
+                headers={"Authorization": f"Bearer {runs_key}"},
+            )
+            with urllib.request.urlopen(status_req, timeout=5) as response:
+                final = _json.loads(response.read())
+            if final["state"] in ("succeeded", "failed", "cancelled", "interrupted"):
+                break
+            time.sleep(2)
+        assert final is not None
+        record(
+            "A06 live terminal",
+            final["state"] in ("succeeded", "failed"),
+            f"state={final['state']} code={(final.get('outcome') or {}).get('code')}",
+        )
+        result_req = urllib.request.Request(
+            f"http://127.0.0.1:{bot_port}/v1/agent-runs/{run_id}/result",
+            headers={"Authorization": f"Bearer {runs_key}"},
+        )
+        with urllib.request.urlopen(result_req, timeout=5) as response:
+            result = _json.loads(response.read())
+        text = (result.get("outcome") or {}).get("text", "")
+        record("A25 live model text", "READY" in text.upper(),
+               f"len={len(text)} text={text[:120]!r}")
+        return 0 if all(item["ok"] for item in RESULTS) else 1
+    finally:
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover
+            proc.terminate()
+        out = tmp / "results.json"
+        out.write_text(_json.dumps(RESULTS, indent=2), encoding="utf-8")
+        print(f"evidence: {out}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true", help="real processes (P7)")
     args = parser.parse_args()
     if args.live:
-        print("live mode: wired during P7 live acceptance")
-        return 2
+        return asyncio.run(live_matrix())
     return asyncio.run(offline_matrix())
 
 
