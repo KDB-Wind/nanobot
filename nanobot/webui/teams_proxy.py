@@ -90,7 +90,8 @@ class TeamsProxy:
                                 if event is not None:
                                     await on_event(event)
             except (httpx.HTTPError, asyncio.CancelledError):
-                if asyncio.current_task().cancelled():
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
                     raise
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
@@ -107,12 +108,12 @@ def _parse_sse(raw: bytes) -> dict[str, Any] | None:
     if not data:
         return None
     try:
-        payload = json.loads(data)
+        parsed = json.loads(data)
     except ValueError:
         return None
-    if not isinstance(payload, dict):
+    if not isinstance(parsed, dict):
         return None
-    payload.setdefault("type", event_type)
+    payload: dict[str, Any] = {**parsed, "type": event_type}
     return payload
 
 

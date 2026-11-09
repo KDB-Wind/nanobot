@@ -1,5 +1,13 @@
 # Acceptance runs
 
+## Version 0.4 repair acceptance
+
+Run `../.venv-nanobot/Scripts/python.exe acceptance/repair_live.py --preset glm-5.3-flash` from the Teams directory. The named preset must exist in the user's Nanobot configuration. The runner creates a unique `.e2e/repair-*` directory and exports connection values to child environments without writing literal credentials into generated configurations. It tests the real config loader, Planner through MCP to Research, explicit thread continuation after target restart, and durable observations without task content.
+
+Real stdio cancellation, process death, restart quarantine and second-writer rejection are also covered offline by `tests/test_mcp_stdio.py`. New-task isolation and explicit continuation replace the old fixed-session assumption. Multi-hop fixtures explicitly enable the feature and forward `expires_at`.
+
+The legacy runner now uses a unique `.e2e/acceptance-*` directory. The following historical instructions and scenario list do not imply all cases were rerun for 0.4. See [REPAIR_STATUS.md](../REPAIR_STATUS.md) for actual results. Live cases can incur model usage; the configured model credentials remain private.
+
 Harnesses that exercise the real integration. They sit outside the package:
 they need two live Nanobot processes, a browser, and provider credentials, so
 they are run by hand rather than in CI. The server path runs on Windows and on

@@ -262,7 +262,7 @@ class RunStore:
                     submit.workflow_id,
                     submit.input_text,
                     digest,
-                    rfc3339(submit.deadline_at),
+                    rfc3339(submit.deadline_at or utc_now()),
                     RunState.QUEUED.value,
                     moment,
                 ),

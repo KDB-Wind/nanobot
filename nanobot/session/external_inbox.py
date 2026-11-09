@@ -13,7 +13,7 @@ import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
 from .state import SessionConflictError, SessionState
 
@@ -104,13 +104,19 @@ class ExternalInbox:
 
     def __init__(self, state: SessionState) -> None:
         self._state = state
-        self._store = state._store
+        self._store = state._store  # pyright: ignore[reportPrivateUsage]
 
     def _write(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
-        return self._store.run_write(lambda: operation(self._store._local.connection))
+        # The inbox is the sanctioned session-domain collaborator on the
+        # store's writer transaction (same boundary as state.py internals).
+        return self._store.run_write(  # pyright: ignore[reportPrivateUsage]
+            lambda: operation(self._store._local.connection)  # pyright: ignore[reportPrivateUsage]
+        )
 
     def _read(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
-        return self._store.run_read(lambda: operation(self._store._local.connection))
+        return self._store.run_read(  # pyright: ignore[reportPrivateUsage]
+            lambda: operation(self._store._local.connection)  # pyright: ignore[reportPrivateUsage]
+        )
 
     # ---- capabilities ----
 
@@ -181,7 +187,7 @@ class ExternalInbox:
     ) -> ReplyCapability:
         digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-        def query(conn: sqlite3.Connection) -> tuple | None:
+        def query(conn: sqlite3.Connection) -> tuple[Any, ...] | None:
             return conn.execute(
                 "SELECT capability_id, session_key, session_generation, workflow_id, "
                 "operation_key, bot_id, instance_id, principal_id, expires_at, auto_continue "
@@ -249,7 +255,9 @@ class ExternalInbox:
     ) -> tuple[str, str, str, str] | None:
         """Bind wildcard fields on first use; reject any later mismatch."""
 
-        def resolve(conn: sqlite3.Connection) -> tuple[str, str, str, str] | None:
+        def resolve(
+            conn: sqlite3.Connection,
+        ) -> tuple[str, str, str, str] | None:
             if stored_workflow not in ("*", "") and stored_workflow != workflow_id:
                 return None
             if stored_operation not in ("*", "") and stored_operation != operation_key:
@@ -308,19 +316,19 @@ class ExternalInbox:
 
     async def revoke_session_workflows_async(self, session_key: str) -> int:
         """Revoke through the session owner so the write uses its writer thread."""
-        result = await self._state._execute(
+        result = await self._state._execute(  # pyright: ignore[reportPrivateUsage]
             session_key,
-            lambda: self._state._change(
+            lambda: self._state._change(  # pyright: ignore[reportPrivateUsage]
                 session_key,
                 lambda session: self.revoke_session_workflows(session_key),
                 history=False,
             ),
             operation_name="revoke_external_workflows",
         )
-        return int(result) if isinstance(result, int) else 0
+        return int(result)  # _change returns the callback value verbatim
 
     def workflow_allows_auto_continue(self, workflow_id: str) -> bool:
-        def query(conn: sqlite3.Connection) -> tuple | None:
+        def query(conn: sqlite3.Connection) -> tuple[Any, ...] | None:
             return conn.execute(
                 "SELECT auto_continue FROM external_workflows WHERE workflow_id=?",
                 (workflow_id,),
@@ -407,7 +415,9 @@ class ExternalInbox:
 
         return self._read(query)
 
-    def _inbox_row(self, conn: sqlite3.Connection, delivery_id: str) -> dict | None:
+    def _inbox_row(
+        self, conn: sqlite3.Connection, delivery_id: str
+    ) -> dict[str, Any] | None:
         row = conn.execute(
             "SELECT delivery_id, session_key, session_generation, workflow_id, task_id, "
             "bot_id, instance_id, run_id, terminal_revision, outcome_code, result_text, "
@@ -423,14 +433,14 @@ class ExternalInbox:
         )
         return dict(zip(keys, row, strict=True))
 
-    def _delivery_or_none(self, delivery_id: str) -> dict | None:
+    def _delivery_or_none(self, delivery_id: str) -> dict[str, Any] | None:
         return self._read(lambda conn: self._inbox_row(conn, delivery_id))
 
     async def apply_pending(self, delivery_id: str) -> str:
         """Atomically inject one received delivery into history; idempotent."""
 
-        def change(session):  # type: ignore[no-untyped-def]
-            conn = self._store._local.connection
+        def change(session: Any) -> str:
+            conn = self._store._local.connection  # pyright: ignore[reportPrivateUsage]
             row = self._inbox_row(conn, delivery_id)
             if row is None:
                 return "already_handled"
@@ -469,9 +479,11 @@ class ExternalInbox:
             return "already_handled"
         session_key = str(row["session_key"])
         try:
-            return await self._state._execute(
+            return await self._state._execute(  # pyright: ignore[reportPrivateUsage]
                 session_key,
-                lambda: self._state._change(session_key, change),
+                lambda: self._state._change(  # pyright: ignore[reportPrivateUsage]
+                    session_key, change
+                ),
                 operation_name="apply_external_delivery",
             )
         except SessionConflictError:

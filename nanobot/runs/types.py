@@ -109,7 +109,7 @@ class RunSubmit:
     task_id: str
     workflow_id: str
     input_text: str
-    deadline_at: datetime
+    deadline_at: datetime | None
     operation_key: str
     principal_id: str
 

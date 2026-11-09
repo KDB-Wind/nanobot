@@ -27,7 +27,8 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 TEAMS = ROOT.parent
-OUT = TEAMS / ".e2e"
+OUT = TEAMS / ".e2e" / ("acceptance-" + time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3))
+sys.path.insert(0, str(TEAMS / "src"))
 WT = Path(os.environ.get("NANOBOT_TEAMS_WORKTREE") or TEAMS.parent)
 if os.name == "nt":
     PY_TEAMS = TEAMS / ".venv/Scripts/python.exe"
@@ -313,7 +314,10 @@ class StubHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+        except OSError:
+            pass
 
     def log_message(self, *_args) -> None:
         return
@@ -353,7 +357,7 @@ def _wait_ports_bindable(timeout: float = 90.0) -> None:
 
 def reset() -> None:
     _wait_ports_bindable()
-    for name in ("research", "planner", "writer", "mid", "logs"):
+    for name in ("research", "planner", "writer", "writer2", "mid", "logs", ".teams-state"):
         shutil.rmtree(OUT / name, ignore_errors=True)
     (OUT / "research/workspace").mkdir(parents=True, exist_ok=True)
     (OUT / "planner/workspace").mkdir(parents=True, exist_ok=True)
@@ -481,6 +485,13 @@ def scenario_session_persistence() -> None:
             ),
         )
         assert "OK" in first.upper(), first
+        from nanobot_teams.ledger import Ledger
+
+        book = Ledger(OUT / ".teams-state/planner.sqlite3", read_only=True)
+        try:
+            continued_thread = book.list_tasks()[0].thread_key
+        finally:
+            book.close()
         stop(research_proc)
         research_proc = start_nanobot("research", OUT / "research", research, env)
         wait_health(RESEARCH_PORT, research_proc, "research")
@@ -491,7 +502,7 @@ def scenario_session_persistence() -> None:
             delegation_prompt(
                 "What code did I ask you to remember earlier in this session? "
                 "Reply with only the code."
-            ),
+            ) + f" Set the delegate_task thread_key parameter to {continued_thread}.",
         )
         assert code in second, second
         log("PASS session_persistence")
@@ -699,6 +710,7 @@ def write_teams_chain(research_port: int = RESEARCH_PORT) -> Path:
         {
             "schema_version": 2,
             "team_id": "e2e-chain",
+            "allow_multihop": True,
             "thread_key": "main",
             "bots": [
                 {"id": "planner", "display_name": "Planner", "role": "planning"},
@@ -784,7 +796,7 @@ def scenario_chain_abc() -> None:
             "mcp_teams_delegate_task with bot_id research and this task:\n"
             "Read the file secret.txt in your workspace with your file tool. "
             "Reply with only its exact contents and nothing else.\n"
-            "Copy root_task_id, hop, deadline_remaining_s, and chain exactly from "
+            "Copy root_task_id, hop, deadline_remaining_s, expires_at, and chain exactly from "
             "your [teams-envelope] block into the call, and pass parent_task_id "
             "with the block's task_id value. Do not change any value.\n"
             "After the tool returns, reply with only the returned content.\n\n"
@@ -828,6 +840,7 @@ def _chain_call(**overrides) -> dict:
         "root_task_id": str(uuid.uuid4()),
         "hop": 2,
         "deadline_remaining_s": 60.0,
+        "expires_at": time.time() + 60,
         "chain": ["planner", "mid"],
     }
     call.update(overrides)
@@ -909,6 +922,21 @@ def scenario_bot_init_live() -> None:
     )
     assert init.returncode == 0, init.stdout + init.stderr
     assert (home / "config.json").exists()
+    from repair_live import export_refs
+
+    generated = json.loads((home / "config.json").read_text(encoding="utf-8"))
+    original = user_config()
+    def expanded(value):
+        if isinstance(value, dict):
+            return {key: expanded(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [expanded(item) for item in value]
+        if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+            return env[value[2:-1]]
+        return value
+    provider_name = original["modelPresets"][PRESET]["provider"]
+    export_refs(generated["providers"][provider_name], expanded(original["providers"][provider_name]), env)
+    export_refs(generated["modelPresets"][PRESET], expanded(original["modelPresets"][PRESET]), env)
     assert "TEAMS_WRITER2_API_KEY" in init.stdout
 
     registry_after = json.loads(registry_path.read_text(encoding="utf-8"))

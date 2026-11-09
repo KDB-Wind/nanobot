@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hmac
+import json
 from typing import Any
 
 from aiohttp import web
 
-from nanobot.api.agent_runs import parse_protocol_json, protocol_error
+from nanobot.api.agent_runs import parse_protocol_json
 from nanobot.config.schema import ApiRunsConfig
 from nanobot.session.external_inbox import (
     ExternalInbox,
@@ -51,6 +52,25 @@ def _error(status: int, code: str, message: str) -> web.Response:
     return _json({"code": code, "message": message}, status=status)
 
 
+
+def _error_from_protocol(exc: web.HTTPException) -> web.Response:
+    """Convert a protocol_error response into an inbox _error response."""
+    try:
+        parsed_detail: Any = json.loads(exc.text or "{}")
+    except ValueError:
+        parsed_detail = {}
+    # json.loads is an Any boundary; the isinstance guard is the runtime check.
+    detail: dict[str, Any] = (
+        dict(parsed_detail)  # pyright: ignore[reportUnknownArgumentType]
+        if isinstance(parsed_detail, dict)
+        else {}
+    )
+    return _error(
+        int(exc.status or 400),
+        str(detail.get("code", "invalid_json")),
+        str(detail.get("message", "Body rejected.")),
+    )
+
 def _bounded_int(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError("terminal_revision must be an integer")
@@ -78,13 +98,8 @@ async def handle_capability_validate(request: web.Request) -> web.Response:
     config: ApiRunsConfig = request.app[_INBOX_CONFIG_KEY]
     try:
         body = await parse_protocol_json(request)
-    except protocol_error as exc:
-        detail = getattr(exc, "payload", {})
-        return _error(
-            getattr(exc, "status", 400),
-            str(detail.get("code", "invalid_json")),
-            str(detail.get("message", "Body rejected.")),
-        )
+    except web.HTTPException as exc:
+        return _error_from_protocol(exc)
     required = {"capability", "workflow", "operation_key", "bot_id", "instance_id"}
     missing = required - set(body)
     if missing:
@@ -112,13 +127,8 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
     config: ApiRunsConfig = request.app[_INBOX_CONFIG_KEY]
     try:
         body = await parse_protocol_json(request)
-    except protocol_error as exc:
-        detail = getattr(exc, "payload", {})
-        return _error(
-            getattr(exc, "status", 400),
-            str(detail.get("code", "invalid_json")),
-            str(detail.get("message", "Body rejected.")),
-        )
+    except web.HTTPException as exc:
+        return _error_from_protocol(exc)
     unknown = set(body) - INBOX_FIELDS
     if unknown:
         return _error(400, "unknown_fields", f"Unknown fields: {sorted(unknown)}")
@@ -138,7 +148,12 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
     if len(result_text.encode("utf-8")) > 32 * 1024:
         return _error(413, "result_too_large", "result_text exceeds 32 KiB.")
     outcome = body.get("outcome")
-    outcome_code = str(outcome.get("code", "")) if isinstance(outcome, dict) else ""
+    outcome_code = ""
+    if isinstance(outcome, dict):
+        # Same Any boundary as above; the key read is guarded at runtime.
+        outcome_code = str(
+            outcome.get("code", "")  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
+        )
     delivery = InboxDelivery(
         delivery_id=str(body.get("delivery_id", "")),
         session_key=capability.session_key,
@@ -164,11 +179,10 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
     )
     try:
         receipt = inbox.receive(delivery)
-    except (InboxError, ValueError) as exc:
-        code = getattr(exc, "code", "invalid_field")
-        detail = getattr(exc, "detail", str(exc))
-        status = 409 if hasattr(exc, "code") else 400
-        return _error(status, code, detail)
+    except InboxError as exc:
+        return _error(409, exc.code, exc.detail)
+    except ValueError as exc:
+        return _error(400, "invalid_field", str(exc))
     status = 202 if receipt.state == "received" else 200
     response = _json(
         {

@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .config import TeamConfig
-from .ledger import Ledger
+from .ledger import Ledger, LedgerError
 
 _MERMAQ_SAFE = str.maketrans({".": "_", "-": "_"})
 
@@ -38,11 +38,18 @@ def render_graph(config: TeamConfig) -> str:
 
 
 def render_budget(config: TeamConfig, ledger_paths: Sequence[Path]) -> str:
+    if not ledger_paths:
+        return "unavailable: no control ledgers found; usage is unverified"
     rows: list[str] = []
     header = f"{'bot':<16} {'delegations':<16} {'result_bytes':<22} {'chain_seconds':<18}"
     rows.append(header)
     missing = [str(path) for path in ledger_paths if not Path(path).exists()]
-    usage = _combined_usage(ledger_paths)
+    if missing:
+        return "missing: " + ", ".join(missing) + "; usage is unverified"
+    try:
+        usage = _combined_usage(ledger_paths, config.team_id)
+    except LedgerError:
+        return "unavailable: ledger cannot be read or requires migration; usage is unverified"
     for bot in config.bots:
         budget = config.budgets.get(bot.id)
         count, result_bytes, seconds = usage.get(bot.id, (0, 0, 0.0))
@@ -68,10 +75,15 @@ def render_audit(
     for path in ledger_paths:
         if not Path(path).exists():
             continue
-        ledger = Ledger(path, read_only=True)
+        try:
+            ledger = Ledger(path, read_only=True)
+        except LedgerError:
+            return "unavailable: ledger cannot be opened; history is unverified"
         try:
             for record in ledger.list_tasks(limit=limit, target=target, status=status):
                 rows.append((str(path), record))
+        except LedgerError:
+            return "unavailable: ledger cannot be read or requires migration; history is unverified"
         finally:
             ledger.close()
     rows.sort(key=lambda item: item[1].started_at, reverse=True)
@@ -93,24 +105,29 @@ def render_audit(
     return "\n".join(lines)
 
 
-def _combined_usage(ledger_paths: Sequence[Path]) -> dict[str, tuple[int, int, float]]:
+def _combined_usage(ledger_paths: Sequence[Path], team_id: str) -> dict[str, tuple[int, int, float]]:
     usage: dict[str, tuple[int, int, float]] = {}
     callers: set[str] = set()
     existing = [path for path in ledger_paths if Path(path).exists()]
     for path in existing:
         ledger = Ledger(path, read_only=True)
         try:
-            ledger_callers = ledger.list_tasks(limit=500)
+            identity = ledger.identity()
+            if identity is None or identity[0] != team_id:
+                raise LedgerError("Ledger belongs to another team or is unverified.")
+            ledger_callers = ledger.callers()
         finally:
             ledger.close()
-        for record in ledger_callers:
-            callers.add(record.caller)
+        callers.update(ledger_callers)
     for caller in callers:
         total = [0, 0, 0.0]
         for path in existing:
             ledger = Ledger(path, read_only=True)
             try:
-                count, result_bytes, seconds = ledger.usage_for(caller)
+                totals = ledger.usage_for(caller)
+                if totals is None:
+                    raise LedgerError("Budget usage unavailable.")
+                count, result_bytes, seconds = totals
             finally:
                 ledger.close()
             total[0] += count

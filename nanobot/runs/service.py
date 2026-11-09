@@ -17,6 +17,7 @@ from typing import Protocol
 from .store import (
     RunStore,
     StateTransitionError,
+    StoreUnavailableError,
     canonical_request_digest,
 )
 from .types import (

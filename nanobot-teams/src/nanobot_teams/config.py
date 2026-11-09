@@ -9,6 +9,7 @@ the same TeamConfig model.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -33,7 +34,7 @@ _TOP_LEVEL_KEYS_V1 = frozenset(
     }
 )
 _TOP_LEVEL_KEYS_V2 = frozenset(
-    {"schema_version", "team_id", "thread_key", "bots", "limits", "budgets"}
+    {"schema_version", "team_id", "thread_key", "bots", "limits", "budgets", "allow_multihop"}
 )
 _BOT_KEYS_V1 = frozenset({"id", "display_name", "role", "endpoint", "api_key_env"})
 _BOT_KEYS_V2 = frozenset(
@@ -46,6 +47,7 @@ _BOT_KEYS_V2 = frozenset(
         "endpoint",
         "api_key_env",
         "allowed_callers",
+        "can_start_root",
     }
 )
 _LIMIT_KEYS = (
@@ -97,6 +99,7 @@ class BotConfig:
     endpoint: str | None = None
     api_key_env: str | None = None
     allowed_callers: tuple[str, ...] = ()
+    can_start_root: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,7 @@ class TeamConfig:
     limits: Limits = Limits()
     default_caller_id: str | None = None
     budgets: Mapping[str, Budget] = field(default_factory=dict)
+    allow_multihop: bool = False
 
     def bot(self, bot_id: str) -> BotConfig | None:
         return next((bot for bot in self.bots if bot.id == bot_id), None)
@@ -192,7 +196,7 @@ def _load_v1(root: dict[str, Any]) -> TeamConfig:
         elif bot.endpoint is not None or bot.api_key_env is not None:
             raise ConfigError(f"bot {bot.id!r} is not an allowed target and cannot set endpoint")
         else:
-            normalized.append(bot)
+            normalized.append(replace(bot, can_start_root=bot.id == caller_bot_id))
     return TeamConfig(
         schema_version=1,
         team_id=team_id,
@@ -209,12 +213,18 @@ def _load_v2(root: dict[str, Any]) -> TeamConfig:
     thread_key = _text(root.get("thread_key"), "thread_key")
     bots = _bots(root.get("bots"), _BOT_KEYS_V2)
     _validate_v2_graph(bots)
+    limits = _limits(root.get("limits"))
+    allow_multihop = root.get("allow_multihop", False)
+    if type(allow_multihop) is not bool:
+        raise ConfigError("allow_multihop must be a boolean")
+    _validate_dag(bots, limits.max_hops if allow_multihop else None)
     return TeamConfig(
         schema_version=2,
         team_id=team_id,
         thread_key=thread_key,
         bots=bots,
-        limits=_limits(root.get("limits")),
+        limits=limits,
+        allow_multihop=allow_multihop,
         budgets=_budgets(root.get("budgets"), bots),
     )
 
@@ -258,8 +268,8 @@ def _budgets(value: Any, bots: tuple[BotConfig, ...]) -> dict[str, Budget]:
         for key, ceiling in limits.items():
             if isinstance(ceiling, bool) or not isinstance(ceiling, int | float):
                 raise ConfigError(f"budgets.{bot_id}.{key} must be a number")
-            if ceiling <= 0:
-                raise ConfigError(f"budgets.{bot_id}.{key} must be positive")
+            if ceiling > 10**12 or ceiling <= 0 or not math.isfinite(ceiling):
+                raise ConfigError(f"budgets.{bot_id}.{key} must be positive and finite, at most 1e12")
             if key in {"delegations", "result_bytes"} and not isinstance(ceiling, int):
                 raise ConfigError(f"budgets.{bot_id}.{key} must be an integer")
             fields[key] = ceiling
@@ -294,7 +304,7 @@ def _allowed_targets(value: Any) -> tuple[str, ...]:
         raise ConfigError("allowed_targets must be a non-empty array")
     targets = tuple(value)
     for target in targets:
-        if not isinstance(target, str) or not _BOT_ID.match(target):
+        if not isinstance(target, str) or not _BOT_ID.fullmatch(target):
             raise ConfigError("allowed_targets entries must be bot ids")
     if len(set(targets)) != len(targets):
         raise ConfigError("allowed_targets must not repeat a bot id")
@@ -304,16 +314,21 @@ def _allowed_targets(value: Any) -> tuple[str, ...]:
 def _bots(value: Any, bot_keys: frozenset[str]) -> tuple[BotConfig, ...]:
     if not isinstance(value, list) or not value:
         raise ConfigError("bots must be a non-empty array")
+    if len(value) > 64:
+        raise ConfigError("bots must contain at most 64 entries")
     bots: list[BotConfig] = []
     for index, raw in enumerate(value):
         where = f"bots[{index}]"
         entry = _object(raw, where)
         _reject_unknown(entry, bot_keys, where)
         bot_id = _text(entry.get("id"), f"{where}.id")
-        if not _BOT_ID.match(bot_id):
+        if not _BOT_ID.fullmatch(bot_id):
             raise ConfigError(f"{where}.id must match {_BOT_ID.pattern}")
         endpoint = entry.get("endpoint")
         api_key_env = entry.get("api_key_env")
+        can_start_root = entry.get("can_start_root", not entry.get("allowed_callers"))
+        if type(can_start_root) is not bool:
+            raise ConfigError(f"{where}.can_start_root must be a boolean")
         model_preset = entry.get("model_preset")
         bots.append(
             BotConfig(
@@ -333,6 +348,7 @@ def _bots(value: Any, bot_keys: frozenset[str]) -> tuple[BotConfig, ...]:
                     None if api_key_env is None else _env_name(api_key_env, f"{where}.api_key_env")
                 ),
                 allowed_callers=_caller_list(entry.get("allowed_callers"), where),
+                can_start_root=can_start_root,
             )
         )
     ids = [bot.id for bot in bots]
@@ -351,7 +367,7 @@ def _capabilities(value: Any, where: str) -> tuple[str, ...]:
         raise ConfigError(f"{where}.capabilities must list at most {_MAX_CAPABILITIES} entries")
     items = []
     for item in value:
-        if not isinstance(item, str) or not _CAPABILITY.match(item):
+        if not isinstance(item, str) or not _CAPABILITY.fullmatch(item):
             raise ConfigError(f"{where}.capabilities entries must be short lowercase tokens")
         items.append(item)
     if len(set(items)) != len(items):
@@ -362,11 +378,11 @@ def _capabilities(value: Any, where: str) -> tuple[str, ...]:
 def _caller_list(value: Any, where: str) -> tuple[str, ...]:
     if value is None:
         return ()
-    if not isinstance(value, list) or not value:
-        raise ConfigError(f"{where}.allowed_callers must be a non-empty array")
+    if not isinstance(value, list):
+        raise ConfigError(f"{where}.allowed_callers must be an array")
     callers = tuple(value)
     for caller in callers:
-        if not isinstance(caller, str) or not _BOT_ID.match(caller):
+        if not isinstance(caller, str) or not _BOT_ID.fullmatch(caller):
             raise ConfigError(f"{where}.allowed_callers entries must be bot ids")
     if len(set(callers)) != len(callers):
         raise ConfigError(f"{where}.allowed_callers must not repeat a bot id")
@@ -385,8 +401,9 @@ def _limits(value: Any) -> Limits:
         raw = entry[key]
         if isinstance(raw, bool) or not isinstance(raw, int | float):
             raise ConfigError(f"limits.{key} must be a number")
-        if raw <= 0:
-            raise ConfigError(f"limits.{key} must be positive")
+        ceiling = 16 * 1024 * 1024 if key in _BYTE_LIMITS else 86400
+        if raw > ceiling or raw <= 0 or not math.isfinite(raw):
+            raise ConfigError(f"limits.{key} must be positive and finite, at most {ceiling}")
         if key in _INT_LIMITS and not isinstance(raw, int):
             raise ConfigError(f"limits.{key} must be an integer")
         if key == "max_hops" and not 1 <= raw <= 4:
@@ -400,6 +417,8 @@ def _endpoint(value: Any, where: str) -> str:
         raise ConfigError(f"{where} must be a string")
     if value != value.strip():
         raise ConfigError(f"{where} must not have surrounding whitespace")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ConfigError(f"{where} must not contain control characters")
     try:
         parts = urlsplit(value)
         port = parts.port
@@ -417,10 +436,32 @@ def _endpoint(value: Any, where: str) -> str:
         raise ConfigError(f"{where} path must be {_API_PATH}")
     if "?" in value or "#" in value:
         raise ConfigError(f"{where} must not contain a query or fragment")
-    return value
+    return f"http://127.0.0.1:{port}{_API_PATH}"
 
 
 def _env_name(value: Any, where: str) -> str:
-    if not isinstance(value, str) or not _ENV_NAME.match(value):
+    if not isinstance(value, str) or not _ENV_NAME.fullmatch(value):
         raise ConfigError(f"{where} must be an environment variable name")
     return value
+
+
+def _validate_dag(bots: tuple[BotConfig, ...], max_depth: int | None) -> None:
+    targets = {bot.id: [target.id for target in bots if bot.id in target.allowed_callers] for bot in bots}
+    visiting: set[str] = set()
+    depths: dict[str, int] = {}
+
+    def depth(bot_id: str) -> int:
+        if bot_id in visiting:
+            raise ConfigError("The authorization graph must be acyclic (DAG).")
+        if bot_id in depths:
+            return depths[bot_id]
+        visiting.add(bot_id)
+        value = max((1 + depth(target) for target in targets[bot_id]), default=0)
+        visiting.remove(bot_id)
+        depths[bot_id] = value
+        return value
+
+    for bot in bots:
+        if max_depth is not None and depth(bot.id) > max_depth:
+            raise ConfigError("Authorization graph depth exceeds limits.max_hops.")
+        depth(bot.id)

@@ -1,4 +1,4 @@
-"""The two MCP tools, in text JSON with isError on every non-completed result."""
+"""Four MCP tools, in text JSON with isError on every non-completed result."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from mcp.server.stdio import stdio_server
 from . import __version__
 from .config import TeamConfig
 from .delegation import Delegator
-from .ledger import Ledger
+from .ledger import Ledger, LedgerError
 from .transport import HttpTransport, OutcomeKind
 
 _SERVER_NAME = "nanobot-teams"
@@ -50,7 +50,7 @@ _GET_TASK_SCHEMA: dict[str, Any] = {
 _DELEGATE_TASK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "bot_id": {"type": "string", "description": "Bot id reported by list_bots."},
+        "bot_id": {"type": "string", "maxLength": 64, "description": "Bot id reported by list_bots."},
         "task": {"type": "string", "description": "Self-contained task and expected output."},
         "parent_task_id": {
             "type": "string",
@@ -68,6 +68,10 @@ _DELEGATE_TASK_SCHEMA: dict[str, Any] = {
             "type": "number",
             "description": "Remaining chain budget in seconds, copied from the envelope block.",
         },
+        "thread_key": {"type": "string", "maxLength": 128,
+                       "description": "Continue a thread_key returned for this target; omit for an isolated new task."},
+        "expires_at": {"type": "number",
+                       "description": "Unix expiry copied with a multi-hop envelope; advisory, not authenticated."},
         "chain": {
             "type": "array",
             "items": {"type": "string"},
@@ -102,7 +106,7 @@ def build_server(delegator: Delegator) -> Server:
                 annotations=types.ToolAnnotations(
                     readOnlyHint=False,
                     idempotentHint=False,
-                    destructiveHint=False,
+                    destructiveHint=True,
                     openWorldHint=True,
                 ),
             ),
@@ -110,8 +114,7 @@ def build_server(delegator: Delegator) -> Server:
                 name="list_tasks",
                 description=(
                     "List recent delegations from the local ledger. Local observation "
-                    "only; completed is not proof of remote success. Empty until the "
-                    "server runs with --ledger."
+                    "only; completed is not proof of remote success. Backed by durable local control state."
                 ),
                 inputSchema=_LIST_TASKS_SCHEMA,
                 annotations=types.ToolAnnotations(
@@ -132,8 +135,7 @@ def build_server(delegator: Delegator) -> Server:
             ),
         ]
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+    async def _call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
         if name == "list_bots":
             text = json.dumps(
                 {"bots": delegator.list_bots()}, ensure_ascii=False, separators=(",", ":")
@@ -179,10 +181,19 @@ def build_server(delegator: Delegator) -> Server:
                 hop=arguments.get("hop"),
                 deadline_remaining_s=arguments.get("deadline_remaining_s"),
                 chain=arguments.get("chain"),
+                expires_at=arguments.get("expires_at"),
+                thread_key=arguments.get("thread_key"),
             )
             is_error = result.status is not OutcomeKind.completed
             return _text_result(result.to_json(), is_error=is_error)
         return _error_result("unknown_tool", "Unknown tool.")
+
+    @server.call_tool()
+    async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+        try:
+            return await _call_tool(name, arguments)
+        except LedgerError:
+            return _error_result("ledger_unavailable", "Cannot read durable control state.")
 
     return server
 
@@ -193,8 +204,11 @@ async def serve(
     caller_id: str,
     ledger: Ledger | None = None,
 ) -> None:
-    transport = HttpTransport(config.limits)
     book = ledger if ledger is not None else Ledger(None)
+    if not book.enabled:
+        raise LedgerError("A persistent ledger is required.")
+    book.bind(config.team_id, caller_id)
+    transport = HttpTransport(config.limits)
     try:
         server = build_server(Delegator(config, transport, api_keys, caller_id, ledger=book))
         async with stdio_server() as (read_stream, write_stream):

@@ -5,13 +5,14 @@ is prefixed with a machine-readable block so a middle-hop bot can continue the
 chain: it copies the fields into its own delegate_task call per its skill
 instructions. The values arrive through model mediation, so the MCP treats
 them as structured, untrusted input and enforces the invariants locally:
-hop bounds, chain shape, no revisited bot, and a deadline that only shrinks.
+hop bounds, chain shape, and expiry. These values are advisory, not authenticated.
 """
 
 from __future__ import annotations
 
 import math
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -29,6 +30,7 @@ ENVELOPE_KEYS = (
     "hop",
     "deadline_remaining_s",
     "chain",
+    "expires_at",
 )
 
 
@@ -48,6 +50,7 @@ class Envelope:
     hop: int
     deadline_remaining_s: float
     chain: tuple[str, ...]
+    expires_at: float
 
 
 def envelope_for_root(task_id: str, caller_id: str, deadline_s: float) -> Envelope:
@@ -57,6 +60,7 @@ def envelope_for_root(task_id: str, caller_id: str, deadline_s: float) -> Envelo
         hop=1,
         deadline_remaining_s=deadline_s,
         chain=(caller_id,),
+        expires_at=time.time() + deadline_s,
     )
 
 
@@ -71,6 +75,7 @@ def validate_continuation(
     chain: Any,
     max_hops: int,
     known_bots: frozenset[str] | set[str],
+    expires_at: Any = None,
 ) -> Envelope:
     """Check one middle-hop delegation and return the envelope it runs under."""
     present = [
@@ -81,6 +86,7 @@ def validate_continuation(
             ("hop", hop),
             ("deadline_remaining_s", deadline_remaining_s),
             ("chain", chain),
+            ("expires_at", expires_at),
         )
         if value is not None
     ]
@@ -92,7 +98,7 @@ def validate_continuation(
         )
 
     for name, value in (("parent_task_id", parent_task_id), ("root_task_id", root_task_id)):
-        if not isinstance(value, str) or not _UUID.match(value):
+        if not isinstance(value, str) or not _UUID.fullmatch(value):
             raise EnvelopeError("envelope_invalid", f"{name} must be a task id.")
 
     if isinstance(hop, bool) or not isinstance(hop, int) or hop < 2:
@@ -105,20 +111,24 @@ def validate_continuation(
 
     if isinstance(deadline_remaining_s, bool) or not isinstance(deadline_remaining_s, int | float):
         raise EnvelopeError("envelope_invalid", "deadline_remaining_s must be a number.")
-    if not math.isfinite(deadline_remaining_s):
-        raise EnvelopeError("envelope_invalid", "deadline_remaining_s must be a finite number.")
     if deadline_remaining_s <= 0:
-        raise EnvelopeError(
-            "budget_exhausted", "The chain deadline is spent; no budget remains."
-        )
+        raise EnvelopeError("budget_exhausted", "The chain deadline is spent; no budget remains.")
     if deadline_remaining_s > _DEADLINE_MAX:
         raise EnvelopeError("envelope_invalid", "deadline_remaining_s exceeds the cap.")
+    if not math.isfinite(deadline_remaining_s):
+        raise EnvelopeError("envelope_invalid", "deadline_remaining_s must be finite.")
+
+    if isinstance(expires_at, bool) or not isinstance(expires_at, int | float) or abs(expires_at) > 10**12 or not math.isfinite(expires_at):
+        raise EnvelopeError("envelope_invalid", "expires_at must be a finite Unix timestamp.")
+    remaining = min(float(deadline_remaining_s), expires_at - time.time())
+    if remaining <= 0:
+        raise EnvelopeError("budget_exhausted", "The envelope has expired.")
 
     if not isinstance(chain, list) or not chain:
         raise EnvelopeError("envelope_invalid", "chain must be a non-empty array of bot ids.")
     entries: list[str] = []
     for entry in chain:
-        if not isinstance(entry, str) or not _BOT_ID.match(entry):
+        if not isinstance(entry, str) or not _BOT_ID.fullmatch(entry):
             raise EnvelopeError("envelope_invalid", "chain entries must be bot ids.")
         if entry not in known_bots:
             raise EnvelopeError("envelope_invalid", f"chain names unknown bot {entry!r}.")
@@ -141,19 +151,22 @@ def validate_continuation(
         root_task_id=root_task_id,
         parent_task_id=parent_task_id,
         hop=hop,
-        deadline_remaining_s=float(deadline_remaining_s),
+        deadline_remaining_s=remaining,
         chain=tuple(entries),
+        expires_at=float(expires_at),
     )
 
 
 def preamble_envelope(envelope: Envelope, task_id: str, target_id: str) -> Envelope:
-    """Derive the envelope block the target receives. The deadline only shrinks."""
+    """Derive the envelope block the target receives. Derive a bounded advisory expiry, deducting elapsed wall-clock time."""
+    remaining = max(min(envelope.deadline_remaining_s, envelope.expires_at - time.time()) * _CHILD_RESERVE, 0.0)
     return Envelope(
         root_task_id=envelope.root_task_id,
         parent_task_id=task_id,
         hop=envelope.hop + 1,
-        deadline_remaining_s=max(envelope.deadline_remaining_s * _CHILD_RESERVE, 0.0),
+        deadline_remaining_s=remaining,
         chain=(*envelope.chain, target_id),
+        expires_at=min(envelope.expires_at, time.time() + remaining),
     )
 
 
@@ -165,6 +178,7 @@ def task_with_preamble(task: str, envelope: Envelope, task_id: str) -> str:
         f"parent_task_id: {envelope.parent_task_id or 'none'}",
         f"hop: {envelope.hop}",
         f"deadline_remaining_s: {round(envelope.deadline_remaining_s, 3):g}",
+        f"expires_at: {envelope.expires_at:.6f}",
         f"chain: {','.join(envelope.chain)}",
         _CLOSE,
         "",
@@ -190,10 +204,12 @@ def parse_preamble(text: str) -> dict[str, Any]:
             "hop",
             "deadline_remaining_s",
             "chain",
+            "expires_at",
         }:
             raise ValueError(f"unknown envelope field {key!r}")
         fields[key] = value
     fields["hop"] = int(fields["hop"])
+    fields["expires_at"] = float(fields["expires_at"])
     fields["deadline_remaining_s"] = float(fields["deadline_remaining_s"])
     fields["chain"] = fields["chain"].split(",")
     fields["parent_task_id"] = None if fields["parent_task_id"] == "none" else fields["parent_task_id"]
@@ -202,7 +218,7 @@ def parse_preamble(text: str) -> dict[str, Any]:
 
 
 def is_task_id(value: str) -> bool:
-    return bool(_UUID.match(value))
+    return bool(_UUID.fullmatch(value))
 
 
 def new_task_id() -> str:
