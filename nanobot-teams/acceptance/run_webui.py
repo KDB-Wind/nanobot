@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 import shutil
 import subprocess
@@ -18,9 +19,10 @@ sys.path.insert(0, str(ROOT))
 import run_e2e as base  # noqa: E402
 
 TEAMS = ROOT.parent
-WT = TEAMS.parent
+WT = Path(os.environ.get("NANOBOT_TEAMS_WORKTREE") or TEAMS.parent)
+WEBUI = Path(os.environ.get("NANOBOT_TEAMS_WEBUI") or WT / "webui")
 OUT = TEAMS / ".e2e"
-NANOBOT = WT / ".venv-nanobot/Scripts/nanobot.exe"
+NANOBOT = base.NANOBOT
 RESEARCH_PORT = 8901
 WEBUI_PORT = 8766
 GATEWAY_PORT = 18790
@@ -123,9 +125,9 @@ def main() -> int:
                 f"http://127.0.0.1:{WEBUI_PORT}",
                 nonce,
                 str(shots),
-                str(WT / "webui/package.json"),
+                str(WEBUI / "package.json"),
             ],
-            cwd=str(WT / "webui"),
+            cwd=str(WEBUI),
             capture_output=True,
             text=True,
             timeout=300,

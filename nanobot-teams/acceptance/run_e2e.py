@@ -28,7 +28,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent
 TEAMS = ROOT.parent
 OUT = TEAMS / ".e2e"
-WT = TEAMS.parent
+WT = Path(os.environ.get("NANOBOT_TEAMS_WORKTREE") or TEAMS.parent)
 if os.name == "nt":
     PY_TEAMS = TEAMS / ".venv/Scripts/python.exe"
     PY_NB = WT / ".venv-nanobot/Scripts/python.exe"
@@ -47,6 +47,17 @@ RESEARCH_KEY = secrets.token_urlsafe(24)
 PLANNER_KEY = secrets.token_urlsafe(24)
 WRITER_KEY = secrets.token_urlsafe(24)
 PRESET = os.environ.get("NANOBOT_TEAMS_PRESET", "step-5-preview")
+
+
+def _package_version() -> str:
+    text = (TEAMS / "pyproject.toml").read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if line.startswith("version = "):
+            return line.split('"')[1]
+    raise RuntimeError("pyproject.toml has no version line")
+
+
+VERSION = _package_version()
 
 
 def log(message: str) -> None:
@@ -1152,7 +1163,7 @@ def scenario_packaging_fresh() -> None:
         )
         assert build.returncode == 0, build.stdout + build.stderr
         wheel = next(dist.glob("nanobot_teams-*.whl"))
-        assert "0.2.0" in wheel.name, wheel.name
+        assert VERSION in wheel.name, wheel.name
 
         fresh = OUT / "fresh"
         shutil.rmtree(fresh, ignore_errors=True)
@@ -1175,7 +1186,7 @@ def scenario_packaging_fresh() -> None:
             capture_output=True, text=True, env=pip_env,
         )
         assert probe.returncode == 0, probe.stderr
-        assert probe.stdout.strip() == "0.2.0", probe.stdout
+        assert probe.stdout.strip() == VERSION, probe.stdout
 
         config = write_teams(f"http://127.0.0.1:{STUB_PORT}/v1/chat/completions")
 

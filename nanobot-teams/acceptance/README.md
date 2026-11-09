@@ -7,10 +7,14 @@ Linux; the WebUI path needs Edge and has only been run on Windows.
 
 ## Prerequisites
 
-- The worktree root has `.venv-nanobot` with the baseline Nanobot installed.
-- `..\.venv` has this package installed in editable mode.
-- `webui/node_modules` exists and Playwright can launch Edge.
-- `~/.nanobot/config.json` holds working provider credentials for the chosen
+- A checkout whose parent directory contains \`.venv-nanobot\` with the baseline
+  Nanobot installed. \`NANOBOT_TEAMS_WORKTREE\` overrides that parent, which is what
+  a standalone clone needs.
+- The repository root has \`.venv\` with this package installed in editable mode.
+- \`NANOBOT_TEAMS_WEBUI\` names a \`webui\` directory whose \`node_modules\` has
+  Playwright and can launch Edge. It defaults to \`<worktree>/webui\`. Only the WebUI
+  harness needs it.
+- \`~/.nanobot/config.json\` holds working provider credentials for the chosen
   preset. The harness copies the preset and overrides only its API key.
 
 Select a preset with `NANOBOT_TEAMS_PRESET`; it defaults to `step-5-preview`.
@@ -95,3 +99,9 @@ credentials through environment variables; delete them after a run anyway.
 ```bash
 find .e2e -name config.json -delete
 ```
+
+## CI
+
+\`.github/workflows/ci.yml\` runs \`ruff\` and the unit suite on Ubuntu and Windows for
+every push and pull request. It expects this directory to be the repository root,
+and it does not run these harnesses.
