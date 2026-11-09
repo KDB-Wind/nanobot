@@ -377,3 +377,79 @@ def test_truncate_text_boundary():
     assert cut == "ab" and truncated is True and size == 8
     same, truncated, size = truncate_text("abc", 100)
     assert same == "abc" and truncated is False
+
+
+async def test_q1a_b1_defaulted_deadline_replay_reconciles(make):
+    """Same wire body without a deadline replays after the default was fixed."""
+    service, fake = make()
+    fake.gate = asyncio.Event()
+    await service.start()
+    holder = await service.submit(submit_req(key=str(uuid.uuid4()), task_id="holder"))
+    await wait_for_state(service, holder.run.run_id, RunState.RUNNING)
+    request = RunSubmit(
+        task_id="replay",
+        workflow_id="wf",
+        input_text="same body",
+        deadline_at=None,
+        operation_key=str(uuid.uuid4()),
+        principal_id="planner-1",
+    )
+    first = await service.submit(request)
+    assert (await service.get(first.run.run_id)).state in (RunState.QUEUED, RunState.RUNNING)
+    replay = await service.submit(request)
+    assert replay.created is False
+    assert replay.run.run_id == first.run.run_id
+
+
+async def test_q1a_b2_cancel_racing_the_worker_pump_is_honored(make):
+    """Cancel landing exactly as the worker starts the run still cancels."""
+    service, fake = make()
+    fake.gate = asyncio.Event()
+    await service.start()
+    accepted = await service.submit(submit_req())
+    results = await asyncio.gather(
+        service.cancel(accepted.run.run_id),
+        service.cancel(accepted.run.run_id),
+    )
+    final = await wait_for_state(service, accepted.run.run_id, RunState.CANCELLED)
+    assert final.cancel_requested_at is not None
+    for result in results:
+        assert result.run_id == accepted.run.run_id
+
+
+async def test_q1a_b3_store_failure_does_not_leak_the_slot_forever(make):
+    """A result write failing leaves the run reaped and the instance isolated."""
+    service, fake = make()
+    fake.gate = asyncio.Event()
+    await service.start()
+    accepted = await service.submit(submit_req())
+    await wait_for_state(service, accepted.run.run_id, RunState.RUNNING)
+    original = service._store.transition
+
+    def broken(*args, **kwargs):
+        from nanobot.runs.store import StoreUnavailableError
+
+        raise StoreUnavailableError("disk full")
+
+    service._store.transition = broken  # type: ignore[method-assign]
+    fake.gate.set()
+    for _ in range(300):
+        task = service._tasks.get(accepted.run.run_id)
+        if task is not None and task.done():
+            break
+        await asyncio.sleep(0.01)
+    service._store.transition = original  # type: ignore[method-assign]
+    # The sweep must reap the orphaned cancelling run and isolate the instance.
+    from nanobot.runs.types import InstanceIsolatedError
+
+    reaped = False
+    for _ in range(200):
+        await service._pump_once()
+        run = await service.get(accepted.run.run_id)
+        if run.state is RunState.CANCELLED:
+            reaped = True
+            break
+        await asyncio.sleep(0.01)
+    assert reaped, "the orphaned cancelling run must be finalized by the sweep"
+    with pytest.raises(InstanceIsolatedError):
+        await service.submit(submit_req(key=str(uuid.uuid4()), task_id="next"))

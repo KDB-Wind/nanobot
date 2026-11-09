@@ -141,7 +141,22 @@ class RunService:
             raise InputTooLargeError(
                 f"input_text exceeds {INPUT_MAX_BYTES} bytes before admission."
             )
+        # Digest the caller-provided semantics first: a defaulted deadline is
+        # fixed after the key check, so replaying the identical wire body
+        # always reconciles to the original run.
+        digest = canonical_request_digest(request)
+        existing = self._store.lookup(request.principal_id, request.operation_key)
+        if existing is not None:
+            if existing.request_digest != digest:
+                raise IdempotencyConflictError(
+                    "This operation key was submitted with a different request body."
+                )
+            return SubmitAcceptance(run=existing, created=False)
         deadline = _deadline_or_default(request.deadline_at)
+        _validate_deadline_bounds(deadline)
+        isolated, reason = self._store.isolation()
+        if isolated:
+            raise InstanceIsolatedError(f"This instance is isolated: {reason}")
         normalized = RunSubmit(
             task_id=request.task_id,
             workflow_id=request.workflow_id,
@@ -150,18 +165,6 @@ class RunService:
             operation_key=request.operation_key,
             principal_id=request.principal_id,
         )
-        digest = canonical_request_digest(normalized)
-        existing = self._store.lookup(request.principal_id, request.operation_key)
-        if existing is not None:
-            if existing.request_digest != digest:
-                raise IdempotencyConflictError(
-                    "This operation key was submitted with a different request body."
-                )
-            return SubmitAcceptance(run=existing, created=False)
-        _validate_deadline_bounds(deadline)
-        isolated, reason = self._store.isolation()
-        if isolated:
-            raise InstanceIsolatedError(f"This instance is isolated: {reason}")
         run, created = self._store.submit(
             normalized,
             instance_id=self._instance_id,
@@ -186,34 +189,42 @@ class RunService:
         run = await self.get(run_id)
         if run.terminal:
             return run
-        if run.state is RunState.QUEUED:
-            try:
-                self._store.transition(
-                    run.run_id,
-                    RunState.QUEUED,
-                    RunState.CANCELLED,
-                    outcome=RunOutcome(code=OutcomeCode.CANCELLED, message="Cancelled before start."),
-                    stop_confirmed=True,
-                    cancel_requested=True,
-                    cancel_reason="cancel_requested",
-                    event_data={"code": "cancelled"},
-                )
-            except StateTransitionError:
-                pass
-            self._wakeup.set()
-            return await self.get(run_id)
-        if run.state is RunState.RUNNING:
-            try:
-                self._store.transition(
-                    run.run_id,
-                    RunState.RUNNING,
-                    RunState.CANCELLING,
-                    cancel_requested=True,
-                    cancel_reason="cancel_requested",
-                    event_type="cancel_requested",
-                )
-            except StateTransitionError:
-                pass
+        # A worker pump may move the run between our read and the transition;
+        # re-read on conflict so a cancel request is never silently dropped.
+        for _ in range(3):
+            run = await self.get(run_id)
+            if run.terminal:
+                return run
+            if run.state is RunState.QUEUED:
+                try:
+                    self._store.transition(
+                        run.run_id,
+                        RunState.QUEUED,
+                        RunState.CANCELLED,
+                        outcome=RunOutcome(code=OutcomeCode.CANCELLED, message="Cancelled before start."),
+                        stop_confirmed=True,
+                        cancel_requested=True,
+                        cancel_reason="cancel_requested",
+                        event_data={"code": "cancelled"},
+                    )
+                    self._wakeup.set()
+                    return await self.get(run_id)
+                except StateTransitionError:
+                    continue
+            if run.state is RunState.RUNNING:
+                try:
+                    self._store.transition(
+                        run.run_id,
+                        RunState.RUNNING,
+                        RunState.CANCELLING,
+                        cancel_requested=True,
+                        cancel_reason="cancel_requested",
+                        event_type="cancel_requested",
+                    )
+                except StateTransitionError:
+                    continue
+                break
+            break
         task = self._tasks.get(run_id)
         if task is not None and not task.done():
             task.cancel()
@@ -247,8 +258,49 @@ class RunService:
 
     async def _pump_once(self) -> bool:
         progressed = self._sweep_deadlines()
+        progressed = self._reap_orphan_cancelling() or progressed
         progressed = self._start_queued() or progressed
         return progressed
+
+    def _reap_orphan_cancelling(self) -> bool:
+        """Finalize cancelling runs whose executor task is gone.
+
+        The executor coroutine exits when its result could not be persisted or
+        the process is closing; the slot must not stay held forever. The stop
+        is recorded conservatively: the coroutine is gone, but whether every
+        background effect was reaped is unknown, so the instance isolates.
+        """
+        acted = False
+        orphans = self._store.list_state(RunState.CANCELLING, limit=100) + self._store.list_state(
+            RunState.RUNNING, limit=100
+        )
+        for run in orphans:
+            task = self._tasks.get(run.run_id)
+            if task is not None and not task.done():
+                continue
+            try:
+                self._store.transition(
+                    run.run_id,
+                    run.state,
+                    RunState.CANCELLED,
+                    outcome=RunOutcome(
+                        code=OutcomeCode.CANCELLED,
+                        message="Executor exited before confirming the stop; "
+                        "background effects are unverified.",
+                    ),
+                    stop_confirmed=True,
+                    effects_uncertain=True,
+                    event_type="run_cancelled_unverified",
+                )
+                self._store.set_isolation(
+                    f"Run {run.run_id} stopped without confirmed effect cleanup."
+                )
+                acted = True
+            except StateTransitionError:
+                continue
+            except StoreUnavailableError:
+                return acted
+        return acted
 
     def _sweep_deadlines(self) -> bool:
         now = utc_now()
@@ -314,7 +366,10 @@ class RunService:
         try:
             result = await self._executor.execute(run)
         except asyncio.CancelledError:
-            await self._finalize_cancelled(run.run_id)
+            unverified = bool(
+                getattr(self._executor, "consume_cancel_unverified", lambda: False)()
+            )
+            await self._finalize_cancelled(run.run_id, unverified=unverified)
             raise
         except Exception as exc:
             await self._apply_result(
@@ -326,12 +381,20 @@ class RunService:
                 ),
             )
         else:
-            await self._apply_result(run.run_id, result)
+            try:
+                await self._apply_result(run.run_id, result)
+            except StoreUnavailableError:
+                # The observation could not persist; the run stays non-terminal
+                # and the cancelling sweep reaps the slot conservatively.
+                log.warning(
+                    "run %s result could not be persisted; kept non-terminal",
+                    run.run_id,
+                )
         finally:
             self._tasks.pop(run.run_id, None)
             self._wakeup.set()
 
-    async def _finalize_cancelled(self, run_id: str) -> None:
+    async def _finalize_cancelled(self, run_id: str, *, unverified: bool = False) -> None:
         current = self._store.get(run_id)
         if current is None or current.terminal:
             return
@@ -348,7 +411,12 @@ class RunService:
                 RunState.CANCELLED,
                 outcome=RunOutcome(code=code, message=f"Executor exited after {reason}."),
                 stop_confirmed=True,
+                effects_uncertain=True if unverified else None,
             )
+            if unverified:
+                self._store.set_isolation(
+                    f"Run {run_id} cancelled before its background work confirmed cleanup."
+                )
         except StateTransitionError:
             pass
 

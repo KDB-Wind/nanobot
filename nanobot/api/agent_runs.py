@@ -353,7 +353,14 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
                     }
                 ).encode("utf-8")
                 if len(payload) > EVENT_MAX_BYTES:
-                    continue
+                    # §5: an oversize event is a protocol fault; the subscriber
+                    # must re-query authoritative state instead of skipping it.
+                    fault = (
+                        'event: protocol_fault\ndata: {"code":"event_too_large",'
+                        f'"seq":{event.seq}}}\n\n'
+                    )
+                    await resp.write(fault.encode("utf-8"))
+                    return resp
                 await resp.write(
                     f"id: {event.seq}\nevent: {event.type}\ndata: {payload.decode('utf-8')}\n\n".encode()
                 )

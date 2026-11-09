@@ -50,7 +50,7 @@ def coord_server(tmp_path):
         )
 
     async def submit(request):
-        key = request.headers.get("Idempotency-Key", "")
+        request.headers.get("Idempotency-Key", "")
         run_id = f"run_{uuid.uuid4().hex[:8]}"
         return web.json_response(
             {"protocol": 1, "instance_id": "inst_stdio", "run_id": run_id,

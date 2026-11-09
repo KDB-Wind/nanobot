@@ -135,11 +135,11 @@ async def test_content_at_limit_is_not_truncated() -> None:
         (403, OutcomeKind.failed, "auth_failed", False),
         (404, OutcomeKind.failed, "request_rejected", False),
         (413, OutcomeKind.failed, "request_rejected", False),
-        (418, OutcomeKind.failed, "request_rejected", False),
+        (418, OutcomeKind.outcome_unknown, "unexpected_status", True),
         (302, OutcomeKind.outcome_unknown, "unexpected_status", True),
         (500, OutcomeKind.outcome_unknown, "target_error", True),
         (502, OutcomeKind.outcome_unknown, "target_error", True),
-        (503, OutcomeKind.failed, "provider_unavailable", False),
+        (503, OutcomeKind.outcome_unknown, "target_error", True),
         (504, OutcomeKind.timed_out, "target_timeout", True),
     ],
 )
@@ -176,6 +176,31 @@ async def test_invalid_response_shape(payload: bytes) -> None:
     assert outcome.kind is OutcomeKind.outcome_unknown
     assert outcome.error_code == "response_invalid"
     assert outcome.blocks_future is True
+
+
+async def test_only_known_configuration_503_is_safe() -> None:
+    outcome = await respond(httpx.Response(503, json={"error": {"type": "configuration_error"}}))
+    assert outcome.kind is OutcomeKind.failed
+    assert outcome.error_code == "provider_unavailable"
+    assert not outcome.blocks_future
+
+
+async def test_deep_json_is_classified_as_invalid_response() -> None:
+    outcome = await respond(httpx.Response(200, content=b"[" * 1100 + b"0" + b"]" * 1100))
+    assert outcome.error_code == "response_invalid" and outcome.blocks_future
+
+
+async def test_compressed_body_is_rejected_before_consumption() -> None:
+    consumed = []
+
+    class Compressed(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            consumed.append(True)
+            yield b"not even a valid gzip stream"
+
+    outcome = await respond(httpx.Response(200, headers={"Content-Encoding": "gzip"}, stream=Compressed()))
+    assert outcome.error_code == "response_invalid" and outcome.blocks_future
+    assert consumed == []
 
 
 async def test_response_too_large() -> None:

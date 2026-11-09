@@ -509,7 +509,8 @@ class CoordinatorStore:
         )
         workflow_result_bytes = int(
             self._conn.execute(
-                "SELECT COALESCE(SUM(LENGTH(result_text)),0) FROM tasks WHERE workflow_id=?",
+                "SELECT COALESCE(SUM(LENGTH(CAST(result_text AS BLOB))),0) FROM tasks "
+                "WHERE workflow_id=?",
                 (workflow_id,),
             ).fetchone()[0]
         )
@@ -573,7 +574,10 @@ class CoordinatorStore:
                 (project_id,),
             ).fetchone() is None:
                 raise AdmissionError("project_not_found", "No active project with that id.")
-            if bot.bot_id != bot_id or not bot.enabled:
+            if bot.bot_id != bot_id:
+                raise AdmissionError("bot_unavailable", "Bot is missing or disabled.")
+            live_bot = self.get_bot(bot_id)
+            if live_bot is None or not live_bot.enabled:
                 raise AdmissionError("bot_unavailable", "Bot is missing or disabled.")
             quarantines = self.active_quarantines()
             if bot.instance_id and bot.instance_id in quarantines:

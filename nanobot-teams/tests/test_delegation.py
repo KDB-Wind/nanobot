@@ -10,6 +10,7 @@ import httpx
 
 from nanobot_teams.config import Limits, TeamConfig, load_teams_config
 from nanobot_teams.delegation import Delegator, session_id_for
+from nanobot_teams.ledger import Ledger
 from nanobot_teams.transport import HttpTransport, OutcomeKind
 
 ENDPOINT = "http://127.0.0.1:8901/v1/chat/completions"
@@ -55,7 +56,7 @@ def build(
     config = load(tmp_path, data or config_data())
     transport = HttpTransport(config.limits, transport=httpx.MockTransport(handler))
     keys = {bot.id: SECRET for bot in config.targets_for("planner")}
-    return Delegator(config, transport, keys, "planner"), transport
+    return Delegator(config, transport, keys, "planner", ledger=Ledger(tmp_path / "state.sqlite3")), transport
 
 
 def completion(content: str) -> dict[str, Any]:
@@ -96,7 +97,7 @@ async def test_completed_delegation(tmp_path: Path) -> None:
     assert SECRET not in result.to_json()
 
 
-async def test_task_ids_change_and_session_is_stable(tmp_path: Path) -> None:
+async def test_new_tasks_use_isolated_sessions(tmp_path: Path) -> None:
     bodies: list[dict[str, Any]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -111,7 +112,7 @@ async def test_task_ids_change_and_session_is_stable(tmp_path: Path) -> None:
         await transport.aclose()
 
     assert first.task_id != second.task_id
-    assert bodies[0]["session_id"] == bodies[1]["session_id"]
+    assert bodies[0]["session_id"] != bodies[1]["session_id"]
     assert bodies[0]["session_id"].startswith("teams-v1-")
 
 

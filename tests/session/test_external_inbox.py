@@ -173,3 +173,47 @@ async def test_new_user_turn_revokes_auto_continue(harness):
     session = await state.read(key)
     assert session is not None
     assert not any(m.get("external_delivery_id") for m in session.messages)
+
+
+async def test_q1a_b4_revoked_workflow_stays_revoked_after_new_mint(harness):
+    """A later capability mint must not resurrect a revoked workflow."""
+    inbox, state, key, generation = harness
+    inbox.mint_capability(
+        session_key=key, session_generation=generation, workflow_id="wf-r",
+        operation_key="op-1", bot_id="research", instance_id="inst_r",
+        principal_id="coordinator",
+    )
+    inbox.revoke_session_workflows(key)
+    assert inbox.workflow_allows_auto_continue("wf-r") is False
+    second = inbox.mint_capability(
+        session_key=key, session_generation=generation, workflow_id="wf-r",
+        operation_key="op-2", bot_id="research", instance_id="inst_r",
+        principal_id="coordinator",
+    )
+    assert inbox.workflow_allows_auto_continue("wf-r") is False
+    with pytest.raises(InboxError) as exc:
+        inbox.validate_capability(
+            token=second.token, workflow_id="wf-r", operation_key="op-2",
+            bot_id="research", instance_id="inst_r", principal_id="coordinator",
+        )
+    assert exc.value.code == "auto_continue_revoked"
+
+
+async def test_q1a_b6_concurrent_first_use_binds_exactly_once(harness):
+    """Two validates racing different keys on wildcards: one wins, one loses."""
+    inbox, state, key, generation = harness
+    capability = inbox.mint_capability(
+        session_key=key, session_generation=generation, workflow_id="wf-race",
+        operation_key="*", bot_id="*", instance_id="*", principal_id="coordinator",
+    )
+    first = inbox.validate_capability(
+        token=capability.token, workflow_id="wf-race", operation_key="op-A",
+        bot_id="research", instance_id="inst-A", principal_id="coordinator",
+    )
+    assert first.operation_key == "op-A"
+    with pytest.raises(InboxError) as exc:
+        inbox.validate_capability(
+            token=capability.token, workflow_id="wf-race", operation_key="op-B",
+            bot_id="research", instance_id="inst-A", principal_id="coordinator",
+        )
+    assert exc.value.code == "capability_binding_mismatch"

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 from nanobot.agent.tools.mcp import MCPToolWrapper, set_teams_async_meta_hook
 from nanobot.agent.tools.registry import is_tool_error_result
 

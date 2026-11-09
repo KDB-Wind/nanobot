@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
-from nanobot_teams.config import load_teams_config
+from nanobot_teams.config import ConfigError, load_teams_config
 from nanobot_teams.delegation import Delegator, session_id_for
 from nanobot_teams.envelope import (
     EnvelopeError,
@@ -19,6 +20,7 @@ from nanobot_teams.envelope import (
     task_with_preamble,
     validate_continuation,
 )
+from nanobot_teams.ledger import Ledger
 from nanobot_teams.transport import HttpTransport, OutcomeKind
 
 ENDPOINT = "http://127.0.0.1:8901/v1/chat/completions"
@@ -27,6 +29,7 @@ SECRET = "sekret-value"
 V2_DATA: dict[str, Any] = {
     "schema_version": 2,
     "team_id": "chain",
+    "allow_multihop": True,
     "thread_key": "main",
     "bots": [
         {"id": "planner", "display_name": "Planner", "role": "planning"},
@@ -64,7 +67,7 @@ def build(tmp_path: Path, handler, caller: str = "planner"):
     config = load(tmp_path)
     transport = HttpTransport(config.limits, transport=httpx.MockTransport(handler))
     keys = {bot.id: SECRET for bot in config.targets_for(caller)}
-    return config, Delegator(config, transport, keys, caller), transport
+    return config, Delegator(config, transport, keys, caller, ledger=Ledger(tmp_path / "state.sqlite3")), transport
 
 
 def continuation(**overrides):
@@ -74,6 +77,7 @@ def continuation(**overrides):
         "hop": 2,
         "deadline_remaining_s": 60.0,
         "chain": ["planner", "mid"],
+        "expires_at": time.time() + 60,
     }
     base.update(overrides)
     return base
@@ -107,7 +111,7 @@ async def test_root_delegation_embeds_preamble(tmp_path: Path) -> None:
     assert fields["parent_task_id"] == result.task_id
     assert fields["hop"] == 2
     assert fields["chain"] == ["planner", "research"]
-    assert fields["deadline_remaining_s"] == pytest.approx(145.0 * 0.9)
+    assert fields["deadline_remaining_s"] == pytest.approx(145.0 * 0.9, abs=0.2)
     assert sent.endswith("find x")
 
 
@@ -134,7 +138,7 @@ async def test_continuation_flows_envelope(tmp_path: Path) -> None:
     assert fields["parent_task_id"] == result.task_id
     assert fields["hop"] == 3
     assert fields["chain"] == ["planner", "mid", "research"]
-    assert fields["deadline_remaining_s"] == pytest.approx(54.0)
+    assert fields["deadline_remaining_s"] == pytest.approx(54.0, abs=0.2)
 
 
 async def test_loop_back_to_ancestor_refused(tmp_path: Path) -> None:
@@ -148,17 +152,8 @@ async def test_loop_back_to_ancestor_refused(tmp_path: Path) -> None:
     data["bots"][0]["endpoint"] = ENDPOINT
     data["bots"][0]["api_key_env"] = "TEAMS_PLANNER_API_KEY"
     data["bots"][0]["allowed_callers"] = ["mid"]
-    config = load(tmp_path, data)
-    transport = HttpTransport(config.limits, transport=httpx.MockTransport(handler))
-    keys = {bot.id: SECRET for bot in config.targets_for("mid")}
-    delegator = Delegator(config, transport, keys, "mid")
-    args = continuation()
-    try:
-        result = await delegator.delegate_task("planner", "back to the root", **args)
-    finally:
-        await transport.aclose()
-
-    assert result.error_code == "loop_detected"
+    with pytest.raises(ConfigError, match="acyclic"):
+        load(tmp_path, data)
     assert requests == []
 
 
@@ -257,6 +252,7 @@ def test_validate_continuation_unit() -> None:
         chain=["planner", "mid"],
         max_hops=2,
         known_bots={"planner", "mid", "research"},
+        expires_at=time.time() + 30,
     )
     assert envelope.hop == 2
 
@@ -271,6 +267,7 @@ def test_validate_continuation_unit() -> None:
             chain=["planner", "mid"],
             max_hops=2,
             known_bots={"planner", "mid", "research"},
+        expires_at=time.time() + 30,
         )
     assert exc.value.error_code == "hop_limit"
 

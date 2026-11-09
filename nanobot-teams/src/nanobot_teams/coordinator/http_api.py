@@ -18,6 +18,7 @@ from .store import (
     AdmissionError,
     CoordinatorStore,
     IdempotencyConflictError,
+    task_digest,
 )
 from .worker import task_public_json
 
@@ -54,6 +55,19 @@ class Roles:
             if hmac.compare_digest(token, secret):
                 return role
         return None
+
+
+def _is_loopback_http_endpoint(endpoint: str) -> bool:
+    """Exact loopback host, no userinfo, http only — startswith is not enough."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(endpoint)
+    except ValueError:
+        return False
+    if parts.scheme != "http" or parts.username is not None or parts.password is not None:
+        return False
+    return parts.hostname in ("127.0.0.1", "localhost", "::1")
 
 
 def bot_public_json(bot: Bot, *, include_secret_env: bool = True) -> dict[str, Any]:
@@ -127,6 +141,42 @@ def build_app(
         delivery_mode = DeliveryMode(str(body.get("delivery_mode", "workbench_only")))
         if delivery_mode not in (DeliveryMode.WORKBENCH_ONLY, DeliveryMode.AUTO_RESUME):
             return api_error(400, "invalid_field", "delivery_mode must be workbench_only or auto_resume.")
+        if delivery_mode is DeliveryMode.AUTO_RESUME and request[_ROLE_KEY] != "planner":
+            return api_error(
+                403, "operator_workbench_only",
+                "Only the planner principal may request auto-resume delivery.",
+            )
+        deadline_raw = body.get("deadline_at")
+        deadline = None
+        if deadline_raw is not None:
+            from datetime import datetime
+
+            try:
+                deadline = datetime.fromisoformat(str(deadline_raw))
+            except ValueError:
+                return api_error(400, "invalid_field", "deadline_at must be RFC 3339.")
+            if deadline.tzinfo is None:
+                return api_error(
+                    400, "invalid_field", "deadline_at must carry a UTC timezone."
+                )
+
+        # Idempotent reconciliation wins over fresh validation: a retry of an
+        # accepted task must return the original even while the planner is down.
+        existing = store.lookup_task(principal_for(request), str(body["operation_key"]))
+        if existing is not None:
+            digest = task_digest(
+                caller_principal=principal_for(request),
+                project_id=str(body["project"]),
+                bot_id=str(body["bot"]),
+                input_text=str(body["input"]),
+                deadline_at=deadline,
+                delivery_mode=delivery_mode.value,
+                workflow_id=str(body.get("workflow", "wf-default")),
+            )
+            if existing.request_digest == digest:
+                return _json_response(task_public_json(existing), status=200)
+            return api_error(409, "operation_key_conflict",
+                             "This operation key was used with different semantics.")
         if delivery_mode is DeliveryMode.AUTO_RESUME:
             planner = config.planner
             capability = str(body.get("reply_capability", "")).strip()
@@ -178,15 +228,6 @@ def build_app(
         bot = store.get_bot(str(body["bot"]))
         if bot is None:
             return api_error(400, "bot_unavailable", "No registered bot with that id.")
-        deadline_raw = body.get("deadline_at")
-        deadline = None
-        if deadline_raw is not None:
-            from datetime import datetime
-
-            try:
-                deadline = datetime.fromisoformat(str(deadline_raw))
-            except ValueError:
-                return api_error(400, "invalid_field", "deadline_at must be RFC 3339.")
         reply_capability = str(body.get("reply_capability", "")).strip()
         try:
             task, created = store.admit_task(
@@ -286,7 +327,15 @@ def build_app(
                     for p in store.list_projects()
                 ],
                 "bots": bots,
-                "tasks": [task_public_json(t) for t in store.list_tasks(limit=PAGE_MAX)],
+                "tasks": [
+                    task_public_json(t)
+                    for t in store.list_tasks(
+                        caller_principal=(
+                            "planner" if request[_ROLE_KEY] == "planner" else None
+                        ),
+                        limit=PAGE_MAX,
+                    )
+                ],
                 "quarantines": quarantines,
                 "protocol": 1,
             }
@@ -369,7 +418,7 @@ def build_app(
         bot_id = str(body.get("bot_id", "")).strip()
         endpoint = str(body.get("endpoint", "")).strip()
         secret_env = str(body.get("secret_env", "")).strip()
-        if not bot_id or not endpoint.startswith(("http://127.0.0.1", "http://localhost")):
+        if not bot_id or not _is_loopback_http_endpoint(endpoint):
             return api_error(
                 400, "invalid_field", "v1 accepts loopback bot endpoints only."
             )

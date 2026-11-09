@@ -38,6 +38,13 @@ class AgentLoopRunExecutor:
 
     def __init__(self, loop: "AgentLoop") -> None:
         self._loop = loop
+        self._cancel_unverified = False
+
+    def consume_cancel_unverified(self) -> bool:
+        """One-shot flag: the last cancellation could not confirm cleanup."""
+        value = self._cancel_unverified
+        self._cancel_unverified = False
+        return value
 
     async def execute(self, run: Run) -> ExecutionResult:
         capture = _RunOutcomeCaptureHook()
@@ -62,7 +69,9 @@ class AgentLoopRunExecutor:
             try:
                 await self._loop.cancel_session_work(f"run:{run.run_id}")
             except Exception:
-                pass
+                # Background tool/exec cleanup could not be confirmed; the
+                # service must isolate the instance instead of trusting stop.
+                self._cancel_unverified = True
             raise
         except Exception as exc:
             return ExecutionResult(

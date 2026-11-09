@@ -184,7 +184,7 @@ def test_check_clean_registry_passes(tmp_path: Path) -> None:
     )
 
     assert [f for f in findings if f.severity == "error"] == []
-    assert all(f.code in {"endpoint_down", "endpoint_up"} for f in findings)
+    assert all(f.code in {"endpoint_down", "endpoint_up", "timeouts_unverified"} for f in findings)
 
 
 def test_check_scopes_to_caller_and_flags_unknown(tmp_path: Path) -> None:
@@ -200,7 +200,7 @@ def test_check_scopes_to_caller_and_flags_unknown(tmp_path: Path) -> None:
         probe=False,
         nanobot_version="0.4.1",
     )
-    assert [f.code for f in findings if f.severity == "error"] == []
+    assert [f.code for f in findings if f.severity == "error"] == ["missing_env"]
 
     findings = check(
         registry,
@@ -349,3 +349,92 @@ def test_bot_init_keeps_existing_provider_key_reference(tmp_path: Path) -> None:
     assert [f for f in findings if f.severity == "error"] == []
     config = json.loads((home / "config.json").read_text(encoding="utf-8"))
     assert config["providers"]["demo"]["apiKey"] == "${STEPFUN_API_KEY}"
+
+
+def test_scaffold_externalizes_all_connection_overrides(tmp_path: Path) -> None:
+    source = write_user_config(tmp_path)
+    raw = json.loads(source.read_text(encoding="utf-8"))
+    raw["providers"]["demo"].update({
+        "extraHeaders": {"Authorization": "FAKE_HEADER_SECRET"},
+        "apiBase": "https://example.invalid/token/FAKE_URL_SECRET",
+        "extraQuery": {"key": "FAKE_QUERY_SECRET"},
+        "extraBody": {"nested": ["FAKE_BODY_SECRET", 123]},
+    })
+    raw["modelPresets"]["step-5-preview"].update({
+        "extraHeaders": {"X-Api-Key": "FAKE_PRESET_SECRET"},
+        "api": {"supportedApis": ["chat_completions"], "apiKey": "FAKE_UNKNOWN_SECRET"},
+    })
+    source.write_text(json.dumps(raw), encoding="utf-8")
+    home = tmp_path / "safe-bot"
+    scaffold, findings = bot_init("safe", registry_path=write_registry(tmp_path), home=home,
+        port=59913, preset="step-5-preview", role="writes", allowed_callers=["planner"],
+        user_config=source)
+    assert not [item for item in findings if item.severity == "error"]
+    written = (home / "config.json").read_text(encoding="utf-8")
+    assert "FAKE_" not in written and "literal-secret" not in written
+    config = json.loads(written)
+    assert config["providers"]["demo"]["extraBody"]["nested"][1] == 123
+    assert config["modelPresets"]["step-5-preview"]["api"] == {"supportedApis": ["chat_completions"]}
+    assert len([line for line in scaffold.checklist if line.startswith("export ")]) == 6
+
+
+def test_scaffold_refuses_existing_home_and_key_collision(tmp_path: Path) -> None:
+    path = write_registry(tmp_path)
+    home = tmp_path / "existing"
+    home.mkdir()
+    protected = home / "config.json"
+    protected.write_text("keep", encoding="utf-8")
+    _, findings = bot_init("new", registry_path=path, home=home, port=59914,
+                          preset="step-5-preview", role="writes", allowed_callers=["planner"])
+    assert any(item.code == "home_exists" for item in findings)
+    assert protected.read_text(encoding="utf-8") == "keep"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["bots"][1]["api_key_env"] = "TEAMS_NEW_BOT_API_KEY"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    _, findings = bot_init("new.bot", registry_path=path, home=tmp_path/"other", port=59914,
+                          preset="step-5-preview", role="writes", allowed_callers=["planner"])
+    assert any(item.code == "key_env_collision" for item in findings)
+    assert not (tmp_path/"other").exists()
+
+
+def test_scaffold_rolls_back_its_home_on_registry_commit_failure(tmp_path: Path, monkeypatch) -> None:
+    from nanobot_teams import lifecycle
+
+    path = write_registry(tmp_path)
+    original = path.read_bytes()
+    real_write = lifecycle._atomic_write
+
+    def fail_registry(destination, text):
+        if destination == path:
+            raise OSError("simulated full disk")
+        real_write(destination, text)
+
+    monkeypatch.setattr(lifecycle, "_atomic_write", fail_registry)
+    home = tmp_path / "rolled-back"
+    _, findings = bot_init("new", registry_path=path, home=home, port=59915,
+        preset="step-5-preview", role="writes", allowed_callers=["planner"],
+        user_config=write_user_config(tmp_path))
+    assert any(item.code == "registry_write_failed" for item in findings)
+    assert path.read_bytes() == original
+    assert not home.exists()
+
+
+def test_check_validates_declared_timeout_layers(tmp_path: Path) -> None:
+    path = write_registry(tmp_path)
+    manifest = tmp_path / "deployment.json"
+    data = {"mcp_tool_timeout_s": 180, "planner_timeout_s": 210,
+            "targets": {"research": {"api_timeout_s": 120, "queue_included": True}}}
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    findings = check(path, caller="planner", environ={"TEAMS_RESEARCH_API_KEY": "fake"},
+        probe=False, nanobot_version="0.4.1", deployment=manifest)
+    assert not [item for item in findings if item.severity == "error"]
+    assert any(item.code == "timeouts_declared" for item in findings)
+    data["mcp_tool_timeout_s"] = 30
+    data["planner_timeout_s"] = 20
+    data["targets"]["research"]["api_timeout_s"] = 140
+    data["targets"]["research"]["queue_included"] = False
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    findings = check(path, caller="planner", environ={"TEAMS_RESEARCH_API_KEY": "fake"},
+        probe=False, nanobot_version="0.4.1", deployment=manifest)
+    codes = {item.code for item in findings if item.severity == "error"}
+    assert codes == {"tool_timeout_short", "planner_timeout_short", "target_timeout_invalid", "queue_timeout_unverified"}

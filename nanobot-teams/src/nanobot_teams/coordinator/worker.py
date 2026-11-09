@@ -280,7 +280,11 @@ class DispatchWorker:
             return
         if receipt.status_code != 200:
             return
-        state = str(receipt.json().get("state", ""))
+        try:
+            receipt_payload = receipt.json()
+        except ValueError:
+            return  # Non-JSON body (proxy/error page); retry next pump.
+        state = str(receipt_payload.get("state", ""))
         mapping = {
             "injected": DeliveryState.INJECTED,
             "orphaned": DeliveryState.ORPHANED,
@@ -367,7 +371,12 @@ class DispatchWorker:
             bot = self._store.get_bot(task.bot_id)
             if bot is None:
                 continue
-            client = self._clients.for_bot(bot.endpoint, bot.secret_env)
+            try:
+                client = self._clients.for_bot(bot.endpoint, bot.secret_env)
+            except MissingSecretError:
+                # Observations resume when the operator restores the secret;
+                # other bots must keep flowing.
+                continue
             try:
                 response = await client.get_run(task.remote_run_id)
             except BotUnreachableError:

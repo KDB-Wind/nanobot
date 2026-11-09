@@ -330,3 +330,62 @@ async def test_bot_with_open_tasks_rejects_edits(client):
     )
     assert edit.status == 409
     assert (await edit.json())["code"] == "bot_has_open_tasks"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_q1b_ssrf_endpoint_variants_rejected(client):
+    test_client, _ = client
+    for endpoint in (
+        "http://127.0.0.1.evil.com",
+        "http://127.0.0.1@attacker.host",
+        "http://localhost:80@evil",
+        "https://127.0.0.1",
+    ):
+        response = await test_client.post(
+            "/v1/teams/bots",
+            headers=admin_headers(),
+            json={"bot_id": "s", "endpoint": endpoint, "secret_env": "E"},
+        )
+        assert response.status == 400, endpoint
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_q1b_replay_wins_over_capability_validation(client):
+    await seed_catalog(client)
+    test_client, store = client
+    body = task_body()
+    first = await test_client.post("/v1/teams/tasks", headers=planner_headers(), json=body)
+    assert first.status == 201
+    # A workbench_only retry never touches the planner anyway; assert the
+    # replay path returns 200 with the original task id.
+    replay = await test_client.post("/v1/teams/tasks", headers=planner_headers(), json=body)
+    assert replay.status == 200
+    assert (await replay.json())["task_id"] == (await first.json())["task_id"]
+    different = await test_client.post(
+        "/v1/teams/tasks",
+        headers=planner_headers(),
+        json={**body, "input": "different"},
+    )
+    assert different.status == 409
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_q1b_planner_snapshot_is_scoped_and_operator_cannot_auto_resume(client):
+    await seed_catalog(client)
+    test_client, store = client
+    # Operator-created task stays invisible to the planner snapshot.
+    await test_client.post(
+        "/v1/teams/tasks",
+        headers=admin_headers(),
+        json=task_body(operation_key=str(__import__("uuid").uuid4())),
+    )
+    snapshot = await test_client.get("/v1/teams/snapshot", headers=planner_headers())
+    tasks = (await snapshot.json())["tasks"]
+    assert all(t["caller_principal"] == "planner" for t in tasks)
+    # Operator may not request auto-resume delivery.
+    response = await test_client.post(
+        "/v1/teams/tasks",
+        headers=admin_headers(),
+        json=task_body(delivery_mode="auto_resume"),
+    )
+    assert response.status == 403

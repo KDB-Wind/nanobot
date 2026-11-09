@@ -7,6 +7,7 @@ from typing import Any
 
 from aiohttp import web
 
+from nanobot.api.agent_runs import parse_protocol_json, protocol_error
 from nanobot.config.schema import ApiRunsConfig
 from nanobot.session.external_inbox import (
     ExternalInbox,
@@ -50,6 +51,15 @@ def _error(status: int, code: str, message: str) -> web.Response:
     return _json({"code": code, "message": message}, status=status)
 
 
+def _bounded_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("terminal_revision must be an integer")
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError("terminal_revision must be >= 0")
+    return parsed
+
+
 def _require_inbox_auth(request: web.Request) -> web.Response | None:
     config: ApiRunsConfig = request.app[_INBOX_CONFIG_KEY]
     auth = request.headers.get("Authorization", "")
@@ -67,11 +77,14 @@ async def handle_capability_validate(request: web.Request) -> web.Response:
     inbox: ExternalInbox = request.app[_INBOX_KEY]
     config: ApiRunsConfig = request.app[_INBOX_CONFIG_KEY]
     try:
-        body = await request.json()
-    except Exception:
-        return _error(400, "invalid_json", "Body must be JSON.")
-    if not isinstance(body, dict):
-        return _error(400, "invalid_json", "Body must be an object.")
+        body = await parse_protocol_json(request)
+    except protocol_error as exc:
+        detail = getattr(exc, "payload", {})
+        return _error(
+            getattr(exc, "status", 400),
+            str(detail.get("code", "invalid_json")),
+            str(detail.get("message", "Body rejected.")),
+        )
     required = {"capability", "workflow", "operation_key", "bot_id", "instance_id"}
     missing = required - set(body)
     if missing:
@@ -98,11 +111,14 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
     inbox: ExternalInbox = request.app[_INBOX_KEY]
     config: ApiRunsConfig = request.app[_INBOX_CONFIG_KEY]
     try:
-        body = await request.json()
-    except Exception:
-        return _error(400, "invalid_json", "Body must be JSON.")
-    if not isinstance(body, dict):
-        return _error(400, "invalid_json", "Body must be an object.")
+        body = await parse_protocol_json(request)
+    except protocol_error as exc:
+        detail = getattr(exc, "payload", {})
+        return _error(
+            getattr(exc, "status", 400),
+            str(detail.get("code", "invalid_json")),
+            str(detail.get("message", "Body rejected.")),
+        )
     unknown = set(body) - INBOX_FIELDS
     if unknown:
         return _error(400, "unknown_fields", f"Unknown fields: {sorted(unknown)}")
@@ -132,7 +148,7 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
         bot_id=capability.bot_id,
         instance_id=capability.instance_id,
         run_id=str(body.get("run_id", "")),
-        terminal_revision=int(body.get("terminal_revision", 0)),
+        terminal_revision=_bounded_int(body.get("terminal_revision", 0)),
         outcome_code=outcome_code,
         result_text=result_text,
         result_truncated=bool(body.get("result_truncated", False)),
@@ -141,15 +157,18 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
             bot_id=capability.bot_id,
             instance_id=capability.instance_id,
             run_id=str(body.get("run_id", "")),
-            terminal_revision=int(body.get("terminal_revision", 0)),
+            terminal_revision=_bounded_int(body.get("terminal_revision", 0)),
             outcome_code=outcome_code,
             result_text=result_text,
         ),
     )
     try:
         receipt = inbox.receive(delivery)
-    except InboxError as exc:
-        return _error(409, exc.code, exc.detail)
+    except (InboxError, ValueError) as exc:
+        code = getattr(exc, "code", "invalid_field")
+        detail = getattr(exc, "detail", str(exc))
+        status = 409 if hasattr(exc, "code") else 400
+        return _error(status, code, detail)
     status = 202 if receipt.state == "received" else 200
     response = _json(
         {

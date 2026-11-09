@@ -143,22 +143,27 @@ class ExternalInbox:
         now = datetime.now(tz=timezone.utc).isoformat()
 
         def persist(conn: sqlite3.Connection) -> None:
+            existing = conn.execute(
+                "SELECT auto_continue FROM external_workflows WHERE workflow_id=?",
+                (workflow_id,),
+            ).fetchone()
+            grant = 1 if existing is None else int(existing[0])
             conn.execute(
                 "INSERT INTO reply_capabilities (capability_id, digest, session_key, "
                 "session_generation, workflow_id, operation_key, bot_id, instance_id, "
                 "principal_id, auto_continue, created_at, expires_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,1,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     capability.capability_id, digest, session_key, session_generation,
                     workflow_id, operation_key, bot_id, instance_id, principal_id,
-                    now, capability.expires_at.isoformat(),
+                    grant, now, capability.expires_at.isoformat(),
                 ),
             )
             conn.execute(
                 "INSERT INTO external_workflows (workflow_id, session_key, session_generation, "
-                "created_at, auto_continue) VALUES (?,?,?,?,1) "
-                "ON CONFLICT(workflow_id) DO UPDATE SET auto_continue=1",
-                (workflow_id, session_key, session_generation, now),
+                "created_at, auto_continue) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(workflow_id) DO NOTHING",
+                (workflow_id, session_key, session_generation, now, grant),
             )
 
         self._write(persist)
@@ -265,11 +270,18 @@ class ExternalInbox:
                 or new_bot != stored_bot
                 or new_instance != stored_instance
             ):
-                conn.execute(
+                # CAS on the wildcards: exactly one concurrent validate wins,
+                # the loser sees the now-concrete binding and must match it.
+                cursor = conn.execute(
                     "UPDATE reply_capabilities SET operation_key=?, bot_id=?, instance_id=? "
-                    "WHERE digest=?",
-                    (new_operation, new_bot, new_instance, digest),
+                    "WHERE digest=? AND operation_key=? AND bot_id=? AND instance_id=?",
+                    (
+                        new_operation, new_bot, new_instance, digest,
+                        stored_operation, stored_bot, stored_instance,
+                    ),
                 )
+                if cursor.rowcount != 1:
+                    return None
             return workflow_id, new_operation, new_bot, new_instance
 
         return self._write(resolve)

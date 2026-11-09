@@ -89,13 +89,16 @@ CREATE TABLE IF NOT EXISTS operation_tombstones (
 
 
 def canonical_request_digest(submit: RunSubmit) -> str:
+    """Digest of the caller-provided semantics; a defaulted deadline is unset
+    here so a replay of the identical wire body reconciles (the concrete
+    deadline is fixed after the key check, as on the coordinator side)."""
     body = json.dumps(
         {
             "protocol": 1,
             "task_id": submit.task_id,
             "workflow_id": submit.workflow_id,
             "input_text": submit.input_text,
-            "deadline_at": rfc3339(submit.deadline_at),
+            "deadline_at": rfc3339(submit.deadline_at) if submit.deadline_at is not None else "unset",
             "principal_id": submit.principal_id,
         },
         ensure_ascii=False,

@@ -67,7 +67,7 @@ def test_config_has_no_secret_fields() -> None:
         "model_preset",
         "endpoint",
         "api_key_env",
-        "allowed_callers",
+        "allowed_callers", "can_start_root",
     }
     assert team_fields == {
         "schema_version",
@@ -77,6 +77,7 @@ def test_config_has_no_secret_fields() -> None:
         "limits",
         "default_caller_id",
         "budgets",
+        "allow_multihop",
     }
     assert not (bot_fields | team_fields) & {"api_key", "token", "secret", "authorization"}
 

@@ -131,7 +131,7 @@ async def test_budget_without_ledger_never_delegates(tmp_path: Path) -> None:
     finally:
         await transport.aclose()
 
-    assert result.error_code == "budget_exceeded"
+    assert result.error_code == "ledger_unavailable"
     assert "--ledger" in (result.detail or "")
 
 
@@ -193,8 +193,8 @@ async def test_budget_fails_closed_when_ledger_unreadable(tmp_path: Path) -> Non
         ledger.close()
 
     assert second.status is OutcomeKind.failed
-    assert second.error_code == "budget_exceeded"
-    assert "unreadable" in (second.detail or "")
+    assert second.error_code == "ledger_unavailable"
+    assert "no request sent" in (second.detail or "")
 
 
 def test_usage_for_signals_unreadable_ledger() -> None:
@@ -205,7 +205,7 @@ def test_usage_for_signals_unreadable_ledger() -> None:
             raise sqlite3.OperationalError("locked")
 
     ledger = Ledger(None)
-    assert ledger.usage_for("planner") == (0, 0, 0.0)
+    assert ledger.usage_for("planner") is None
     ledger._conn = BrokenConn()
     assert ledger.usage_for("planner") is None
 
@@ -241,6 +241,14 @@ def test_audit_missing_ledger_is_not_created(tmp_path: Path) -> None:
     assert not missing.exists()
     assert "missing:" in audit
     assert "missing:" in budget
+
+
+def test_corrupt_ledger_is_reported_as_unverified(tmp_path: Path) -> None:
+    path = tmp_path / "corrupt.sqlite3"
+    path.write_bytes(b"not a sqlite database")
+    config = load(tmp_path, registry_data(budgets={"planner": {"delegations": 2}}))
+    assert render_audit([path]).startswith("unavailable:")
+    assert render_budget(config, [path]).startswith("unavailable:")
 
 
 def test_list_bots_surfaces_model_preset(tmp_path: Path) -> None:
