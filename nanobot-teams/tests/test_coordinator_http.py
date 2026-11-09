@@ -265,6 +265,56 @@ async def test_events_stream_emits_task_lifecycle(client):
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_scaffold_creates_home_and_returns_manual_command(tmp_path, store):
+    from nanobot_teams.coordinator.config import CoordinatorConfig
+
+    config = CoordinatorConfig(
+        control_dir=tmp_path / "control", bot_homes_root=tmp_path / "homes"
+    )
+    app = build_app(store, config, {"operator": ADMIN, "planner": PLANNER})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        created = await test_client.post(
+            "/v1/teams/bots/scaffold",
+            headers=admin_headers(),
+            json={"bot_id": "writer", "role": "writing"},
+        )
+        assert created.status == 201, await created.text()
+        payload = await created.json()
+        assert payload["started"] is False
+        assert payload["start_command"].startswith("nanobot serve --config")
+        assert payload["api_key"]
+        home = tmp_path / "homes" / "writer"
+        assert (home / "nanobot.toml").exists()
+        assert (home / "workspace").is_dir()
+        assert store.get_bot("writer") is not None
+        # The same home is never overwritten.
+        repeat = await test_client.post(
+            "/v1/teams/bots/scaffold",
+            headers=admin_headers(),
+            json={"bot_id": "writer"},
+        )
+        assert repeat.status == 409
+        escape = await test_client.post(
+            "/v1/teams/bots/scaffold",
+            headers=admin_headers(),
+            json={"bot_id": "../evil"},
+        )
+        assert escape.status == 400
+        # Planner cannot scaffold.
+        denied = await test_client.post(
+            "/v1/teams/bots/scaffold",
+            headers=planner_headers(),
+            json={"bot_id": "other"},
+        )
+        assert denied.status == 403
+    finally:
+        await test_client.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
 async def test_bot_with_open_tasks_rejects_edits(client):
     await seed_catalog(client)
     test_client, store = client
