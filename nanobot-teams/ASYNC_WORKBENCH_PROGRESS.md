@@ -30,8 +30,8 @@
 | P2 运行 HTTP + 执行器 | pending | - | - | - |
 | P3 Coordinator + 异步 MCP | verified | §4 P3:29 项新测试(210 总通过)+ 真实进程强杀恢复 | A08 库级故障(只读/满盘)与 stdio MCP 实测留给 Q2/P7 | P4 |
 | P4 可信回传 + 续接 | verified | §4 P4:inbox 领域 4 + P4 链路 3 + Teams 210/parent 99 全绿 | A09 wrapper 单测、A10 进程级交错、A12 → Q1/Q2/P5/P7 | P5 |
-| P5 WebUI 工作台 | pending | - | - | - |
-| P6 cron 定时任务 | in_progress | §4 P6:teams_task kind + 确定性提交键(3 tests) | 真实 cron 触发链路在 P7 验收 | P5 前端 |
+| P5 WebUI 工作台 | in_progress | §4 P5:后端提交 ffca428ff;前端组件 5 测试过 + 五门禁过 | 全量 vitest/browser 运行中;真实网关浏览器验收在 P7 | 等待套件结果
+| P6 cron 定时任务 | verified | §4 P6:teams_task kind + 确定性提交键(3 tests)+ 回归 312 绿 | 真实 cron 触发链路(A24)在 P7 live | P7 |
 | P7 真实验收/迁移/交付 | pending | - | - | - |
 | Q1 独立审核 | pending | - | - | - |
 | Q2 缺陷修复与故障验证 | pending | - | - | - |
@@ -162,7 +162,20 @@
   - `webui/teams_events.py` + channels/manager:事件中继任务(coordinator SSE → broadcast `teams_event`),stop_all 取消;代理经 gateway_services 贯通。
   - Coordinator `/v1/teams/bots/scaffold`(operator):bot_homes_root 内新 home(拒绝已存在/路径越界),生成 nanobot.toml(api.runs 专用密钥+随机端口+exclusive),返回一次性密钥与手动启动命令,started=false。
   - P6:`CronPayload.kind="teams_task"`;`cron/teams_jobs.py` — 每次触发以 `uuid5(job_id:last_run_ms)` 为提交键,重复投递对账为同一任务;cron 来源一律 workbench_only;缺 bot/proxy 即失败该次运行。`tests/cron/test_teams_jobs.py` **3 passed**。
-- 待:前端页面/类型/i18n/浏览器测试(Explore 模板事实回收中),回归套件运行中。
+- 前端(2026-11-09):
+  - `webui/src/lib/teams-api.ts`(typed 客户端:GET snapshot/task + 四个 WS mutation:teams.create_project/create_task/cancel_task/scaffold_bot;api.request 导出复用)。
+  - `webui/src/components/teams/TeamsSettings.tsx`:以 Settings section "teams" 集成(contracts/SettingsSidebar/SettingsPage/App 键注册);capability 缺失时仅说明不报错;项目筛选+创建;Bot 列表+scaffold(显示手动启动命令与一次性密钥,明确"未启动");新建任务(bot+输入+客户端生成 operation_key,提交即返回 Task ID);任务表分列显示 派发/运行/取消/回传 四状态(取消显示 requested/unconfirmed/confirmed,不把 persisted 当已处理);轮询 4s 快照(teams_event 服务端中继已备,UI 轮询即 A12 快照恢复路径)。
+  - i18n:en + zh-CN 全部 settings.teams.* 键(其余语言回退 en)。
+  - `src/tests/teams-workbench.test.tsx` **5 passed**(能力缺失隐藏、快照渲染、提交带新 operation_key、请求取消、scaffold 显示命令/密钥/未启动)。
+  - 门禁:typecheck / lint / check:imports / test:imports / build 全部 EXIT=0;全量 vitest + browser 运行中(结果见下)。
+- 全量结果:vitest 全部 **EXIT=0**;browser 478 passed / 1 failed(失败规格名被管道截断,全量日志重跑中);`bun run build` EXIT=0(产物进 nanobot/web/dist)。
+- 验收脚本 `acceptance/async_workbench.py`(offline):**9/9 PASS**(A01 提交/重放、A03 派发观察、A06 终态结果、P4 auto_resume 全链含 dispatched→injected→历史单次注入、A14 无凭据 401),证据写入临时目录 results.json;顺带修复真实缺陷:delivery_state=persisted 后不再轮询 receipt(竞态卡死)→ persisted 持续轮询直至 injected/orphaned/card_only。
+- 真实网关 + 浏览器实操(A12/A17/A21/A22/A23)在 P7 live 验收。
+- **真实 serve 冒烟(P7 前置,2026-11-09)**:隔离 home(JSON 配置,api.runs enabled+exclusive+专用密钥)启动真实 `python -m nanobot serve`(PID 记录,测后 Stop-Process 清理,端口确认关闭):
+  - `GET /v1/agent-capabilities` 200:真实 instance_id `inst_44e8…`,execution=true,exclusive=true,limits 正确。
+  - `POST /v1/agent-runs` 202 受理(queued,revision=1);数秒后 `GET …/run_id` → failed/revision=3,`outcome.code=execution_error`(隔离 home 无模型,UnconfiguredProvider 引导文案为 partial text),`stop_confirmed=true`。
+  - `GET …/result` 200:完整类型化 outcome(text+code+truncated)。
+  - 结论:类型化失败路径与幂等键受理在真实进程成立;真实模型 succeeded 路径待 P7 配 GLM preset 复验。
 
 ## 5. 运行中进程与待恢复状态
 
