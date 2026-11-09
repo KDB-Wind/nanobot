@@ -253,14 +253,6 @@ class ChannelManager:
             )
             kwargs["gateway"] = gateway
         channel = cls(section, self.bus, **kwargs)
-        if (
-            cls.name == "websocket"
-            and self._teams_proxy is not None
-            and self._teams_proxy.enabled
-        ):
-            from nanobot.webui.teams_events import start_teams_event_relay
-
-            self._teams_event_relay = start_teams_event_relay(self._teams_proxy, channel)
         channel.tool_hint_max_length = self.config.agents.defaults.tool_hint_max_length
         if runtime_name and runtime_name != channel.name:
             channel.name = runtime_name

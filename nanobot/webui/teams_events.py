@@ -6,7 +6,7 @@ import asyncio
 from typing import Any
 
 
-def start_teams_event_relay(proxy: Any, websocket_channel: Any) -> asyncio.Task[None]:
+async def start_teams_event_relay(proxy: Any, websocket_channel: Any) -> None:
     """Subscribe the coordinator stream; forward each event as teams_event."""
 
     async def on_event(event: dict[str, Any]) -> None:
@@ -22,10 +22,7 @@ def start_teams_event_relay(proxy: Any, websocket_channel: Any) -> asyncio.Task[
         except Exception:
             pass
 
-    async def run() -> None:
-        await proxy.event_stream(on_event)
-
-    return asyncio.create_task(run(), name="nanobot-teams-event-relay")
+    await proxy.event_stream(on_event)
 
 
 __all__ = ["start_teams_event_relay"]

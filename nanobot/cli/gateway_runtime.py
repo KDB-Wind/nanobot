@@ -1173,6 +1173,21 @@ def _run_claimed_gateway(
                     inbox_sidecar_coro(),
                     name="nanobot-teams-inbox-sidecar",
                 ))
+            if _PENDING_TEAMS_PROXY.get("proxy") is not None:
+                from nanobot.webui.teams_events import start_teams_event_relay
+
+                async def _run_teams_relay() -> None:
+                    await channels.start_all()
+                    channel = channels.get_channel("websocket")
+                    if channel is None:
+                        return
+                    await start_teams_event_relay(
+                        _PENDING_TEAMS_PROXY["proxy"], channel
+                    )
+
+                tasks.append(asyncio.create_task(
+                    _run_teams_relay(), name="nanobot-teams-event-relay"
+                ))
             if health_server_enabled:
                 tasks.append(asyncio.create_task(
                     _health_server(config.gateway.host, port),
