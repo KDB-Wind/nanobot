@@ -911,12 +911,22 @@ class AgentLoop:
             self._active_tasks.pop(key, None)
 
     def _revoke_external_workflows(self, session_key: str | None) -> None:
-        """A real user turn ends older workflows' auto-continue grants."""
+        """Synchronous revoke for writer-thread contexts (tests, tools)."""
         inbox = getattr(self, "external_inbox", None)
         if inbox is None or not session_key:
             return
         try:
             inbox.revoke_session_workflows(session_key)
+        except Exception:
+            logger.debug("external inbox revocation skipped for {}", session_key)
+
+    async def _arevoke_external_workflows(self, session_key: str | None) -> None:
+        """Async revoke routed through the session owner's writer thread."""
+        inbox = getattr(self, "external_inbox", None)
+        if inbox is None or not session_key:
+            return
+        try:
+            await inbox.revoke_session_workflows_async(session_key)
         except Exception:
             logger.debug("external inbox revocation skipped for {}", session_key)
 
@@ -1871,7 +1881,7 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         kind = TurnKind.USER if msg.is_user_input else TurnKind.SYSTEM
         if kind is TurnKind.USER:
-            self._revoke_external_workflows(session_key)
+            await self._arevoke_external_workflows(session_key or msg.session_key)
         if kind is TurnKind.SYSTEM:
             destination = (
                 msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
@@ -2716,7 +2726,7 @@ class AgentLoop:
                     if attributes is not None:
                         kwargs["attributes"] = dict(attributes)
                     if msg.is_user_input:
-                        self._revoke_external_workflows(session_key)
+                        await self._arevoke_external_workflows(session_key)
                     delivery = self.turn_delivery_factory.create(msg, session_key)
                     kwargs["delivery"] = delivery
                     try:

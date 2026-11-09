@@ -277,7 +277,7 @@ class ExternalInbox:
     # ---- workflows ----
 
     def revoke_session_workflows(self, session_key: str) -> int:
-        """A real user turn ends every older workflow's auto-continue permission."""
+        """Synchronous revoke; call only from the store's writer context."""
 
         def update(conn: sqlite3.Connection) -> int:
             cursor = conn.execute(
@@ -293,6 +293,19 @@ class ExternalInbox:
             return cursor.rowcount or 0
 
         return self._write(update)
+
+    async def revoke_session_workflows_async(self, session_key: str) -> int:
+        """Revoke through the session owner so the write uses its writer thread."""
+        result = await self._state._execute(
+            session_key,
+            lambda: self._state._change(
+                session_key,
+                lambda session: self.revoke_session_workflows(session_key),
+                history=False,
+            ),
+            operation_name="revoke_external_workflows",
+        )
+        return int(result) if isinstance(result, int) else 0
 
     def workflow_allows_auto_continue(self, workflow_id: str) -> bool:
         def query(conn: sqlite3.Connection) -> tuple | None:
