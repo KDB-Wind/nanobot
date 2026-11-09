@@ -593,10 +593,6 @@ def _run_claimed_gateway(
 
         external_inbox = ExternalInbox(session_manager.state)
         _PENDING_EXTERNAL_INBOX["inbox"] = external_inbox
-        # The loop's user-turn hook reads this attribute to revoke stale
-        # workflow grants; absent when the feature is off.
-        agent.external_inbox = external_inbox
-
         def _teams_meta_provider(server_name: str):
             def provider() -> dict[str, str]:
                 from nanobot.agent.tools.context import current_request_context
