@@ -43,31 +43,31 @@
 
 | ID | 状态 | 证据(命令/退出码/路径) | 备注 |
 | --- | --- | --- | --- |
-| A01 | pending | - | - |
-| A02 | pending | - | - |
-| A03 | pending | - | - |
-| A04 | pending | - | - |
-| A05 | pending | - | - |
-| A06 | pending | - | - |
-| A07 | pending | - | - |
-| A08 | pending | - | - |
-| A09 | pending | - | - |
-| A10 | pending | - | - |
-| A11 | pending | - | - |
-| A12 | pending | - | - |
-| A13 | pending | - | - |
-| A14 | pending | - | - |
-| A15 | pending | - | - |
-| A16 | pending | - | - |
-| A17 | pending | - | - |
-| A18 | pending | - | - |
-| A19 | pending | - | - |
-| A20 | pending | - | - |
-| A21 | pending | - | - |
-| A22 | pending | - | - |
-| A23 | pending | - | - |
-| A24 | pending | - | - |
-| A25 | pending | - | - |
+| A01 | pass | tests/runs/test_run_service(幂等/并发/改体409/过期对账)+ test_agent_runs_http + offline 验收 + live_chain settled replay | - |
+| A02 | pass | tests/runs/test_kill_recovery 3/3(真 proc.kill:running/preresult/queued)+ coordinator 强杀恢复(test_coordinator_recovery) | - |
+| A03 | pass | test_coordinator_worker::lost_acceptance(真 transport.abort)+ offline 验收 A03 | - |
+| A04 | pass | test_run_service:queued 取消/完成先于取消/运行中取消确认 | - |
+| A05 | pass | test_cancel_resistant_run_keeps_slot_and_stays_unconfirmed(槽位保持+同实例拒绝新任务+晚到确认) | - |
+| A06 | pass | test_typed_failures/execution_exception/deadline 系列 + live serve 类型化 execution_error→修复后 live 终态 succeeded | - |
+| A07 | pass | test_alias_shares_isolation + test_unreachable_bot_does_not_block_the_other | - |
+| A08 | pass | tests/runs/test_store_failures 2/2(只读拒绝写、观察写失败保持非终态可恢复) | - |
+| A09 | pass | tests/tools/test_mcp_teams_meta 4/4(伪造参数拒绝且不执行、受信 meta 传递、未配置无 meta)+ chain forged capability 422 | - |
+| A10 | partial | 单测:receive 幂等+同体/异体+注入后重放不重复;gateway 重启恢复扫描已实现。强杀交错(receipt 前后杀进程)留 Q2 补 | Q2 补强项 |
+| A11 | pass | test_session_replacement_routes_delivery_orphaned(process)+ chain live 同场景 | - |
+| A12 | partial | 机制(快照+轮询+relay)与组件测试在;真实浏览器多 tab/断线实操待 P7 最终项 | Q2 补强项 |
+| A13 | pass | test_identity_change_goes_indeterminate_and_quarantines(派发前校验+不在新实例执行+重绑后恢复) | - |
+| A14 | pass | runs 401/403 套件 + offline A14 + chain 无凭据 401 + coordinator 角色矩阵 | - |
+| A15 | pass | 压缩体/重复键/未知字段/超限/深层 JSON/游标 410/14-30-90 天清理+tombstone(HTTP+领域测试) | - |
+| A16 | pass | tests/test_async_mcp_stdio(真 stdio 子进程:提交→进程退出→重开查同 Task→同键重放) | - |
+| A17 | pass | runs 关闭时 404+chat 正常、exclusive 409、capability 缺失 UI 静默说明、组件测试;live gateway bootstrap 声明 | - |
+| A18 | pass | test_a18_revoke(真实 _dispatch_one 两轮 mint→撤销)+ 进程脚本 a18_process + live gateway WS 驱动(turn1/mint/turn2) | - |
+| A19 | pass | bots 注册非 loopback 400、scaffold 路径越界 400/409、home 已存在 409 | - |
+| A20 | pass | test_import_04_ledger_is_idempotent_and_preserves_unknown(用量保留/unknown 隔离/二次导入 no-op) | - |
+| A21 | partial | bootstrap 载荷三个服务 token 零泄漏(live)+ snapshot 无 secret_env + 组件断言;浏览器网络面板实操待 P7 | Q2 补强项 |
+| A22 | pass | scaffold 201/409/400 + open-tasks 409 + 角色矩阵(http 测试 11 项) | - |
+| A23 | partial | UI 既有 host 隔离机制未改动,teams 代理无跨 host 状态;真实切换实操待 P7 | Q2 补强项 |
+| A24 | pass | tests/cron/test_teams_jobs 3 + test_teams_cron_service 2(真实 CronService 执行+同触发去重+缺 proxy error) | - |
+| A25 | pass | acceptance/live_chain.py 13/13:双真实 serve 并行、201 受理、succeeded+result、模型文本精确命中、结算后同键对账 | - |
 
 ## 4. 阶段证据日志(追加式)
 
