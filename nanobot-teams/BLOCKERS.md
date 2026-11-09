@@ -7,9 +7,11 @@
 
 未验证/未交付子项(均为记录,非阻塞):
 
-1. **CI workflow 未执行**:`.github/workflows/ci.yml` 已交付,但仓库仅本地
-   存在、未 push,push 后才会首次运行。影响:CI 语义未经证明。
-   可选方案:发布时启用并观察首跑。
+1. ~~**CI workflow 未执行**~~ **已解决(2026-11-09)**:代码已推送到私有仓库
+   `KDB-Wind/nanobot-teams`,`ci` 在 `ubuntu-latest` 与 `windows-latest` 上连续
+   通过(`ruff` + `pytest`)。首跑暴露了未固定 ruff 版本造成的规则漂移:CI 装到
+   0.17.4 后启用了新的默认规则集。已在 `pyproject.toml` 显式声明 lint 配置并把
+   ruff 固定为 `0.17.4`。
 2. **WebUI 验收未在 Unix 复跑**:需要 Edge 浏览器;Windows 已通过。
    影响范围:仅 WebUI 路径的可视化验收,服务端全场景双平台已覆盖。
 3. **只读 Web 页面未交付**:ROADMAP S5 标注"可选";CLI graph/budget/audit

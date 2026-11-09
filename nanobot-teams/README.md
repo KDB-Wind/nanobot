@@ -31,6 +31,7 @@ Every bot keeps its own identity, workspace, model, memory, and session. Teams m
 | Platforms | Windows 11, Ubuntu 22.04 kernel 6.18 on WSL2 in NAT mode |
 | Resolved deps | `mcp` 1.30.0, `httpx` 0.28.1, `anyio` 4.16.0, `pydantic` 2.14.3, identical on both platforms |
 | Server acceptance | All scenarios pass on Windows and on Ubuntu, see `acceptance/README.md` |
+| CI | `ruff` and the unit suite on `ubuntu-latest` and `windows-latest`; green on 2026-11-09 |
 | WebUI acceptance | Pass on Windows |
 
 The Ubuntu run routes egress through a host-side byte relay because the WSL NAT

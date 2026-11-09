@@ -40,6 +40,8 @@ no Nanobot core changes, no private imports, no direct session reads.
 ### Verified
 
 - 152 tests on Windows 11 and Ubuntu 22.04 (WSL2); `ruff` clean on both.
+- CI green on `ubuntu-latest` and `windows-latest` (`ruff` plus `pytest`), with
+  ruff pinned to 0.17.4 through the `dev` extra.
 - 16 live server scenarios and the WebUI scenario on Windows with
   `step-5-preview`.
 - `packaging_fresh`: wheel built, installed into a clean venv, delegated, then

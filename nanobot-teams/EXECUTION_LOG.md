@@ -323,3 +323,17 @@ S0–S6 全部交付。改动全部位于 `nanobot-teams/`(基线 `9c2e90082` �
 6. `list_bots` 没有返回 `model_preset`,且 `bot init` 不写入该元数据。补上,并新增 `--capability`;`test_list_bots_surfaces_model_preset`。
 
 验收:`pytest -q` 152 passed;`ruff` clean;`run_e2e.py all` 16/16;`run_webui.py` PASS。`.e2e` 下的生成配置现在只含 env 引用,不再含明文 provider key。
+
+## 发布准备(2026-11-09)
+
+- 版本 0.2.0 → 0.3.0;`CHANGELOG.md` 覆盖 S0–S6 与复审修复。
+- 插件目录提升为独立私有仓库 `KDB-Wind/nanobot-teams`(history 由
+  `git subtree split -P nanobot-teams` 保留),CI 在 `ubuntu-latest` 与
+  `windows-latest` 上 `ruff` + `pytest` 通过。
+- 首跑失败原因:CI 安装未固定的 ruff(0.17.4),其默认规则集与本地 0.15.20
+  不同,报出 46 项。修复:在 `pyproject.toml` 声明 `[tool.ruff]`
+  (`E/F/I/N/W`,`E501` ignored,`line-length=100`),把 ruff 固定为 0.17.4
+  写入 `dev` extra,CI 改为 `pip install -e ".[dev]"`。
+- 验收 harness 支持独立仓库布局:`NANOBOT_TEAMS_WORKTREE`、
+  `NANOBOT_TEAMS_WEBUI`;打包场景从 `pyproject.toml` 读取版本,不再硬编码。
+- 剩余:wheel 未发布(需授权);WebUI 未在 Unix 复跑;只读页面未交付。
