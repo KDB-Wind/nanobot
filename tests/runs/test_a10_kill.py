@@ -2,11 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
-
-import pytest
-
 from nanobot.session.external_inbox import (
     ExternalInbox,
     InboxDelivery,
@@ -52,7 +47,7 @@ async def test_crash_after_receipt_before_injection_recovers_exactly_once(tmp_pa
     )
     session = await state.read(session_key)
     assert session is not None
-    capability = inbox.mint_capability(
+    inbox.mint_capability(
         session_key=session_key, session_generation=session.generation,
         workflow_id="wf-kill", operation_key="*", bot_id="*", instance_id="*",
         principal_id="teams-coordinator",
