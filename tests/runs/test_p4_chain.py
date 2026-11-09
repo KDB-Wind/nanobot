@@ -132,7 +132,6 @@ async def chain(tmp_path, monkeypatch):
     store = CoordinatorStore(tmp_path / "coord" / "c.sqlite3")
     store.open()
     store.create_project("proj", "Main")
-    bot_port = inbox_server.port  # placeholder, replaced below
     fake_bot = FakeBot()
     bot_server = TestServer(fake_bot.app())
     await bot_server.start_server()
@@ -330,8 +329,7 @@ async def test_forged_capability_or_revoked_workflow_fails_admission(chain):
 async def test_session_reset_routes_delivery_orphaned(chain):
     inbox = chain["inbox"]
     state = chain["state"]
-    worker = chain["worker"]
-    store = chain["store"]
+    inbox_client = chain["inbox_client"]
 
     capability = inbox.mint_capability(
         session_key=chain["session_key"],
