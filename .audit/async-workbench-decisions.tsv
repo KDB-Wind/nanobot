@@ -1,0 +1,26 @@
+ts	phase	decision	why	evidence	result
+2026-11-09T04:00Z	P0	runs 控制库放 <data_dir>/runs/,实例级随机 instance_id 持久化于库内	与 sessions/cron 同级、在 workspace 外;实例身份不能从 URL/端口派生	session/location.py 先例 + get_runtime_subdir	采纳
+2026-11-09T04:10Z	P0	无 create_goal 工具,以 PROGRESS + .audit/objective 等效登记	宿主无该工具;不伪造登记	db.sqlite 无 goals 表;objective.txt 2601 字符	执行中
+2026-11-09T05:20Z	P1	canonical digest 含 deadline 原值(微秒精度),重放必须原样复用	协议要求同键同正文;Coordinator 存储原始 deadline 字符串	test_expired_deadline... 通过;错误构造触发 409 的复现	采纳,测试改为复用原 RunSubmit
+2026-11-09T05:20Z	P1	断言失败也必须 aclose:测试用 async fixture 兜底清理	残留 worker 任务使 pytest-asyncio teardown 挂起	挂起复现 + fixture 后全绿	采纳
+2026-11-09T05:25Z	P1	stop_reason 字符串在执行适配边界白名单映射,未知一律 failed/execution_error	core 无枚举;不改 AgentLoop 核心契约	runner.py stop_reason 清单探针	定稿,P2 落地
+2026-11-09T05:40Z	P2	运行路由用专用 runs key,/v1/agent-* 绕过全局 api_key 中间件	现有 api.apiKey 不自动取得运行/inbox 权限	test_runs_routes_reject_missing_plain_and_wrong_keys	采纳
+2026-11-09T05:40Z	P2	执行器取消路径先调 loop.cancel_session_work 再上抛 CancelledError	停止确认需后台工具/exec 会话真实回收,不是协程退出	agent/subagent.py 取消模式 + test_cancellation_terminates_session_work	采纳
+2026-11-09T05:40Z	P2	stop_reason 白名单映射:completed/empty_final_response→succeeded;error→provider_error;max_iterations→iteration_limit;未知→execution_error	core 无枚举,不改核心契约;边界解析一次	runner.py stop_reason 清单 + test_executor.py	采纳
+2026-11-09T05:40Z	P2	inbox sidecar 推迟到 P4 与 inbox 路由一并实现	空 sidecar 是死代码;最小变更	本条 TSV	执行中
+2026-11-09T06:20Z	P3	digest 不含默认 deadline;显式 deadline 才参与语义摘要	无状态 MCP 重放无法重现时钟默认值;固定期限在准入时落库	test_same_key_same_semantics_returns_original	采纳
+2026-11-09T06:20Z	P3	派发前 capabilities 身份校验;indeterminate 关闭 outbox;force_rebind_instance 操作者显式重绑	身份变化不得在新实例创建运行;不得自动重做;重绑必须留审计	test_identity_change_goes_indeterminate_and_quarantines	采纳
+2026-11-09T06:20Z	P3	ClientFactory 实时读环境变量;缺失即 indeterminate	启动快照漏后注册 bot;空密钥→Bearer 空头无限退避	手动复现 LocalProtocolError + 强杀恢复测试	采纳
+2026-11-09T06:20Z	P3	aiohttp 作为 coordinator extra 引入 Teams 包	服务端需要 aiohttp;核心 stdio 包不强制依赖	pyproject optional-dependencies	采纳
+2026-11-09T07:30Z	P4	capability 首次使用时绑定 workflow/op_key/bot;mint 只绑会话与 generation	mint 发生在模型给出 op_key/bot 之前;通配符首用绑定满足'持久绑定'且不可改绑	external_inbox._bind_first_use + test_capability_binds_origin	采纳
+2026-11-09T07:30Z	P4	投递唤醒与注入分离:receipt 落盘 202 后再 apply;恢复扫描补注入	接收事务与历史插入分开但都持久;崩溃只延迟不丢失	handle_inbox_receive + gateway recovery scan	采纳
+2026-11-09T07:30Z	P4	Coordinator auto_resume 准入实时校验 planner capability,planner 不可用拒新任务	契约§9;已受理任务的对账取消不依赖 planner 在线	http_api create_task + test_auto_resume_full_chain	采纳
+2026-11-09T08:20Z	P5	capability 声明走 webui_contract(extra),配置了 coordinator 才含 teams.async.v1	可选能力不得抬高无关界面协议门槛	client_contract.py + ws_http bootstrap	采纳
+2026-11-09T08:20Z	P5	浏览器写操作一律经 WS webui_request 动作映射 teams.*;GET 直连代理	网关既有 CSRF 策略:直连 HTTP 变更 405	ws_http _is_webui_mutation_path + teams.cancel_task 动态路径	采纳
+2026-11-09T08:20Z	P5	scaffold 只生成 home+配置并返回一次性密钥与启动命令,started=false	UI 不声称已启动;密钥不落库只显示一次	coordinator scaffold_bot 路由	采纳
+2026-11-09T08:20Z	P6	cron teams_task 提交键 = uuid5(job_id:last_run_ms);cron 来源固定 workbench_only	同触发重复投递对账为一;cron 无交互来源不做 auto_resume	tests/cron/test_teams_jobs.py 3 passed	采纳
+2026-11-09T10:10Z	Q2	修复#4: gateway 未把 external_inbox attach 到 agent loop,用户轮次撤销钩子为死代码	构造顺序:inbox 块在 AgentLoop 之前;移到构造后 + 删除块内残留	gateway_runtime 装配审查;import ok + 53 回归过	已修,提交 4f81ea3d7
+2026-11-09T10:10Z	Q2	修复#2/#3: CoordinatorHttpError.message 缺失 + request_context 误用 .get()	stdio 往返(A16)live 发现;AttributeError 变成非 JSON 错误回包	tests/test_async_mcp_stdio.py 1 passed;Teams 212	已修,提交 9503b908a
+2026-11-09T10:10Z	Q2	修复#1: executor hooks 被 ephemeral 门丢弃,真实运行全标 execution_error	live 双 bot 链发现;run_extra_hooks_for_ephemeral 未开	live_chain 13/13;executor 5;parent 99	已修,提交 86dd94089
+2026-11-09T11:00Z	Q2	live gateway 冒烟发现的进程解释器误区:venv launcher 显示 base python 路径属正常;40236 即工作树进程	避免误杀健康实例;以 capability/bootstrap 判定代码版本	bootstrap teams cap True	澄清
+2026-11-09T11:00Z	Q2	撤销钩子经 SessionState writer 异步执行;session_key 用 msg.session_key 兜底	loop 线程同步拿写锁会 BUSY 且被吞;dispatch 不传 key	test_a18_revoke.py 真实 _dispatch_one 路径 passed	采纳

@@ -176,6 +176,10 @@
   - `acceptance/live_chain.py`(A25 双 bot 全链):Coordinator + research/writer 两个真实 serve,201 注册与受理,并行真实执行,双双 succeeded + result 可取,模型文本精确命中 FINDINGS-alpha-7391 / DRAFT-beta-2531,结算后同键重放 200 对账。**13/13 PASS**,证据 `/tmp/teams-chain-*/results.json`。
   - 环境事实:glm-5.3-flash 模型代码已被 provider 下线(错误码 1211),live 验收改用 glm-5.3(执行模型,goal 允许);生成配置必须显式 `agents.defaults.modelPreset`,否则落默认 anthropic 模型。
 - **打包复验(P7)**:0.5.0 wheel(dist/nanobot_teams-0.5.0-py3-none-any.whl,重建于 stdio 修复后,SHA-256 `94da66b4…99d6f7`)在干净 venv(.e2e/verify-050)安装,`coordinator --help` / `async-mcp --help` rc=0。
+- **Q2 级缺陷#4、#5(已修,真实 gateway + A18 行为验证发现)**:
+  - #4:relay 协程在同步 `_build_channel` 中 create_task → "no running event loop",整个 websocket channel 启动失败。relay 移入 gateway 异步任务组(start_all 之后再启,经 channel._commands 广播 `teams_event`)。
+  - #5:撤销钩子两个静默失效:(a) gateway 未把 inbox attach 到 loop;(b) attach 后 `_dispatch_one` 不传 session_key 参数 → 钩子收到 None 直接返回;且同步 revoke 与 session writer 线程竞锁。修:构造后 attach、`session_key or msg.session_key` 兜底、revocation 经 SessionState writer 异步执行;process_direct(API 路径)同样接入。
+  - 验证:tests/runs/test_a18_revoke.py(真实 `_dispatch_one` 两轮,mint→turn2→auto_continue 0)**passed**;live gateway 冒烟:WS 健康、bootstrap 声明 teams.async.v1、inbox sidecar 401/422、bootstrap 载荷对三个服务 token 零泄漏。
 - **Q2 级缺陷#2、#3(已修,stdio 往返发现)**:(a) `CoordinatorHttpError` 未存 `message`,async_mcp 错误分支即抛 AttributeError;(b) 受信 meta 读取把 `server.request_context` property 当 ContextVar 调 `.get()`。修复后真 stdio 往返测试(A16,tests/test_async_mcp_stdio.py)通过:MCP 进程提交任务→退出→重开会话查同一 Task→同键重放对账。Teams 全量 **212 passed**。提交 9503b908a。
 - **Q2 级缺陷#1(已修,live 发现)**:执行器 hooks 被 ephemeral 钩子门丢弃(`build_agent_turn_hook` 在 ephemeral 且未开 `run_extra_hooks_for_ephemeral` 时只留 progress_hook),所有真实运行被误标 execution_error。修复 executor 传入 `_run_extra_hooks_for_ephemeral=True`;executor 契约测试 5/5,parent 回归 99 过,live 链复验 13/13。提交 86dd94089。
 - **真实 serve 冒烟(P7 前置,2026-11-09)**:隔离 home(JSON 配置,api.runs enabled+exclusive+专用密钥)启动真实 `python -m nanobot serve`(PID 记录,测后 Stop-Process 清理,端口确认关闭):
