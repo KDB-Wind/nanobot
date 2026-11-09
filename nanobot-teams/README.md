@@ -4,6 +4,10 @@ Nanobot Teams is a standalone stdio MCP server that delegates tasks between Nano
 
 Every bot keeps its own identity, workspace, model, memory, and session. Teams moves one user message and one answer per delegation, and a chain can cross a middle hop within a hop and budget envelope.
 
+`DESIGN.md` walks through the architecture, the execution order, the failure
+classification, and the trade-offs worth reviewing. It is the entry point for a
+technical review; this README is the operator manual.
+
 ## What it does
 
 - `list_bots` returns the targets this caller may use, with id, display name, role, and capabilities.
