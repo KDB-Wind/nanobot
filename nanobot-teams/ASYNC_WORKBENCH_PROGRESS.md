@@ -171,6 +171,11 @@
 - 全量结果:vitest 全部 **EXIT=0**;browser 478 passed / 1 failed(失败规格名被管道截断,全量日志重跑中);`bun run build` EXIT=0(产物进 nanobot/web/dist)。
 - 验收脚本 `acceptance/async_workbench.py`(offline):**9/9 PASS**(A01 提交/重放、A03 派发观察、A06 终态结果、P4 auto_resume 全链含 dispatched→injected→历史单次注入、A14 无凭据 401),证据写入临时目录 results.json;顺带修复真实缺陷:delivery_state=persisted 后不再轮询 receipt(竞态卡死)→ persisted 持续轮询直至 injected/orphaned/card_only。
 - 真实网关 + 浏览器实操(A12/A17/A21/A22/A23)在 P7 live 验收。
+- **live 验收(2026-11-09,P7)**:
+  - `acceptance/async_workbench.py --live`(单 bot):真实 serve(glm-5.3 preset,隔离 home,随机端口,测后强杀)→ capabilities/受理/真实执行/类型化终态/result 全过。
+  - `acceptance/live_chain.py`(A25 双 bot 全链):Coordinator + research/writer 两个真实 serve,201 注册与受理,并行真实执行,双双 succeeded + result 可取,模型文本精确命中 FINDINGS-alpha-7391 / DRAFT-beta-2531,结算后同键重放 200 对账。**13/13 PASS**,证据 `/tmp/teams-chain-*/results.json`。
+  - 环境事实:glm-5.3-flash 模型代码已被 provider 下线(错误码 1211),live 验收改用 glm-5.3(执行模型,goal 允许);生成配置必须显式 `agents.defaults.modelPreset`,否则落默认 anthropic 模型。
+- **Q2 级缺陷#1(已修,live 发现)**:执行器 hooks 被 ephemeral 钩子门丢弃(`build_agent_turn_hook` 在 ephemeral 且未开 `run_extra_hooks_for_ephemeral` 时只留 progress_hook),所有真实运行被误标 execution_error。修复 executor 传入 `_run_extra_hooks_for_ephemeral=True`;executor 契约测试 5/5,parent 回归 99 过,live 链复验 13/13。提交 86dd94089。
 - **真实 serve 冒烟(P7 前置,2026-11-09)**:隔离 home(JSON 配置,api.runs enabled+exclusive+专用密钥)启动真实 `python -m nanobot serve`(PID 记录,测后 Stop-Process 清理,端口确认关闭):
   - `GET /v1/agent-capabilities` 200:真实 instance_id `inst_44e8…`,execution=true,exclusive=true,limits 正确。
   - `POST /v1/agent-runs` 202 受理(queued,revision=1);数秒后 `GET …/run_id` → failed/revision=3,`outcome.code=execution_error`(隔离 home 无模型,UnconfiguredProvider 引导文案为 partial text),`stop_confirmed=true`。
