@@ -432,6 +432,14 @@ class ApiConfig(Base):
         )
 
 
+class TeamsWorkbenchConfig(Base):
+    """Async teams workbench: gateway proxy to the resident coordinator."""
+
+    coordinator_url: str = ""  # Empty keeps the workbench hidden.
+    coordinator_token_env: str = "TEAMS_COORDINATOR_PLANNER_TOKEN"
+    bot_homes_root: str = ""
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
@@ -540,6 +548,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
+    teams: TeamsWorkbenchConfig = Field(default_factory=TeamsWorkbenchConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(

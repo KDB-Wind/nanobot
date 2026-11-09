@@ -61,6 +61,7 @@ from nanobot.webui.sidebar_state import ensure_webui_session_archives
 
 # Set by the inbox sidecar assembly; read once by the startup recovery scan.
 _PENDING_EXTERNAL_INBOX: dict[str, object] = {}
+_PENDING_TEAMS_PROXY: dict[str, object] = {}
 
 if TYPE_CHECKING:
     from nanobot.update_profiles import ProfileReceipt
@@ -485,6 +486,10 @@ def _run_claimed_gateway(
     from nanobot.channels.manager import ChannelManager
     from nanobot.config.watcher import watch_config_file
     from nanobot.cron.bound_runner import run_bound_cron_job
+    from nanobot.cron.teams_jobs import run_teams_cron_job
+
+    def _teams_proxy():
+        return _PENDING_TEAMS_PROXY.get("proxy")
     from nanobot.cron.service import CronJobSkippedError, CronService
     from nanobot.cron.session_turns import is_bound_cron_job
     from nanobot.cron.types import CronJob, CronRunResult
@@ -839,6 +844,9 @@ def _run_claimed_gateway(
             else:
                 logger.info("Heartbeat: silenced by post-run evaluation")
             return response
+
+        if job.payload.kind == "teams_task":
+            return await run_teams_cron_job(job, teams_proxy=_teams_proxy())
 
         if is_bound_cron_job(job):
             return await run_bound_cron_job(job, agent=agent, cron=cron)

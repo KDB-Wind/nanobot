@@ -15,6 +15,7 @@ WEBUI_PROTOCOL = 1
 CORE_CAPABILITY = "webui.core.v1"
 SUBAGENT_CAPABILITY = "webui.subagents.v1"
 SUBAGENT_EVENTS_CAPABILITY = "webui.subagents.events.v1"
+TEAMS_ASYNC_CAPABILITY = "teams.async.v1"
 SUBAGENT_HISTORY_CAPABILITY = "webui.subagents.history.v1"
 AUTOMATION_CHAT_CAPABILITY = "webui.automation-chat.v1"
 BINARY_ATTACHMENTS_CAPABILITY = "webui.attachments.binary.v1"
@@ -37,12 +38,8 @@ class Compatibility(TypedDict):
     host_version: str
 
 
-def webui_contract() -> dict[str, object]:
-    return {
-        "version": __version__,
-        "min_protocol": WEBUI_PROTOCOL,
-        "max_protocol": WEBUI_PROTOCOL,
-        "capabilities": [
+def webui_contract(extra_capabilities: list[str] | None = None) -> dict[str, object]:
+    capabilities = [
             CORE_CAPABILITY, SUBAGENT_CAPABILITY, SUBAGENT_EVENTS_CAPABILITY,
             SUBAGENT_HISTORY_CAPABILITY, AUTOMATION_CHAT_CAPABILITY,
             BINARY_ATTACHMENTS_CAPABILITY, UPDATE_PLAN_CAPABILITY,
@@ -50,14 +47,27 @@ def webui_contract() -> dict[str, object]:
             UPDATE_RETRY_CAPABILITY, UPDATE_SETTLE_HANDOFF_CAPABILITY, UPDATE_FLOW_CAPABILITY, UPDATE_CHANNEL_CAPABILITY,
             PROMPT_NAVIGATION_CAPABILITY, CONTEXT_GRAPH_REFERENCES_CAPABILITY,
             SANDBOX_SETTINGS_CAPABILITY,
-        ],
+    ]
+    if extra_capabilities:
+        capabilities.extend(extra_capabilities)
+    return {
+        "version": __version__,
+        "min_protocol": WEBUI_PROTOCOL,
+        "max_protocol": WEBUI_PROTOCOL,
+        "capabilities": capabilities,
     }
 
 
-def gateway_identity(gateway_id: str) -> dict[str, object]:
+def gateway_identity(
+    gateway_id: str, extra_capabilities: list[str] | None = None
+) -> dict[str, object]:
     # protocolVersion belongs to the pre-existing terminal transport contract.
     # Do not overload it with the version of the independently shipped WebUI.
-    return {"protocolVersion": 1, "gatewayId": gateway_id, "webui": webui_contract()}
+    return {
+        "protocolVersion": 1,
+        "gatewayId": gateway_id,
+        "webui": webui_contract(extra_capabilities),
+    }
 
 
 def assess_webui_contract(value: object) -> Compatibility:

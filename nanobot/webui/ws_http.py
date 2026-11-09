@@ -248,6 +248,10 @@ _WEBUI_MUTATION_PATHS = {
     "settings.mcp.oauth_start": "/api/settings/mcp-oauth/start",
     "settings.mcp.oauth_complete": "/api/settings/mcp-oauth/complete",
     "settings.mcp.oauth_cancel": "/api/settings/mcp-oauth/cancel",
+    "teams.create_project": "/api/teams/projects",
+    "teams.upsert_bot": "/api/teams/bots",
+    "teams.scaffold_bot": "/api/teams/bots/scaffold",
+    "teams.create_task": "/api/teams/tasks",
 }
 
 _WEBUI_CHANNEL_CONNECT_ACTIONS = {
@@ -443,10 +447,12 @@ class GatewayHTTPHandler:
         ) = None,
         subagent_manager: SubagentManager | None = None,
         discard_session: Callable[[str], Awaitable[None]] | None = None,
+        teams_proxy: Any | None = None,
         log: Any = logger,
     ) -> None:
         self.config = config
         self.session_manager = session_manager
+        self.teams_proxy = teams_proxy
         self.sidebar_state = WebUISidebarState(session_manager.state if session_manager is not None else None)
         self.static_dist_path = static_dist_path
         self.runtime_model_name = runtime_model_name
@@ -606,6 +612,11 @@ class GatewayHTTPHandler:
             if not isinstance(key, str) or not key.strip():
                 return _http_error(400, "missing session key")
             return f"/api/sessions/{quote(key, safe='')}/delete"
+        if action == "teams.cancel_task":
+            task_id = payload.get("task_id")
+            if not isinstance(task_id, str) or not task_id.startswith("task_"):
+                return _http_error(400, "invalid teams task id")
+            return f"/api/teams/tasks/{quote(task_id, safe='')}/cancel"
         connect_action = _WEBUI_CHANNEL_CONNECT_ACTIONS.get(action)
         if connect_action is not None:
             channel = payload.get("channel")
@@ -645,6 +656,9 @@ class GatewayHTTPHandler:
 
         if got == "/api/webui/subagents/cancel":
             return await self._handle_subagent_cancel(request)
+
+        if got.startswith("/api/teams/") and self.teams_proxy is not None:
+            return await self._handle_teams_proxy(request, got)
 
         response = await self._dispatch_session_routes(request, got)
         if response is not None:
@@ -771,7 +785,12 @@ class GatewayHTTPHandler:
 
         from nanobot.webui.client_contract import gateway_identity
 
-        terminal = gateway_identity(self.tokens.instance_id)
+        extra = None
+        if self.teams_proxy is not None and getattr(self.teams_proxy, "enabled", False):
+            from nanobot.webui.client_contract import TEAMS_ASYNC_CAPABILITY
+
+            extra = [TEAMS_ASYNC_CAPABILITY]
+        terminal = gateway_identity(self.tokens.instance_id, extra)
         if terminal_probe:
             # Capability probing does not allocate credentials or acquire client leases.
             return _http_json_response(terminal, extra_headers=_NO_STORE_HEADERS)
@@ -950,6 +969,28 @@ class GatewayHTTPHandler:
         except (OSError, SubagentSessionError):
             return _http_error(503, "task history unavailable")
         return _http_json_response(status.as_dict(), extra_headers=_NO_STORE_HEADERS)
+
+    async def _handle_teams_proxy(self, request: WsRequest, path: str) -> Response:
+        """Proxy one browser workbench call to the coordinator."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if request.method not in ("GET", "POST"):
+            return _http_error(405, "Method not allowed")
+        body: dict[str, Any] | None = None
+        if request.method == "POST":
+            if not getattr(request, _WEBUI_MUTATION_REQUEST_ATTR, False):
+                return _http_error(
+                    405, "Teams mutations require an authenticated WebSocket"
+                )
+            body = _mutation_payload(request)
+            if body is None:
+                return _http_error(400, "invalid teams payload")
+        result = await self.teams_proxy.forward(request.method, path, body)
+        return _http_json_response(
+            result.payload if isinstance(result.payload, (dict, list)) else {"message": str(result.payload)},
+            status=result.status,
+            extra_headers=_NO_STORE_HEADERS,
+        )
 
     def _handle_subagent_thread_get(self, request: WsRequest, key: str, task_id: str) -> Response:
         if not self.check_api_token(request):

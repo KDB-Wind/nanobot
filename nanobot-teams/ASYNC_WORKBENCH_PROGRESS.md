@@ -31,7 +31,7 @@
 | P3 Coordinator + 异步 MCP | verified | §4 P3:29 项新测试(210 总通过)+ 真实进程强杀恢复 | A08 库级故障(只读/满盘)与 stdio MCP 实测留给 Q2/P7 | P4 |
 | P4 可信回传 + 续接 | verified | §4 P4:inbox 领域 4 + P4 链路 3 + Teams 210/parent 99 全绿 | A09 wrapper 单测、A10 进程级交错、A12 → Q1/Q2/P5/P7 | P5 |
 | P5 WebUI 工作台 | pending | - | - | - |
-| P6 cron 定时任务 | pending | - | - | - |
+| P6 cron 定时任务 | in_progress | §4 P6:teams_task kind + 确定性提交键(3 tests) | 真实 cron 触发链路在 P7 验收 | P5 前端 |
 | P7 真实验收/迁移/交付 | pending | - | - | - |
 | Q1 独立审核 | pending | - | - | - |
 | Q2 缺陷修复与故障验证 | pending | - | - | - |
@@ -152,6 +152,17 @@
 - 测试:`tests/session/test_external_inbox.py` **4 passed**(绑定/过期/撤销/伪造、原子注入+重放不重复、会话替换 orphaned、新轮次 card_only);`tests/runs/test_p4_chain.py` **3 passed**(同进程真实 HTTP 全链:capability→Coordinator 校验准入→派发→假 Bot 终态→投递→inbox 注入历史恰一次;伪造/撤销/缺 capability 拒绝+普通凭据 401;会话重置晚到结果不进新会话);Teams 全量 **210 passed**;parent(runs+inbox+API 回归)**99 passed**;两包 ruff 通过。
 - 修复记录:capability 首次使用绑定(mint 时模型尚未给 op_key/bot);外部 workflows INSERT 列序错位(auto_continue 收到时间戳);aiohttp AppKey/RequestKey;异常命名。
 - 剩余(记入 Q1/Q2/P7):A09 wrapper 层保留字段拒绝的专门单测;A10 receipt/历史提交点强杀交错(Q2);A12 浏览器关闭/重启/多 tab(P5/P7);A18 loop 撤销钩子的运行时验证(P7 live);Coordinator 向 planner inbox 的网络断线重试真实进程验证(Q2/P7)。
+
+### P5(后端部分)+ P6
+
+- 2026-11-09 后端完成:
+  - `config.teams`(coordinator_url/coordinator_token_env/bot_homes_root,默认空=功能隐藏);`client_contract` 增 `TEAMS_ASYNC_CAPABILITY("teams.async.v1")` + `webui_contract(extra_capabilities)`。
+  - `webui/teams_proxy.py`:网关 → Coordinator 转发(读 GET 直连,写经 WS webui_request 动作映射 `teams.*` → /api/teams/*;动态 cancel 路径按 task_id 构造);SSE 订阅解析。
+  - `ws_http`:`/api/teams/*` 分派(未配置时 404,不报无关网络错误);POST 强制 WebSocket 变更通道;bootstrap 按配置声明 teams.async.v1。
+  - `webui/teams_events.py` + channels/manager:事件中继任务(coordinator SSE → broadcast `teams_event`),stop_all 取消;代理经 gateway_services 贯通。
+  - Coordinator `/v1/teams/bots/scaffold`(operator):bot_homes_root 内新 home(拒绝已存在/路径越界),生成 nanobot.toml(api.runs 专用密钥+随机端口+exclusive),返回一次性密钥与手动启动命令,started=false。
+  - P6:`CronPayload.kind="teams_task"`;`cron/teams_jobs.py` — 每次触发以 `uuid5(job_id:last_run_ms)` 为提交键,重复投递对账为同一任务;cron 来源一律 workbench_only;缺 bot/proxy 即失败该次运行。`tests/cron/test_teams_jobs.py` **3 passed**。
+- 待:前端页面/类型/i18n/浏览器测试(Explore 模板事实回收中),回归套件运行中。
 
 ## 5. 运行中进程与待恢复状态
 

@@ -143,6 +143,18 @@ class ChannelManager:
         self._webui_skill_state_action = webui_skill_state_action
         self._webui_recovery_action = webui_recovery_action
         self._webui_subagent_manager = webui_subagent_manager
+        from nanobot.webui.teams_proxy import TeamsProxy
+
+        teams_cfg = getattr(self.config, "teams", None)
+        self._teams_proxy = (
+            TeamsProxy(teams_cfg.coordinator_url, teams_cfg.coordinator_token_env)
+            if teams_cfg is not None and teams_cfg.coordinator_url
+            else None
+        )
+        self._teams_event_relay: Any | None = None
+        import nanobot.cli.gateway_runtime as _gr
+        if self._teams_proxy is not None:
+            _gr._PENDING_TEAMS_PROXY["proxy"] = self._teams_proxy
         self._webui_discard_session = webui_discard_session
         self.channels: dict[str, BaseChannel] = {}
         self._channel_owners: dict[str, str] = {}
@@ -236,10 +248,19 @@ class ChannelManager:
                 recovery_action=self._webui_recovery_action,
                 subagent_manager=self._webui_subagent_manager,
                 discard_session=self._webui_discard_session,
+                teams_proxy=self._teams_proxy,
                 logger=logger,
             )
             kwargs["gateway"] = gateway
         channel = cls(section, self.bus, **kwargs)
+        if (
+            cls.name == "websocket"
+            and self._teams_proxy is not None
+            and self._teams_proxy.enabled
+        ):
+            from nanobot.webui.teams_events import start_teams_event_relay
+
+            self._teams_event_relay = start_teams_event_relay(self._teams_proxy, channel)
         channel.tool_hint_max_length = self.config.agents.defaults.tool_hint_max_length
         if runtime_name and runtime_name != channel.name:
             channel.name = runtime_name
@@ -692,6 +713,10 @@ class ChannelManager:
         )
 
     async def stop_all(self) -> None:
+        if self._teams_event_relay is not None:
+            self._teams_event_relay.cancel()
+            self._teams_event_relay = None
+
         """Stop all channels and the dispatcher."""
         logger.info("Stopping all channels...")
         self._started = False
