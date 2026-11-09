@@ -10,8 +10,7 @@ from datetime import timedelta
 import pytest
 
 from nanobot.runs.service import RunService
-from nanobot.runs.store import StoreUnavailableError
-from nanobot.runs.store import RunStore
+from nanobot.runs.store import RunStore, StoreUnavailableError
 from nanobot.runs.types import ExecutionResult, OutcomeCode, RunState, RunSubmit, utc_now
 
 
