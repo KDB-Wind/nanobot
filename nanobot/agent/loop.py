@@ -910,6 +910,16 @@ class AgentLoop:
         if not tasks and self._active_tasks.get(key) is tasks:
             self._active_tasks.pop(key, None)
 
+    def _revoke_external_workflows(self, session_key: str | None) -> None:
+        """A real user turn ends older workflows' auto-continue grants."""
+        inbox = getattr(self, "external_inbox", None)
+        if inbox is None or not session_key:
+            return
+        try:
+            inbox.revoke_session_workflows(session_key)
+        except Exception:
+            logger.debug("external inbox revocation skipped for {}", session_key)
+
     async def cancel_session_work(self, session_key: str) -> int:
         """Cancel one session's tasks, subagents, and exec sessions.
 
@@ -1861,13 +1871,7 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         kind = TurnKind.USER if msg.is_user_input else TurnKind.SYSTEM
         if kind is TurnKind.USER:
-            inbox = getattr(self, "external_inbox", None)
-            if inbox is not None and session_key:
-                # A real user turn ends older workflows' auto-continue grants.
-                try:
-                    inbox.revoke_session_workflows(session_key)
-                except Exception:
-                    logger.debug("external inbox revocation skipped for {}", session_key)
+            self._revoke_external_workflows(session_key)
         if kind is TurnKind.SYSTEM:
             destination = (
                 msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
@@ -2711,6 +2715,8 @@ class AgentLoop:
                         kwargs["on_runtime_admitted"] = on_runtime_admitted
                     if attributes is not None:
                         kwargs["attributes"] = dict(attributes)
+                    if msg.is_user_input:
+                        self._revoke_external_workflows(session_key)
                     delivery = self.turn_delivery_factory.create(msg, session_key)
                     kwargs["delivery"] = delivery
                     try:
