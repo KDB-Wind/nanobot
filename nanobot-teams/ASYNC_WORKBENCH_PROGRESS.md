@@ -28,7 +28,7 @@
 | P0 入口/依赖/基线 | verified | §4 P0:四份探针 + MCP 探针 + 基线 pytest + 备份 | 无 | P1(已开始) |
 | P1 持久运行领域 | in_progress | §4 P1:20 tests + 强杀恢复 3/3 + pyright/ruff 绿 | P2 执行器适配后复验 A01–A06/A15 公开行为 | P2 |
 | P2 运行 HTTP + 执行器 | pending | - | - | - |
-| P3 Coordinator + 异步 MCP | pending | - | - | - |
+| P3 Coordinator + 异步 MCP | verified | §4 P3:29 项新测试(210 总通过)+ 真实进程强杀恢复 | A08 库级故障(只读/满盘)与 stdio MCP 实测留给 Q2/P7 | P4 |
 | P4 可信回传 + 续接 | pending | - | - | - |
 | P5 WebUI 工作台 | pending | - | - | - |
 | P6 cron 定时任务 | pending | - | - | - |
@@ -128,6 +128,17 @@
 - 检查:basedpyright 0 errors(agent_runs.py、api/server.py、schema.py、runs/、agent/loop.py、cli/commands.py);ruff 全通过;`tests/runs + test_openai_api` **92 passed**。
 - 修复记录:aiohttp HTTPException 状态码类级烘焙 → protocol_error 工厂按状态构造异常类;413 需 max_size 参数;SSE 测试用 readany。
 - 范围决定:gateway inbox sidecar 与 inbox 路由一并推迟到 P4 实现(先建空 sidecar 是死代码,违反最小变更;决策已记 TSV)。真实 AgentLoop 的受理/查询/类型化结果为 P7 live 证据;P2 以 stub loop 契约测试 + 假执行器 HTTP 测试覆盖。
+
+### P3
+
+- 2026-11-09 实现并通过:`nanobot_teams/coordinator/`(models/store/client/worker/http_api/config/service)+ `async_mcp.py` + `__main__.py` 子命令(coordinator、async-mcp)。
+- 结构:单 writer(FileLock 排他,open 对刚被强杀的锁有界等待 10s);准入事务(键去重→项目→Bot→隔离→四类配额→结果预留)失败零 HTTP;digest 只覆盖调用方显式语义字段(默认 deadline 在幂等判定后固定,无状态 MCP 重放可对账);indeterminate 同时关闭 outbox 条目(不再派发)。
+- 派发 worker:已提交 outbox 才发 HTTP;派发前 capabilities 身份校验(绑定实例不匹配→indeterminate+隔离,不在新实例创建运行);响应丢失按原键 lookup 对账;网络未知按 1/2/4/8/16/30s+抖动退避;确定性 4xx/凭据缺失→indeterminate(停止自动派发);观察只接受更高 revision;终态时拉取结果文本;取消请求在观察循环驱动;`force_rebind_instance` 为操作者显式重绑(带审计事件)。
+- HTTP API(§7.1 全路由):角色令牌(operator/planner,令牌必须非空且不同,从环境变量解析);auto_resume 在 P4 能力握手就绪前一律 422 origin_required;lookup 静态路由先于动态;SSE 事件流 + snapshot;bots 写操作仅 operator、拒绝裸密钥与非 loopback 端点、有未结任务 409。
+- 真实进程验证:`tests/test_coordinator_recovery.py` **2 passed** — (1) 真实 `python -m nanobot_teams coordinator` 子进程受理任务后 `proc.kill()` 强杀,重启后已提交 outbox 继续派发、恰好一个远端运行、新 MCP 客户端查询同一 Task(A02 coordinator 侧 + A03 + A16 切片);(2) 0.4 ledger 导入幂等、用量与 unknown 隔离保留(A20)。
+- 修复记录:启动快照 secrets 导致后注册 bot 空密钥且无限退避 → ClientFactory 实时读环境 + MissingSecret 快速 indeterminate;HTTPException 状态烘焙、AppKey 警告、异常命名等清理。
+- 检查:`pytest -q` **210 passed in 53s**(基线 181 + 新 29);ruff(src+tests)通过;`coordinator` extra 声明 aiohttp。
+- 剩余(记入 Q2/P7):A08 的 DB 只读/满盘/写盘失败注入;A16 真实 stdio MCP 进程往返;A19 的 home 路径越界在 P5 scaffold 覆盖。
 
 ## 5. 运行中进程与待恢复状态
 

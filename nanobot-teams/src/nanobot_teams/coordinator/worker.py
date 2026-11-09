@@ -1,0 +1,359 @@
+"""Dispatch and observation worker: committed outbox only, same key and body on retry."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import random
+from datetime import timedelta
+
+from .client import BotRunClient, BotUnreachableError
+from .models import TERMINAL_RUN_STATES
+from .store import CoordinatorStore, utc_now
+
+log = logging.getLogger("nanobot_teams.coordinator.worker")
+
+BACKOFF_SECONDS = (1, 2, 4, 8, 16, 30)
+MAX_PARALLEL_BOTS = 4
+
+
+class MissingSecretError(Exception):
+    """The bot's service environment does not carry its secret."""
+
+
+class ClientFactory:
+    """Build one client per bot endpoint; keys come from the live environment."""
+
+    def __init__(self, secrets: dict[str, str] | None = None) -> None:
+        self._secrets = secrets if secrets is not None else dict(os.environ)
+        self._clients: dict[str, BotRunClient] = {}
+
+    def secret_for(self, secret_env: str) -> str:
+        value = self._secrets.get(secret_env, "")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        raise MissingSecretError(f"{secret_env} is not set in the coordinator environment")
+
+    def for_bot(self, endpoint: str, secret_env: str) -> BotRunClient:
+        key = self.secret_for(secret_env)
+        client = self._clients.get((endpoint, key))
+        if client is None:
+            client = BotRunClient(endpoint, key)
+            self._clients[(endpoint, key)] = client
+        return client
+
+    async def aclose(self) -> None:
+        for client in self._clients.values():
+            await client.aclose()
+        self._clients.clear()
+
+
+class DispatchWorker:
+    def __init__(self, store: CoordinatorStore, clients: ClientFactory) -> None:
+        self._store = store
+        self._clients = clients
+        self._running = False
+
+    async def run_loop(self, *, poll_s: float = 0.5) -> None:
+        self._running = True
+        while self._running:
+            try:
+                progressed = await self.pump_once()
+            except Exception:
+                log.exception("coordinator worker iteration failed")
+                progressed = False
+            if not progressed:
+                await asyncio.sleep(poll_s)
+
+    def stop(self) -> None:
+        self._running = False
+
+    async def pump_once(self) -> bool:
+        progressed = False
+        progressed |= await self._dispatch_due()
+        progressed |= await self._observe_accepted()
+        return progressed
+
+    # ---- dispatch ----
+
+    async def _dispatch_due(self) -> bool:
+        now = utc_now()
+        entries = self._store.pending_dispatch(now, limit=16)
+        if not entries:
+            return False
+        progressed = False
+        # Bound concurrent dispatch to distinct bots (default 4).
+        by_bot: dict[str, list] = {}
+        for entry in entries:
+            task = self._store.get_task(entry.task_id)
+            if task is None:
+                continue
+            by_bot.setdefault(task.bot_id, []).append((entry, task))
+        chosen = list(by_bot.items())[:MAX_PARALLEL_BOTS]
+        results = await asyncio.gather(
+            *(self._dispatch_bot_tasks(tasks) for _bot, tasks in chosen)
+        )
+        progressed = any(results)
+        return progressed
+
+    async def _dispatch_bot_tasks(self, tasks: list) -> bool:
+        progressed = False
+        for entry, task in tasks:
+            progressed |= await self._dispatch_one(entry, task)
+        return progressed
+
+    async def _dispatch_one(self, entry, task) -> bool:
+        bot = self._store.get_bot(task.bot_id)
+        if bot is None:
+            self._store.mark_indeterminate(task.task_id, "Bot vanished from the catalog.")
+            return True
+        try:
+            client = self._clients.for_bot(bot.endpoint, bot.secret_env)
+        except MissingSecretError as exc:
+            # Missing credentials are deterministic: stop auto-dispatch.
+            self._store.mark_indeterminate(
+                task.task_id, f"Coordinator secret missing: {exc}"
+            )
+            return True
+        now = utc_now()
+        if task.deadline_at <= now and entry.attempts == 0:
+            # Never sent and already past the business deadline: no new dispatch.
+            self._store.mark_dispatch_failure(
+                entry.entry_id,
+                error="deadline passed before first dispatch",
+                retry_at=now + timedelta(days=3650),
+            )
+            return True
+        body = {
+            "protocol": 1,
+            "task_id": task.task_id,
+            "workflow_id": task.workflow_id,
+            "input_text": task.input_text,
+            "deadline_at": task.deadline_at.isoformat(),
+        }
+        if bot.instance_id:
+            # Verify the endpoint identity before creating any run on it.
+            try:
+                caps = await client.capabilities()
+            except BotUnreachableError as exc:
+                await self._reconcile_unknown(client, task, entry, str(exc))
+                return True
+            if caps.status != 200 or not isinstance(caps.payload, dict):
+                await self._reconcile_unknown(
+                    client, task, entry, f"capabilities returned {caps.status}"
+                )
+                return True
+            seen_instance = str(caps.payload.get("instance_id", ""))
+            if seen_instance and seen_instance != bot.instance_id:
+                await self._indeterminate_identity(task, bot.instance_id, seen_instance)
+                return True
+        try:
+            response = await client.submit(operation_key=task.operation_key, protocol_body=body)
+        except BotUnreachableError as exc:
+            # Unknown delivery: retry the same key and body with backoff; also reconcile.
+            await self._reconcile_unknown(client, task, entry, str(exc))
+            return True
+        if response.status in (200, 202):
+            payload = response.payload or {}
+            instance = str(payload.get("instance_id", ""))
+            run_id = str(payload.get("run_id", ""))
+            if not run_id:
+                await self._reconcile_unknown(
+                    client, task, entry, "accepted response missing run_id"
+                )
+                return True
+            if instance and bot.instance_id and instance != bot.instance_id:
+                await self._indeterminate_identity(task, bot.instance_id or "", instance)
+                return True
+            if instance:
+                self._store.bind_instance(bot.bot_id, instance)
+            self._store.update_after_submit(
+                task.task_id, remote_run_id=run_id, remote_instance_id=instance
+            )
+            return True
+        if response.status == 409 and (response.payload or {}).get("code") in (
+            "idempotency_conflict",
+            "operation_key_retired",
+        ):
+            self._store.mark_indeterminate(
+                task.task_id,
+                f"Remote rejected the operation key: {(response.payload or {}).get('code')}",
+            )
+            return True
+        if response.status == 410:
+            self._store.mark_indeterminate(task.task_id, "Remote storage lost the key.")
+            return True
+        # 4xx/5xx: retryable classification is deferred; unknown delivery for 5xx.
+        if response.status >= 500:
+            await self._reconcile_unknown(
+                client, task, entry, f"remote {response.status}"
+            )
+            return True
+        # Deterministic client error (401/403/400): no retry with this config.
+        self._store.mark_dispatch_failure(
+            entry.entry_id,
+            error=f"remote {response.status}: {(response.payload or {}).get('code', '')}",
+            retry_at=utc_now() + timedelta(days=3650),
+        )
+        self._store.mark_indeterminate(
+            task.task_id,
+            f"Remote refused the submission with {response.status}; operator must fix "
+            "credentials or protocol.",
+        )
+        return True
+
+    async def _reconcile_unknown(
+        self, client: BotRunClient, task, entry, reason: str
+    ) -> None:
+        """Response lost or transport unknown: reconcile by original key before retrying."""
+        try:
+            lookup = await client.lookup(task.operation_key)
+        except BotUnreachableError:
+            lookup = None
+        if lookup is not None and lookup.status == 200 and (lookup.payload or {}).get("run_id"):
+            payload = lookup.payload or {}
+            instance = str(payload.get("instance_id", ""))
+            bot = self._store.get_bot(task.bot_id)
+            if bot is not None and bot.instance_id and instance and instance != bot.instance_id:
+                await self._indeterminate_identity(task, bot.instance_id, instance)
+                return
+            self._store.update_after_submit(
+                task.task_id,
+                remote_run_id=str(payload["run_id"]),
+                remote_instance_id=instance,
+            )
+            return
+        delay = BACKOFF_SECONDS[min(entry.attempts, len(BACKOFF_SECONDS) - 1)]
+        jitter = random.uniform(0, delay * 0.25)
+        self._store.bump_dispatch_attempt(
+            entry.entry_id, utc_now() + timedelta(seconds=delay + jitter), reason
+        )
+
+    async def _indeterminate_identity(self, task, expected: str, actual: str) -> None:
+        self._store.quarantine_instance(
+            actual, f"endpoint identity changed from {expected} to {actual}"
+        )
+        self._store.mark_indeterminate(
+            task.task_id, f"Instance identity changed from {expected} to {actual}."
+        )
+
+    # ---- observation ----
+
+    async def _observe_accepted(self) -> bool:
+        tasks = self._store.tasks_to_observe(limit=32)
+        if not tasks:
+            return False
+        progressed = False
+        for task in tasks:
+            if task.remote_run_id is None:
+                continue
+            bot = self._store.get_bot(task.bot_id)
+            if bot is None:
+                continue
+            client = self._clients.for_bot(bot.endpoint, bot.secret_env)
+            try:
+                response = await client.get_run(task.remote_run_id)
+            except BotUnreachableError:
+                continue
+            if response.status != 200 or not isinstance(response.payload, dict):
+                if response.status == 404:
+                    # The remote lost the run storage; identity check decides.
+                    await self._check_identity_or_indeterminate(task, bot, client)
+                continue
+            payload = response.payload
+            instance = str(payload.get("instance_id", ""))
+            if bot.instance_id and instance and instance != bot.instance_id:
+                await self._indeterminate_identity(task, bot.instance_id, instance)
+                progressed = True
+                continue
+            run_state = str(payload.get("state", ""))
+            if self._store.get_task(task.task_id).remote_revision >= int(
+                payload.get("revision", 0)
+            ):
+                progressed |= await self._drive_cancel(task, client)
+                continue
+            terminal = run_state in TERMINAL_RUN_STATES
+            result_text = None
+            if terminal and payload.get("result_available"):
+                try:
+                    result = await client.get_result(task.remote_run_id)
+                    if result.status == 200 and isinstance(result.payload, dict):
+                        outcome = result.payload.get("outcome") or {}
+                        result_text = str(outcome.get("text", ""))
+                except BotUnreachableError:
+                    result_text = None
+            self._store.record_observation(
+                task.task_id,
+                revision=int(payload.get("revision", 0)),
+                run_state=run_state,
+                stop_confirmed=bool(payload.get("stop_confirmed", False)),
+                effects_uncertain=bool(payload.get("effects_uncertain", False)),
+                outcome_code=(
+                    str((payload.get("outcome") or {}).get("code"))
+                    if payload.get("outcome")
+                    else None
+                ),
+                result_text=result_text,
+                result_truncated=None if result_text is None else False,
+            )
+            progressed = True
+            progressed |= await self._drive_cancel(task, client)
+        return progressed
+
+    async def _drive_cancel(self, task, client: BotRunClient) -> bool:
+        current = self._store.get_task(task.task_id)
+        if (
+            current is None
+            or current.cancel_state.value != "requested"
+            or current.remote_run_id is None
+            or current.run_state in TERMINAL_RUN_STATES
+        ):
+            return False
+        try:
+            response = await client.cancel(current.remote_run_id)
+        except BotUnreachableError:
+            return False
+        return response.status in (200, 202)
+
+    async def _check_identity_or_indeterminate(self, task, bot, client: BotRunClient) -> None:
+        try:
+            caps = await client.capabilities()
+        except BotUnreachableError:
+            return
+        if caps.status == 200 and isinstance(caps.payload, dict):
+            instance = str(caps.payload.get("instance_id", ""))
+            if bot.instance_id and instance and instance != bot.instance_id:
+                await self._indeterminate_identity(task, bot.instance_id, instance)
+
+
+def task_public_json(task) -> dict:
+    return {
+        "task_id": task.task_id,
+        "project_id": task.project_id,
+        "workflow_id": task.workflow_id,
+        "bot_id": task.bot_id,
+        "operation_key": task.operation_key,
+        "dispatch_state": task.dispatch_state.value,
+        "run_state": task.run_state,
+        "remote_run_id": task.remote_run_id,
+        "remote_revision": task.remote_revision,
+        "stop_confirmed": task.stop_confirmed,
+        "effects_uncertain": task.effects_uncertain,
+        "cancel_state": task.cancel_state.value,
+        "delivery_state": task.delivery_state.value,
+        "outcome_code": task.outcome_code,
+        "result_available": task.result_available,
+        "deadline_at": task.deadline_at.isoformat(),
+        "created_at": task.created_at.isoformat(),
+        "finished_at": None if task.finished_at is None else task.finished_at.isoformat(),
+        "last_error": task.last_error,
+    }
+
+
+__all__ = [
+    "BACKOFF_SECONDS",
+    "ClientFactory",
+    "DispatchWorker",
+    "task_public_json",
+]

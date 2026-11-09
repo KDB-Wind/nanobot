@@ -9,17 +9,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import logging
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 from .config import ConfigError, load_teams_config, resolve_api_keys, resolve_caller
-from .ledger import Ledger
+from .ledger import Ledger, LedgerError
 from .lifecycle import bot_init, check, print_findings
 from .server import serve
 
-_SUBCOMMANDS = ("serve", "bot", "check", "graph", "budget", "audit")
+_SUBCOMMANDS = (
+    "serve", "bot", "check", "graph", "budget", "audit", "ack-unknown",
+    "coordinator", "async-mcp",
+)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -30,6 +34,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _dispatch(args: list[str]) -> int:
+    if args[0] == "coordinator":
+        return _run_coordinator(_parse_coordinator(args[1:]))
+    if args[0] == "async-mcp":
+        return _run_async_mcp(_parse_async_mcp(args[1:]))
+    if args[0] == "ack-unknown":
+        return _run_ack(args[1:])
     if args[0] == "serve":
         return _run_server(_parse_serve(args[1:]))
     if args[0] == "check":
@@ -60,9 +70,15 @@ def _run_server(args: argparse.Namespace) -> int:
         print(f"nanobot-teams: {exc}", file=sys.stderr)
         return 2
 
-    ledger = Ledger(args.ledger) if args.ledger else None
+    ledger = None
     try:
+        ledger_path = args.ledger or Path(args.config).resolve().parent / ".teams-state" / f"{caller_id}.sqlite3"
+        ledger = Ledger(ledger_path)
+        ledger.bind(config.team_id, caller_id)
         asyncio.run(serve(config, api_keys, caller_id, ledger=ledger))
+    except LedgerError as exc:
+        print(f"nanobot-teams: {exc}", file=sys.stderr)
+        return 2
     finally:
         if ledger is not None:
             ledger.close()
@@ -70,7 +86,8 @@ def _run_server(args: argparse.Namespace) -> int:
 
 
 def _run_check(args: argparse.Namespace) -> int:
-    findings = check(Path(args.config), caller=args.caller, probe=not args.no_probe)
+    findings = check(Path(args.config), caller=args.caller, probe=not args.no_probe,
+                     deployment=Path(args.deployment) if args.deployment else None)
     return print_findings(findings)
 
 
@@ -115,21 +132,79 @@ def _run_budget(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"nanobot-teams: {exc}", file=sys.stderr)
         return 2
-    print(render_budget(config, [Path(p) for p in args.ledger]))
+    paths = [Path(p) for p in args.ledger] or sorted((Path(args.config).resolve().parent / ".teams-state").glob("*.sqlite3"))
+    report = render_budget(config, paths)
+    print(report)
+    if report.startswith(("unavailable:", "missing:")):
+        return 2
     return 0
 
 
 def _run_audit(args: argparse.Namespace) -> int:
     from .reporting import render_audit
 
-    print(
-        render_audit(
+    report = render_audit(
             [Path(p) for p in args.ledger],
             limit=args.limit,
             target=args.target,
             status=args.status,
-        )
     )
+    print(report)
+    return 2 if report.startswith(("unavailable:", "missing:")) else 0
+
+
+def _parse_coordinator(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="nanobot-teams coordinator")
+    parser.add_argument("--config", required=True, help="path to coordinator.json")
+    return parser.parse_args(argv)
+
+
+def _parse_async_mcp(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="nanobot-teams async-mcp")
+    parser.add_argument("--url", required=True, help="coordinator base URL")
+    parser.add_argument("--token-env", required=True, help="env var carrying the planner token")
+    return parser.parse_args(argv)
+
+
+def _run_coordinator(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.INFO,
+        format="%(levelname)s %(name)s %(message)s",
+    )
+    try:
+        from .coordinator.config import ConfigError
+        from .coordinator.http_api import build_app
+        from .coordinator.service import CoordinatorService
+
+        service = CoordinatorService.from_config_path(args.config)
+    except (ConfigError, Exception) as exc:
+        if type(exc) is Exception:  # unexpected import/runtime issue
+            raise
+        print(f"nanobot-teams coordinator: {exc}", file=sys.stderr)
+        return 2
+    try:
+        import asyncio
+
+        return asyncio.run(service.run_forever(build_app))
+    finally:
+        service.close()
+
+
+def _run_async_mcp(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.INFO,
+        format="%(levelname)s %(name)s %(message)s",
+    )
+    import asyncio
+
+    from .async_mcp import serve_async
+
+    try:
+        asyncio.run(serve_async(args.url, args.token_env))
+    except KeyboardInterrupt:
+        return 0
     return 0
 
 
@@ -146,7 +221,7 @@ def _parse_budget(argv: Sequence[str]) -> argparse.Namespace:
         "--ledger",
         action="append",
         default=[],
-        help="ledger file to read; repeatable; defaults to the registry directory",
+        help="ledger file to read; repeatable; defaults to <registry-dir>/.teams-state/*.sqlite3",
     )
     return parser.parse_args(argv)
 
@@ -174,7 +249,7 @@ def _parse_serve(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--ledger",
-        help="path to the SQLite ledger; without it no delegation is recorded",
+        help="persistent SQLite control state; defaults to <registry-dir>/.teams-state/<caller>.sqlite3",
     )
     parser.add_argument("--verbose", action="store_true", help="log debug detail")
     return parser.parse_args(argv)
@@ -184,6 +259,7 @@ def _parse_check(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="nanobot-teams check")
     parser.add_argument("--config", required=True, help="path to teams.json")
     parser.add_argument("--caller", help="limit the check to one caller's view")
+    parser.add_argument("--deployment", help="operator-declared timeout contract JSON")
     parser.add_argument(
         "--no-probe", action="store_true", help="skip the endpoint socket probes"
     )
@@ -214,6 +290,30 @@ def _parse_bot_init(argv: Sequence[str]) -> argparse.Namespace:
         help="bot id allowed to call the new bot; repeatable",
     )
     return parser.parse_args(argv)
+
+
+
+
+def _run_ack(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(prog="nanobot-teams ack-unknown")
+    parser.add_argument("--ledger", required=True)
+    parser.add_argument("--task-id", required=True)
+    parser.add_argument("--reason", required=True, help="why you accept the remaining duplicate-execution risk")
+    args = parser.parse_args(argv)
+    if not Path(args.ledger).is_file():
+        print("nanobot-teams: ledger does not exist", file=sys.stderr)
+        return 2
+    try:
+        ledger = Ledger(args.ledger)
+        try:
+            ledger.acknowledge(args.task_id, actor=getpass.getuser(), reason=args.reason)
+        finally:
+            ledger.close()
+    except (LedgerError, ValueError) as exc:
+        print(f"nanobot-teams: {exc}", file=sys.stderr)
+        return 2
+    print("Target quarantine acknowledged; historical unknown outcome and charged quota are preserved.")
+    return 0
 
 
 if __name__ == "__main__":
