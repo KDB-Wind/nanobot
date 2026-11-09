@@ -93,7 +93,7 @@ export interface WebUIMutationTransport {
   ): Promise<T>;
 }
 
-async function request<T>(
+export async function request<T>(
   url: string,
   token: string,
   init?: RequestInit,

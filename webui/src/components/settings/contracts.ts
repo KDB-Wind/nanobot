@@ -13,6 +13,7 @@ export type SettingsSectionKey =
   | "voice"
   | "browser"
   | "channels"
+  | "teams"
   | "apps"
   | "automations"
   | "memory"

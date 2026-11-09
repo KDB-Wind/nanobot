@@ -27,6 +27,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
+import { Users as UsersIcon } from "lucide-react";
+
 import { cn } from "@/lib/utils";
 
 const SETTINGS_NAV_ITEMS: Array<{ key: SettingsSectionKey; icon: LucideIcon; fallback: string }> = [
@@ -35,6 +37,7 @@ const SETTINGS_NAV_ITEMS: Array<{ key: SettingsSectionKey; icon: LucideIcon; fal
   { key: "notifications", icon: Bell, fallback: "Notifications" },
   { key: "models", icon: ModelsIcon, fallback: "Models" },
   { key: "capabilities", icon: CapabilitiesIcon, fallback: "Capabilities" },
+  { key: "teams", icon: UsersIcon, fallback: "Teams" },
   { key: "runtime", icon: SystemIcon, fallback: "System" },
   { key: "advanced", icon: AdvancedIcon, fallback: "Advanced" },
   { key: "about", icon: AboutIcon, fallback: "About" },
@@ -45,6 +48,7 @@ export function standaloneSectionTitle(section: SettingsSectionKey): string {
   if (section === "automations") return "Automations";
   if (section === "skills") return "Skills";
   if (section === "channels") return "Channels";
+  if (section === "teams") return "Teams";
   return SETTINGS_NAV_ITEMS.find((item) => item.key === section)?.fallback ?? "Settings";
 }
 

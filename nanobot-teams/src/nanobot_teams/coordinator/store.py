@@ -829,7 +829,7 @@ class CoordinatorStore:
         rows = self._conn.execute(
             "SELECT task_id FROM tasks WHERE delivery_mode='auto_resume' AND "
             "run_state IN ('succeeded','failed','cancelled','interrupted') AND "
-            "delivery_state IN ('not_ready','pending')"
+            "delivery_state IN ('not_ready','pending','persisted')"
         ).fetchall()
         return [self._load_task(r[0]) for r in rows]
 

@@ -249,13 +249,56 @@ class DispatchWorker:
 
     # ---- delivery ----
 
+    async def _poll_receipt(self, task, client=None, inbox_key=None, delivery_id=None):
+        """Observe the planner receipt until it reaches a stable state."""
+        import hashlib
+
+        import httpx
+
+        planner = self._planner
+        if planner is None:
+            return
+        delivery_id = delivery_id or "del_" + hashlib.sha256(
+            f"{task.task_id}:{task.remote_revision}".encode("utf-8")
+        ).hexdigest()[:24]
+        inbox_key = inbox_key or os.environ.get(planner.inbox_key_env, "").strip()
+        if not inbox_key:
+            return
+        try:
+            if client is None:
+                async with httpx.AsyncClient(timeout=10.0) as owned:
+                    receipt = await owned.get(
+                        planner.inbox_url.rstrip("/") + f"/v1/agent-inbox/{delivery_id}",
+                        headers={"Authorization": f"Bearer {inbox_key}"},
+                    )
+            else:
+                receipt = await client.get(
+                    planner.inbox_url.rstrip("/") + f"/v1/agent-inbox/{delivery_id}",
+                    headers={"Authorization": f"Bearer {inbox_key}"},
+                )
+        except httpx.HTTPError:
+            return
+        if receipt.status_code != 200:
+            return
+        state = str(receipt.json().get("state", ""))
+        mapping = {
+            "injected": DeliveryState.INJECTED,
+            "orphaned": DeliveryState.ORPHANED,
+            "card_only": DeliveryState.CARD_ONLY,
+        }
+        if state in mapping:
+            self._store.set_delivery_state(task.task_id, mapping[state])
+
     async def _deliver_results(self) -> bool:
         """Deliver terminal auto_resume results to the fixed planner inbox."""
         tasks = self._store.auto_resume_ready_tasks()
         if not tasks:
             return False
         for task in tasks:
-            await self._deliver_one(task)
+            if task.delivery_state.value == "persisted":
+                await self._poll_receipt(task)
+            else:
+                await self._deliver_one(task)
         return True
 
     async def _deliver_one(self, task) -> None:
@@ -297,19 +340,8 @@ class DispatchWorker:
                     self._store.set_delivery_state(
                         task.task_id, DeliveryState.PERSISTED
                     )
-                    receipt = await client.get(
-                        planner.inbox_url.rstrip("/") + f"/v1/agent-inbox/{delivery_id}",
-                        headers={"Authorization": f"Bearer {inbox_key}"},
-                    )
-                    if receipt.status_code == 200:
-                        state = str(receipt.json().get("state", ""))
-                        mapping = {
-                            "injected": DeliveryState.INJECTED,
-                            "orphaned": DeliveryState.ORPHANED,
-                            "card_only": DeliveryState.CARD_ONLY,
-                        }
-                        if state in mapping:
-                            self._store.set_delivery_state(task.task_id, mapping[state])
+                    await self._poll_receipt(task, client=client, inbox_key=inbox_key,
+                                             delivery_id=delivery_id)
                     return
                 if response.status_code == 410:
                     self._store.set_delivery_state(task.task_id, DeliveryState.ORPHANED)

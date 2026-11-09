@@ -40,6 +40,7 @@ import {
   AutomationEditDialog,
   AutomationsSettings,
 } from "@/components/settings/system/AutomationsSettings";
+import { TeamsSettings } from "@/components/teams/TeamsSettings";
 import { ChannelsSettings } from "@/components/settings/system/ChannelsSettings";
 import { RUNTIME_CONFIG_FIELDS, type RuntimeConfigPage } from "@/components/settings/system/runtime-config-fields";
 import { RuntimeConfigSettings } from "@/components/settings/system/RuntimeConfigSettings";
@@ -587,6 +588,12 @@ export function SettingsPage({
               onRestart={restartViaSettingsSurface}
               isRestarting={restartInProgress}
             />
+          </div>
+        );
+      case "teams":
+        return (
+          <div className="settings-stack">
+            <TeamsSettings />
           </div>
         );
       case "automations":
