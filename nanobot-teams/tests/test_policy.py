@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import pytest
+
 from nanobot_teams.config import ConfigError, load_teams_config
 from nanobot_teams.delegation import Delegator
 from nanobot_teams.ledger import Ledger

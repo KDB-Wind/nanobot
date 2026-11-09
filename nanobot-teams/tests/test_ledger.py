@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
 from nanobot_teams.config import load_teams_config
 from nanobot_teams.delegation import Delegator
 from nanobot_teams.ledger import Ledger

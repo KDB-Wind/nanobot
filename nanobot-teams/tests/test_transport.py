@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 import pytest
+
 from nanobot_teams.config import Limits
 from nanobot_teams.transport import (
     HttpTransport,

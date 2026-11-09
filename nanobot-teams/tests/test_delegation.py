@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
 from nanobot_teams.config import Limits, TeamConfig, load_teams_config
 from nanobot_teams.delegation import Delegator, session_id_for
 from nanobot_teams.transport import HttpTransport, OutcomeKind

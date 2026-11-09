@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from nanobot_teams.config import (
     ConfigError,
     Limits,

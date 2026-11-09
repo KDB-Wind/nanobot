@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 import pytest
+
 from nanobot_teams.config import load_teams_config
 from nanobot_teams.delegation import Delegator, session_id_for
 from nanobot_teams.envelope import (
