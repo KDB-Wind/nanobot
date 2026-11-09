@@ -910,6 +910,16 @@ class AgentLoop:
         if not tasks and self._active_tasks.get(key) is tasks:
             self._active_tasks.pop(key, None)
 
+    async def cancel_session_work(self, session_key: str) -> int:
+        """Cancel one session's tasks, subagents, and exec sessions.
+
+        Public stop path for adapters that drive ``process_direct`` in their own
+        tasks (for example the agent-runs executor); returns the number of
+        cancelled work items. Awaiting this is what makes executor stop
+        confirmation real rather than assumed.
+        """
+        return await self._cancel_active_tasks(session_key)
+
     async def _cancel_active_tasks(self, key: str) -> int:
         pending = self._pending_queues.get(key)
         tasks = tuple(self._active_tasks.pop(key, set()))

@@ -410,20 +410,55 @@ def serve(
         )
     console.print()
 
+    runs_service: Any | None = None
+    runs_store: Any | None = None
+    if api_cfg.runs.enabled:
+        from nanobot.config.paths import get_runtime_subdir
+        from nanobot.runs.executor import AgentLoopRunExecutor
+        from nanobot.runs.service import RunService
+        from nanobot.runs.store import RunStore
+
+        runs_store = RunStore(get_runtime_subdir("runs") / "runs.sqlite3")
+        runs_store.open()
+        runs_service = RunService(
+            runs_store,
+            AgentLoopRunExecutor(agent_loop),
+            max_active=api_cfg.runs.max_concurrent,
+        )
+        console.print(
+            f"  [cyan]Agent runs[/cyan]: enabled (principal {api_cfg.runs.principal_id}"
+            f"{', exclusive' if api_cfg.runs.exclusive_execution else ''})"
+        )
+
     api_app = create_app(
         agent_loop, model_name=model_name, request_timeout=timeout,
         api_key=api_key,
         prepare_agent=mcp_provider.connect,
+        runs_service=runs_service,
+        runs_config=api_cfg.runs if api_cfg.runs.enabled else None,
     )
 
     async def on_startup(_app: Any) -> None:
         await mcp_provider.connect()
+        if runs_service is not None:
+            interrupted = await runs_service.start()
+            if interrupted:
+                logger.warning(
+                    "agent runs: {} run(s) interrupted by the previous shutdown",
+                    len(interrupted),
+                )
 
     async def on_cleanup(_app: Any) -> None:
         try:
-            await agent_loop.aclose()
+            if runs_service is not None:
+                await runs_service.aclose()
         finally:
-            await mcp_provider.aclose()
+            try:
+                await agent_loop.aclose()
+            finally:
+                if runs_store is not None:
+                    runs_store.close()
+                await mcp_provider.aclose()
 
     api_app.on_startup.append(on_startup)
     api_app.on_cleanup.append(on_cleanup)

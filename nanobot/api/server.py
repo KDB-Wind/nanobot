@@ -19,6 +19,7 @@ from aiohttp import web
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentRunHookContext
+from nanobot.api.agent_runs import RUNS_ROUTE_PREFIX, register_runs_routes
 from nanobot.config.paths import get_media_dir
 from nanobot.providers.base import LLMUsage
 from nanobot.providers.unconfigured_provider import UnconfiguredProvider
@@ -53,6 +54,7 @@ _MODEL_NAME_KEY = web.AppKey[str]("model_name")
 _REQUEST_TIMEOUT_KEY = web.AppKey[float]("request_timeout")
 _SESSION_LOCKS_KEY = web.AppKey[dict[str, asyncio.Lock]]("session_locks")
 _PREPARE_AGENT_KEY = web.AppKey[Callable[[], Awaitable[None]] | None]("prepare_agent")
+_EXCLUSIVE_RUNS_KEY = web.AppKey[bool]("exclusive_runs")
 _REQUEST_ID_KEY = web.RequestKey[str]("request_id")
 
 
@@ -248,6 +250,18 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
 
 async def handle_chat_completions(request: web.Request) -> web.Response | web.StreamResponse:
     """POST /v1/chat/completions — supports JSON and multipart/form-data."""
+    if request.app.get(_EXCLUSIVE_RUNS_KEY, False):
+        return web.json_response(
+            {
+                "error": {
+                    "message": "This instance is managed for exclusive agent-run execution; "
+                    "the chat endpoint is disabled.",
+                    "type": "managed_execution_only",
+                    "code": 409,
+                }
+            },
+            status=409,
+        )
     content_type = _as_str(cast(object, request.content_type or ""))
 
     agent_loop = request.app[_AGENT_LOOP_KEY]
@@ -297,8 +311,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
     session_lock = session_locks.setdefault(session_key, asyncio.Lock())
 
     logger.info(
-        "API request session_key={} media={} text={} stream={}",
-        session_key, len(media_paths), text[:80], stream,
+        "API request session_key={} media={} text_chars={} stream={}",
+        session_key, len(media_paths), len(text), stream,
     )
     if stream:
         resp = web.StreamResponse()
@@ -327,8 +341,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
         async def _run() -> None:
             nonlocal stream_failed
             try:
-                async with session_lock:
-                    async with asyncio.timeout(timeout_s):
+                async with asyncio.timeout(timeout_s):
+                    async with session_lock:
                         await _prepare_agent(request.app)
                         response = await agent_loop.process_direct(
                             content=text,
@@ -369,30 +383,25 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
 
     usage_capture = _UsageCaptureHook()
     try:
-        async with session_lock:
-            try:
-                async with asyncio.timeout(timeout_s):
-                    await _prepare_agent(request.app)
-                    response = await agent_loop.process_direct(
-                        content=text,
-                        media=media_paths if media_paths else None,
-                        session_key=session_key,
-                        channel="api",
-                        chat_id=chat_id,
-                        hooks=[usage_capture],
-                    )
+        async with asyncio.timeout(timeout_s):
+            async with session_lock:
+                await _prepare_agent(request.app)
+                response = await agent_loop.process_direct(
+                    content=text,
+                    media=media_paths if media_paths else None,
+                    session_key=session_key,
+                    channel="api",
+                    chat_id=chat_id,
+                    hooks=[usage_capture],
+                )
                 response_text = _response_text(response)
                 if not response_text or not response_text.strip():
                     logger.warning("Empty response for session {}, using fallback", session_key)
                     response_text = EMPTY_FINAL_RESPONSE_MESSAGE
-
-            except asyncio.TimeoutError:
-                return _error_json(504, f"Request timed out after {timeout_s}s")
-            except Exception:
-                logger.exception("Error processing request for session {}", session_key)
-                return _error_json(500, "Internal server error", err_type="server_error")
+    except asyncio.TimeoutError:
+        return _error_json(504, f"Request timed out after {timeout_s}s")
     except Exception:
-        logger.exception("Unexpected API lock error for session {}", session_key)
+        logger.exception("Error processing request for session {}", session_key)
         return _error_json(500, "Internal server error", err_type="server_error")
 
     return web.json_response(
@@ -429,6 +438,8 @@ def create_app(
     request_timeout: float = 120.0,
     api_key: str = "",
     prepare_agent: Callable[[], Awaitable[None]] | None = None,
+    runs_service: Any | None = None,
+    runs_config: Any | None = None,
 ) -> web.Application:
     """Create the aiohttp application.
 
@@ -438,6 +449,8 @@ def create_app(
         request_timeout: Per-request timeout in seconds.
         api_key: Optional API key for Bearer-token authentication on API routes.
         prepare_agent: Optional application-owned readiness callback run before each turn.
+        runs_service: Optional RunService mounting the public agent-run protocol.
+        runs_config: The ApiRunsConfig authorizing that protocol.
     """
     app = web.Application(client_max_size=20 * 1024 * 1024)
     app[_AGENT_LOOP_KEY] = agent_loop
@@ -445,6 +458,7 @@ def create_app(
     app[_REQUEST_TIMEOUT_KEY] = request_timeout
     app[_SESSION_LOCKS_KEY] = {}
     app[_PREPARE_AGENT_KEY] = prepare_agent
+    exclusive_execution = bool(runs_config is not None and runs_config.exclusive_execution)
 
     @web.middleware
     async def request_logging_middleware(
@@ -508,6 +522,10 @@ def create_app(
         # Allow unauthenticated health checks.
         if request.path == "/health":
             return await handler(request)
+        # The agent-run protocol carries its own dedicated key; the plain
+        # api.api_key never authorizes run or inbox access.
+        if request.path.startswith(RUNS_ROUTE_PREFIX):
+            return await handler(request)
         if not api_key:
             return await handler(request)
         auth = request.headers.get("Authorization", "")
@@ -523,4 +541,7 @@ def create_app(
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
+    if runs_service is not None and runs_config is not None:
+        app[_EXCLUSIVE_RUNS_KEY] = exclusive_execution
+        register_runs_routes(app, runs_service, runs_config)
     return app

@@ -380,6 +380,37 @@ class HeartbeatConfig(Base):
     interval_s: int = 30 * 60
 
 
+class ApiRunsConfig(Base):
+    """Public agent-run protocol (v1) configuration. Disabled by default.
+
+    ``api_key`` is a dedicated secret: the plain ``api.api_key`` never grants
+    run-protocol or inbox access. ``principal_id`` is the fixed coordinator
+    identity; rotating the key does not change it.
+    """
+
+    enabled: bool = False
+    api_key: str = Field(default="", repr=False)
+    principal_id: str = "teams-coordinator"
+    execution_enabled: bool = False
+    inbox_enabled: bool = False
+    exclusive_execution: bool = False
+    max_concurrent: int = 1
+
+    @model_validator(mode="after")
+    def enabled_requires_dedicated_key(self) -> "ApiRunsConfig":
+        if not self.enabled:
+            return self
+        if not self.api_key.strip():
+            raise ValueError("api.runs.enabled requires a dedicated api.runs.api_key")
+        if not self.principal_id.strip():
+            raise ValueError("api.runs.principal_id must be a non-empty identity")
+        if self.exclusive_execution and not self.execution_enabled:
+            raise ValueError("api.runs.exclusive_execution requires execution_enabled")
+        if self.max_concurrent < 1:
+            raise ValueError("api.runs.max_concurrent must be at least 1")
+        return self
+
+
 class ApiConfig(Base):
     """OpenAI-compatible API server configuration."""
 
@@ -387,6 +418,7 @@ class ApiConfig(Base):
     port: int = 8900
     timeout: float = 120.0  # Per-request timeout in seconds.
     api_key: str = Field(default="", repr=False)
+    runs: ApiRunsConfig = Field(default_factory=ApiRunsConfig)
 
     @model_validator(mode="after")
     def wildcard_host_requires_auth(self) -> "ApiConfig":

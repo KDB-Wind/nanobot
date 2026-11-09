@@ -115,6 +115,20 @@
 - 检查:`basedpyright --pythonpath .venv-nanobot nanobot/runs` **0 errors, 0 warnings, 0 notes**;`ruff check nanobot/runs tests/runs` 通过;`pytest tests/runs/ -q` **20 passed**。
 - 剩余:P1 的 A01/A02/A04/A05/A06/A15 为领域层证据,公开 HTTP 面在 P2 复验(A01–A06、A14、A17)。
 
+### P2(部分:运行 HTTP + 执行器 + 配置 + serve 装配)
+
+- 2026-11-09 实现并通过:
+  - `nanobot/config/schema.py`:`ApiRunsConfig`(默认 enabled=false;启用必须专用 api_key;exclusive 需 execution;max_concurrent≥1),挂在 `ApiConfig.runs`。`tests/runs/test_runs_config.py` **4 passed**。
+  - `nanobot/api/agent_runs.py`:公开运行协议 v1 路由(capabilities、submit+Idempotency-Key、lookup、get、result、cancel、SSE events 带 Last-Event-ID/心跳/游标 410)。有界 raw 读取 256KiB、拒绝压缩体/重复键/非有限数/16 层以上嵌套,错误统一 `{code,message,retryable,request_id}`;运行路由专用密钥鉴权,`api.api_key` 不放行(测试覆盖)。
+  - `nanobot/api/server.py`:`create_app` 可选挂载 runs 路由;`/v1/agent-*` 绕过全局 api_key 中间件;exclusive 模式下 `/v1/chat/completions` 409 `managed_execution_only`。
+  - `nanobot/runs/executor.py`:`AgentLoopRunExecutor` — 每次运行 `session_key=run:<id>` 的隔离 ephemeral 会话;stop_reason 白名单映射(completed/empty_final_response→succeeded,error→provider_error,max_iterations→iteration_limit,其余→execution_error);取消时先 `loop.cancel_session_work()` 再上抛。`agent/loop.py` 新增公开 `cancel_session_work`(复用 `_cancel_active_tasks`,取消任务/pending/subagent/exec 会话)。`tests/runs/test_executor.py` **5 passed**。
+  - `nanobot/cli/commands.py` serve:`api.runs.enabled` 时在 `<config dir>/runs/runs.sqlite3` 开库、装配 RunService、startup 恢复(打日志)、cleanup 关闭(先 runs.aclose 请求取消+有界等待,再 loop.aclose,再关库)。
+- `tests/runs/test_agent_runs_http.py` **12 passed**(capabilities 实例身份、401 无/错/普通 key、同键同体 202/复用/执行一次/改体 409、缺 key/未知字段/超限输入 400/413、result 409→200 生命周期、lookup 对账且不新增执行、cancel 202→cancelled+stop_confirmed、SSE 流含 id/run_succeeded 且事件含 run_id、execution_disabled 403、exclusive 聊天 409、runs 关闭时路由 404 且 /health 正常、压缩体 400)。
+- 回归:`tests/test_openai_api.py + test_api_attachment + test_api_stream` **94 passed**(改动 api/server.py 后)。
+- 检查:basedpyright 0 errors(agent_runs.py、api/server.py、schema.py、runs/、agent/loop.py、cli/commands.py);ruff 全通过;`tests/runs + test_openai_api` **92 passed**。
+- 修复记录:aiohttp HTTPException 状态码类级烘焙 → protocol_error 工厂按状态构造异常类;413 需 max_size 参数;SSE 测试用 readany。
+- 范围决定:gateway inbox sidecar 与 inbox 路由一并推迟到 P4 实现(先建空 sidecar 是死代码,违反最小变更;决策已记 TSV)。真实 AgentLoop 的受理/查询/类型化结果为 P7 live 证据;P2 以 stub loop 契约测试 + 假执行器 HTTP 测试覆盖。
+
 ## 5. 运行中进程与待恢复状态
 
 - 无。

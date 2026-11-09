@@ -640,4 +640,5 @@ class RunStore:
             created_at=None if row[21] is None else datetime.fromisoformat(row[21]),
             started_at=None if row[22] is None else datetime.fromisoformat(row[22]),
             finished_at=None if row[23] is None else datetime.fromisoformat(row[23]),
+            result_cleaned_at=None if row[24] is None else datetime.fromisoformat(row[24]),
         )

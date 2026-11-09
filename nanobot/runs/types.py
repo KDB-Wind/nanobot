@@ -133,6 +133,7 @@ class Run:
     outcome: RunOutcome | None = None
     cancel_requested_at: datetime | None = None
     cancel_reason: str = ""
+    result_cleaned_at: datetime | None = None
     created_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
