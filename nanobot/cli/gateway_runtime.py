@@ -593,6 +593,9 @@ def _run_claimed_gateway(
 
         external_inbox = ExternalInbox(session_manager.state)
         _PENDING_EXTERNAL_INBOX["inbox"] = external_inbox
+        # The loop's user-turn hook reads this attribute to revoke stale
+        # workflow grants; absent when the feature is off.
+        agent.external_inbox = external_inbox
 
         def _teams_meta_provider(server_name: str):
             def provider() -> dict[str, str]:
@@ -681,6 +684,12 @@ def _run_claimed_gateway(
         recovery_admission=recovery,
         builtin_assembly=install_goal,
     )
+
+    # The loop's user-turn hook reads this attribute to revoke stale
+    # workflow grants; absent (plain getattr) when the feature is off.
+    pending_inbox = _PENDING_EXTERNAL_INBOX.get("inbox")
+    if pending_inbox is not None:
+        agent.external_inbox = pending_inbox
 
     def _schedule_webui_background(awaitable: Awaitable[None]) -> None:
         agent.schedule_background(cast(Coroutine[Any, Any, None], awaitable))
