@@ -55,3 +55,18 @@ dependencies.
 The full webui suite was not used as acceptance: unrelated pre-existing tests
 (i18n resource parity, settings channels) fail in this worktree, and this branch
 touches no file under `webui/`.
+
+## Scope corrections after the round-5 review
+
+Three statements above were narrower than their evidence:
+
+- P16-04 and P16-05 ran one run at a time. The stop conclusion lived on the
+  executor, so with `max_concurrent=2` a clean cancellation could clear the
+  evidence of a slower one. The fix moves the conclusion onto the cancelled
+  execution (`RunCancelled`); see `../fix-round5/RESULT.md`.
+- P16-06 created a fresh 0.4 database and imported it. It did not cover a
+  database upgraded in place, where the guard row was never written. Opening
+  the store now backfills those rows.
+- P16-03 proved the crash-after-consumption direction only. The completion
+  direction (`pending_user_turn` left behind by a successful wake turn) is
+  covered in round 5.

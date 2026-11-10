@@ -12,11 +12,11 @@ A missing row at one instant cannot fence an in-flight POST. `_reconcile_cancell
 
 ## P16-03 wake consumption handoff
 
-The session owner's `pending_user_turn` marker is written in the same session-store transaction that clears `wake_due`. A crash after consumption leaves the marker, so `RecoveryCoordinator.scan` turns it into an awaiting-user card. A completed turn clears the marker in `_save_turn`, so no stale state survives success.
+The session owner's `pending_user_turn` marker is written in the same session-store transaction that clears `wake_due`. A crash after consumption leaves the marker, so `RecoveryCoordinator.scan` turns it into an awaiting-user card. The marker records the accepting turn's delivery, generation and turn id, and the completing turn settles it only on a match (round-5 correction: the marker is written after the turn's draft was read, so the transcript merge alone could not observe it, and a completed wake kept a stale marker).
 
 ## P16-04 cancellation uncertainty
 
-The executor sets `_cancel_unverified=True` before awaiting the reap and clears it only after a typed confirmed report. `RunService.cancel` never injects a second `CancelledError` into a CANCELLING run. `_sweep_deadlines` only cancels when it moved RUNNING to CANCELLING.
+Each cancelled execution raises `RunCancelled` carrying its own stop conclusion; a plain `CancelledError` (deadline, shutdown, external task cancel) stays unverified. Round-5 correction: the first version kept one flag on the executor, so a second run's clean cleanup cleared the evidence a slower cancellation had set. `RunService.cancel` never injects a second `CancelledError` into a CANCELLING run. `_sweep_deadlines` only cancels when it moved RUNNING to CANCELLING.
 
 ## P16-05 terminal state and isolation in one transaction
 
@@ -24,7 +24,7 @@ The executor sets `_cancel_unverified=True` before awaiting the reap and clears 
 
 ## P16-06 legacy endpoint identity
 
-A new `legacy_endpoint_guards` table records the guard key, the original endpoint, the credential environment the 0.4 task used, and the instance once it is mapped. Preflight probes the original endpoint with that credential before binding a new instance. Same instance means defer and persist the mapping; a different instance maps and allows. A rejected probe, a missing credential, or an unreachable guard defers, and the operator resolves the incident.
+A new `legacy_endpoint_guards` table records the guard key, the original endpoint, the credential environment the 0.4 task used, and the instance once it is mapped. Opening a pre-existing database backfills a guard for every active `legacy:` quarantine (round-5 correction: the first version only wrote guards at import time, so upgraded databases had an active quarantine with no identity row and dispatch read "no guard" as "no isolation"). Preflight probes the original endpoint with that credential before binding a new instance. Same instance means defer and persist the mapping; a different instance maps and allows. A rejected probe, a missing credential, or an unreachable guard defers, and the operator resolves the incident.
 
 ## P16-07 result byte reservation
 
