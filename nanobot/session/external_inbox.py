@@ -672,14 +672,49 @@ class ExternalInbox:
         return self._read(query)
 
     def mark_wake_consumed(self, delivery_id: str) -> bool:
-        """Clear the obligation after a turn accepted the wake; CAS guards double-clear."""
+        """Accept the wake and hand the turn to the session owner.
+
+        Clearing wake_due and marking the session's pending turn commit in one
+        transaction. A crash after this point leaves the pending marker for
+        RecoveryCoordinator.scan; a completed turn clears it in _save_turn.
+        """
 
         def update(conn: sqlite3.Connection) -> bool:
             cursor = conn.execute(
                 "UPDATE external_inbox SET wake_due=0 WHERE delivery_id=? AND wake_due=1",
                 (delivery_id,),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount != 1:
+                return False
+            row = conn.execute(
+                "SELECT session_key FROM external_inbox WHERE delivery_id=?",
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                return True
+            session_key = str(row[0])
+            session_row = conn.execute(
+                "SELECT metadata FROM sessions WHERE key=?", (session_key,)
+            ).fetchone()
+            if session_row is None:
+                return True
+            metadata = json.loads(session_row[0]) if session_row[0] else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["pending_user_turn"] = True
+            conn.execute(
+                "UPDATE sessions SET metadata=?, revision=revision+1 WHERE key=?",
+                (
+                    json.dumps(
+                        metadata,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    ),
+                    session_key,
+                ),
+            )
+            return True
 
         return self._write(update)
 
