@@ -131,6 +131,21 @@ export function cancelTeamsTask(
   return transport.requestMutation("teams.cancel_task", { task_id: taskId });
 }
 
+export interface TeamsWorkflowStopResult {
+  workflow_id: string;
+  revoked: number;
+  cancelled: number;
+  unconfirmed: number;
+  total: number;
+}
+
+export function stopTeamsWorkflow(
+  transport: WebUIMutationTransport,
+  workflowId: string,
+): Promise<TeamsWorkflowStopResult> {
+  return transport.requestMutation("teams.stop_workflow", { workflow_id: workflowId });
+}
+
 export function scaffoldTeamsBot(
   transport: WebUIMutationTransport,
   values: { bot_id: string; role?: string; display_name?: string },

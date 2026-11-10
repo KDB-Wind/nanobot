@@ -214,6 +214,19 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
     return response
 
 
+async def handle_workflow_revoke(request: web.Request) -> web.Response:
+    """Operator stop: revoke one workflow's auto-continue grant."""
+    denied = _require_inbox_auth(request)
+    if denied is not None:
+        return denied
+    inbox: ExternalInbox = request.app[_INBOX_KEY]
+    workflow_id = request.match_info["workflow_id"].strip()
+    if not workflow_id:
+        return _error(400, "invalid_field", "workflow_id is required.")
+    revoked = await inbox.revoke_workflow_async(workflow_id)
+    return _json({"workflow_id": workflow_id, "revoked": revoked})
+
+
 async def handle_inbox_receipt(request: web.Request) -> web.Response:
     denied = _require_inbox_auth(request)
     if denied is not None:
@@ -238,6 +251,9 @@ def register_inbox_routes(
     app[_INBOX_KEY] = inbox
     app[_INBOX_CONFIG_KEY] = config
     app.router.add_post("/v1/agent-inbox/capabilities/validate", handle_capability_validate)
+    app.router.add_post(
+        "/v1/agent-inbox/workflows/{workflow_id}/revoke", handle_workflow_revoke
+    )
     app.router.add_post("/v1/agent-inbox", handle_inbox_receive)
     app.router.add_get("/v1/agent-inbox/{delivery_id}", handle_inbox_receipt)
 

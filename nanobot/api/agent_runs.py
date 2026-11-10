@@ -346,6 +346,41 @@ async def handle_cancel(request: web.Request) -> web.Response:
     )
 
 
+async def handle_clear_isolation(request: web.Request) -> web.Response:
+    """Operator recovery: clear the instance quarantine and audit who did it.
+
+    This is maintenance, not execution: it never starts an executor and never
+    touches a run row.
+    """
+    _require_runs_auth(request)
+    service: RunService = request.app[_RUNS_SERVICE_KEY]
+    body = await parse_protocol_json(request)
+    actor = body.get("actor")
+    reason = body.get("reason")
+    if not isinstance(actor, str) or not actor.strip():
+        raise protocol_error(400, "invalid_field", "actor must be a non-empty string.")
+    if not isinstance(reason, str) or not reason.strip():
+        raise protocol_error(400, "invalid_field", "reason must be a non-empty string.")
+    try:
+        previous_isolated, previous_reason = service.clear_isolation(
+            actor.strip(), reason.strip()
+        )
+    except StoreUnavailableError:
+        raise protocol_error(
+            503,
+            "storage_unavailable",
+            "The runs store is temporarily unavailable; retry the same request.",
+            retryable=True,
+        )
+    return _protocol_json_response(
+        {
+            "cleared": True,
+            "previous_isolated": previous_isolated,
+            "previous_reason": previous_reason,
+        }
+    )
+
+
 async def handle_events(request: web.Request) -> web.StreamResponse:
     _require_runs_auth(request)
     service: RunService = request.app[_RUNS_SERVICE_KEY]
@@ -440,6 +475,9 @@ def register_runs_routes(app: web.Application, service: RunService, config: ApiR
     app.router.add_get("/v1/agent-capabilities", handle_capabilities)
     app.router.add_post("/v1/agent-runs", handle_submit)
     app.router.add_get("/v1/agent-runs/lookup", handle_lookup)
+    app.router.add_post(
+        "/v1/agent-runs/maintenance/clear-isolation", handle_clear_isolation
+    )
     app.router.add_get("/v1/agent-runs/events", handle_events)
     app.router.add_get("/v1/agent-runs/{run_id}", handle_get_run)
     app.router.add_get("/v1/agent-runs/{run_id}/result", handle_get_result)
@@ -452,6 +490,7 @@ __all__ = [
     "RUNS_ROUTE_PREFIX",
     "handle_capabilities",
     "handle_cancel",
+    "handle_clear_isolation",
     "handle_events",
     "handle_get_result",
     "handle_get_run",

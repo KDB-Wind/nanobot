@@ -420,6 +420,63 @@ async def test_compressed_and_duplicate_key_bodies_rejected(client_factory):
     assert (await compressed.json())["code"] == "compressed_body_rejected"
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_clear_isolation_requires_key_and_non_empty_fields(client_factory):
+    client, service, _ = await client_factory()
+    path = "/v1/agent-runs/maintenance/clear-isolation"
+    no_auth = await client.post(path, json={"actor": "op", "reason": "reviewed"})
+    assert no_auth.status == 401
+    assert (await no_auth.json())["code"] == "missing_bearer"
+    plain = await client.post(
+        path,
+        headers=runs_headers(key=PLAIN_API_KEY),
+        json={"actor": "op", "reason": "reviewed"},
+    )
+    assert plain.status == 401
+    assert (await plain.json())["code"] == "invalid_bearer"
+    for body in (
+        {"actor": "", "reason": "reviewed"},
+        {"actor": "op", "reason": "   "},
+        {"actor": "op"},
+        {"reason": "reviewed"},
+    ):
+        response = await client.post(path, headers=runs_headers(), json=body)
+        assert response.status == 400, body
+        assert (await response.json())["code"] == "invalid_field"
+    assert service.isolation() == (False, "")
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_clear_isolation_clears_a_real_isolated_store(client_factory):
+    client, service, _ = await client_factory()
+    incident = "Run run_x stopped without confirmed cleanup."
+    service._store.set_isolation(incident)
+    assert service.isolation()[0] is True
+    path = "/v1/agent-runs/maintenance/clear-isolation"
+    response = await client.post(
+        path,
+        headers=runs_headers(),
+        json={"actor": "operator-1", "reason": "inspected, no stray processes"},
+    )
+    assert response.status == 200, await response.text()
+    assert await response.json() == {
+        "cleared": True,
+        "previous_isolated": True,
+        "previous_reason": incident,
+    }
+    cleared, reason = service.isolation()
+    assert cleared is False
+    assert reason == "inspected, no stray processes"
+    # Clearing an instance that is not isolated reports the real previous state.
+    again = await client.post(
+        path,
+        headers=runs_headers(),
+        json={"actor": "operator-1", "reason": "second check"},
+    )
+    assert again.status == 200
+    assert (await again.json())["previous_isolated"] is False
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
 async def test_storage_fault_is_retryable_503_while_missing_run_stays_404(client_factory):
     """M01: a storage failure is a structured retryable 503, never 404."""
     client, service, _ = await client_factory()

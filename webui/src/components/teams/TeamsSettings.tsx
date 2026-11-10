@@ -8,6 +8,7 @@ import {
   fetchTeamsSnapshot,
   fetchTeamsTaskResult,
   scaffoldTeamsBot,
+  stopTeamsWorkflow,
   TeamsScaffoldResult,
   TeamsSnapshot,
   TeamsTaskResult,
@@ -58,6 +59,9 @@ export function TeamsSettings() {
   const [scaffold, setScaffold] = useState<TeamsScaffoldResult | null>(null);
   const [scaffoldId, setScaffoldId] = useState("");
   const [newProject, setNewProject] = useState("");
+  // The whole-workflow stop is one operation per workflow; every row sharing
+  // that workflow stays disabled until the coordinator reports back.
+  const [stopPending, setStopPending] = useState<string | null>(null);
 
   const tx = useCallback(
     (key: string, fallback: string, vars?: Record<string, string>) =>
@@ -150,6 +154,19 @@ export function TeamsSettings() {
       setSubmitState(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setSubmitPending(false);
+    }
+  };
+
+  const stopWorkflow = async (workflowId: string) => {
+    if (stopPending !== null) return;
+    setStopPending(workflowId);
+    try {
+      await stopTeamsWorkflow(client, workflowId);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setStopPending(null);
+      await refresh();
     }
   };
 
@@ -339,8 +356,12 @@ export function TeamsSettings() {
                   )}
                 </td>
                 <td>
-                  {task.dispatch_state === "pending" || task.dispatch_state === "accepted" ? (
-                    task.run_state !== "succeeded" && task.run_state !== "failed" && task.run_state !== "cancelled" && task.run_state !== "interrupted" ? (
+                  {(task.dispatch_state === "pending" || task.dispatch_state === "accepted") &&
+                  task.run_state !== "succeeded" &&
+                  task.run_state !== "failed" &&
+                  task.run_state !== "cancelled" &&
+                  task.run_state !== "interrupted" ? (
+                    <div className="flex gap-1">
                       <button
                         type="button"
                         className="rounded border px-2 py-0.5 text-xs"
@@ -351,7 +372,16 @@ export function TeamsSettings() {
                       >
                         {tx("settings.teams.cancelAction", "Request cancel")}
                       </button>
-                    ) : null
+                      <button
+                        type="button"
+                        data-stop-workflow={task.workflow_id}
+                        className="rounded border px-2 py-0.5 text-xs disabled:opacity-50"
+                        disabled={stopPending !== null}
+                        onClick={() => void stopWorkflow(task.workflow_id)}
+                      >
+                        {tx("settings.teams.stopWorkflow", "Stop workflow")}
+                      </button>
+                    </div>
                   ) : null}
                 </td>
               </tr>

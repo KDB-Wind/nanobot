@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from urllib.parse import quote
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -386,6 +387,160 @@ async def test_q1b_replay_wins_over_capability_validation(client):
         json={**body, "input": "different"},
     )
     assert different.status == 409
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_stop_workflow_revokes_grant_before_cancelling(
+    tmp_path, store, monkeypatch
+):
+    """T5: the planner grant is withdrawn before any cancel is requested."""
+    from aiohttp import web
+
+    monkeypatch.setenv("TEAMS_PLANNER_INBOX_KEY", "planner-inbox-secret")
+    seen: dict[str, object] = {}
+    open_ids: list[str] = []
+
+    async def fake_revoke(request):
+        workflow = request.match_info["workflow_id"]
+        seen["workflow"] = workflow
+        seen["auth"] = request.headers.get("Authorization", "")
+        seen["states_at_revoke"] = [
+            store.get_task(task_id).cancel_state.value for task_id in open_ids
+        ]
+        return web.json_response({"workflow_id": workflow, "revoked": True})
+
+    inbox_app = web.Application()
+    inbox_app.router.add_post(
+        "/v1/agent-inbox/workflows/{workflow_id}/revoke", fake_revoke
+    )
+    inbox_server = TestServer(inbox_app)
+    await inbox_server.start_server()
+    config = CoordinatorConfig(
+        control_dir=tmp_path / "control",
+        planner=PlannerBinding(
+            inbox_url=str(inbox_server.make_url("/")).rstrip("/"),
+            instance_id="planner-inst",
+            principal_id="planner",
+        ),
+    )
+    app = build_app(store, config, {"operator": ADMIN, "planner": PLANNER})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await seed_catalog((test_client, store))
+        stopped: list[str] = []
+        for _ in range(2):
+            created = await test_client.post(
+                "/v1/teams/tasks",
+                headers=planner_headers(),
+                json=task_body(workflow="wf-stop"),
+            )
+            assert created.status == 201
+            stopped.append((await created.json())["task_id"])
+        open_ids.extend(stopped)
+        other = await test_client.post(
+            "/v1/teams/tasks",
+            headers=planner_headers(),
+            json=task_body(workflow="wf-other"),
+        )
+        other_id = (await other.json())["task_id"]
+
+        response = await test_client.post(
+            "/v1/teams/workflows/wf-stop/stop", headers=admin_headers()
+        )
+        assert response.status == 200, await response.text()
+        payload = await response.json()
+        assert payload["workflow_id"] == "wf-stop"
+        assert payload["revoked"] is True
+        assert set(payload["cancelled"]) == set(stopped)
+        assert payload["unconfirmed"] == []
+        assert payload["total"] == 2
+        assert seen["workflow"] == "wf-stop"
+        assert seen["auth"] == "Bearer planner-inbox-secret"
+        assert seen["states_at_revoke"] == ["none", "none"]
+        for task_id in stopped:
+            assert store.get_task(task_id).cancel_state.value == "confirmed"
+        assert store.get_task(other_id).cancel_state.value == "none"
+
+        # The planner principal may stop too; its own workflow's task cancels.
+        planner_stop = await test_client.post(
+            "/v1/teams/workflows/wf-other/stop", headers=planner_headers()
+        )
+        assert planner_stop.status == 200, await planner_stop.text()
+        other_payload = await planner_stop.json()
+        assert other_payload["cancelled"] == [other_id]
+    finally:
+        await test_client.close()
+        await inbox_server.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_stop_workflow_cancels_tasks_when_grant_cannot_be_revoked(
+    tmp_path, store, monkeypatch
+):
+    """A missing planner key reports revoked=false and still stops the tasks."""
+    monkeypatch.delenv("TEAMS_PLANNER_INBOX_KEY", raising=False)
+    config = make_config(tmp_path)
+    app = build_app(store, config, {"operator": ADMIN, "planner": PLANNER})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await seed_catalog((test_client, store))
+        created = await test_client.post(
+            "/v1/teams/tasks",
+            headers=planner_headers(),
+            json=task_body(workflow="wf-nokey"),
+        )
+        task_id = (await created.json())["task_id"]
+        response = await test_client.post(
+            "/v1/teams/workflows/wf-nokey/stop", headers=admin_headers()
+        )
+        assert response.status == 200, await response.text()
+        payload = await response.json()
+        assert payload["revoked"] is False
+        assert payload["cancelled"] == [task_id]
+        assert payload["total"] == 1
+        assert store.get_task(task_id).cancel_state.value == "confirmed"
+    finally:
+        await test_client.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_resolve_quarantine_is_operator_only_and_records_actor(client):
+    test_client, store = client
+    key = "legacy:http://127.0.0.1:8921"
+    store.quarantine_instance(key, "stop unconfirmed for the imported instance")
+    route = f"/v1/teams/quarantine/{quote(key, safe='')}/resolve"
+    denied = await test_client.post(
+        route, headers=planner_headers(), json={"actor": "planner", "note": "ok"}
+    )
+    assert denied.status == 403
+    empty = await test_client.post(
+        route, headers=admin_headers(), json={"actor": " ", "note": ""}
+    )
+    assert empty.status == 400
+    assert (await empty.json())["code"] == "invalid_field"
+    resolved = await test_client.post(
+        route,
+        headers=admin_headers(),
+        json={"actor": "operator-7", "note": "reviewed logs and closed the run"},
+    )
+    assert resolved.status == 200, await resolved.text()
+    assert await resolved.json() == {"key": key, "resolved": True}
+    assert key not in store.active_quarantines()
+    events = [
+        event
+        for event in store.events_after(0, limit=100)
+        if event.type == "quarantine_resolved"
+    ]
+    assert events
+    assert events[-1].data == {
+        "instance": key,
+        "actor": "operator-7",
+        "note": "reviewed logs and closed the run",
+    }
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")

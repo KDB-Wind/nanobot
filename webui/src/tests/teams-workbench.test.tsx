@@ -235,6 +235,27 @@ describe("TeamsSettings", () => {
     );
   });
 
+  it("stops the whole workflow with the task workflow id", async () => {
+    renderTeams();
+    const row = await screen.findByRole("row", { name: /task_1/ });
+    fireEvent.click(within(row).getByRole("button", { name: /stop workflow/i }));
+    await waitFor(() =>
+      expect(requestMutation).toHaveBeenCalledWith("teams.stop_workflow", {
+        workflow_id: "wf-1",
+      }),
+    );
+  });
+
+  it("disables workflow stop while a stop is in flight", async () => {
+    requestMutation.mockImplementationOnce(() => new Promise(() => {}));
+    renderTeams();
+    const row = await screen.findByRole("row", { name: /task_1/ });
+    const stop = within(row).getByRole("button", { name: /stop workflow/i });
+    fireEvent.click(stop);
+    await waitFor(() => expect(requestMutation).toHaveBeenCalledTimes(1));
+    expect(stop).toBeDisabled();
+  });
+
   it("shows the scaffold key file location and never the raw service key", async () => {
     renderTeams();
     await screen.findAllByText("Research");

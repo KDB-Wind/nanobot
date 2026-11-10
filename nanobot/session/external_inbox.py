@@ -364,6 +364,33 @@ class ExternalInbox:
         )
         return int(result)  # _change returns the callback value verbatim
 
+    def revoke_workflow(self, workflow_id: str) -> bool:
+        """Revoke one workflow's grant; true when a live grant was turned off."""
+
+        def update(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                "UPDATE external_workflows SET auto_continue=0 "
+                "WHERE workflow_id=? AND auto_continue=1",
+                (workflow_id,),
+            )
+            conn.execute(
+                "UPDATE reply_capabilities SET auto_continue=0 "
+                "WHERE workflow_id=? AND auto_continue=1",
+                (workflow_id,),
+            )
+            return (cursor.rowcount or 0) > 0
+
+        return self._write(update)
+
+    async def revoke_workflow_async(self, workflow_id: str) -> bool:
+        """Revoke through the session owner so the write uses its writer thread."""
+        result = await self._state._execute(  # pyright: ignore[reportPrivateUsage]
+            None,
+            lambda: self.revoke_workflow(workflow_id),
+            operation_name="revoke_external_workflow",
+        )
+        return bool(result)
+
     def workflow_allows_auto_continue(self, workflow_id: str) -> bool:
         def query(conn: sqlite3.Connection) -> tuple[Any, ...] | None:
             return conn.execute(

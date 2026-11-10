@@ -106,6 +106,12 @@ class RunService:
     def isolation(self) -> tuple[bool, str]:
         return self._store.isolation()
 
+    def clear_isolation(self, actor: str, reason: str) -> tuple[bool, str]:
+        """Clear the instance quarantine; returns the previous (isolated, reason)."""
+        previous = self._store.isolation()
+        self._store.clear_isolation(actor, reason)
+        return previous
+
     async def start(self) -> list[Run]:
         interrupted = self._store.recover()
         if interrupted:

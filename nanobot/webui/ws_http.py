@@ -617,6 +617,16 @@ class GatewayHTTPHandler:
             if not isinstance(task_id, str) or not task_id.startswith("task_"):
                 return _http_error(400, "invalid teams task id")
             return f"/api/teams/tasks/{quote(task_id, safe='')}/cancel"
+        if action == "teams.stop_workflow":
+            workflow_id = payload.get("workflow_id")
+            if (
+                not isinstance(workflow_id, str)
+                or not workflow_id
+                or len(workflow_id) > 128
+                or re.fullmatch(r"[A-Za-z0-9._:-]+", workflow_id) is None
+            ):
+                return _http_error(400, "invalid workflow id")
+            return f"/api/teams/workflows/{quote(workflow_id, safe='')}/stop"
         connect_action = _WEBUI_CHANNEL_CONNECT_ACTIONS.get(action)
         if connect_action is not None:
             channel = payload.get("channel")
