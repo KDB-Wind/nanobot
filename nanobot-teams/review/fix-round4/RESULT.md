@@ -46,6 +46,12 @@ bun run typecheck                                    clean
 ruff check <changed Python files>                    all checks passed
 ```
 
+A filtered strict `basedpyright` run over the changed `nanobot/` files reports
+no new error. Its only hit is the pre-existing `nanobot/runs/store.py:154`
+(`os.close` argument type), which this branch does not touch; the whole-tree
+count is not comparable to CI because this virtualenv lacks the optional channel
+dependencies.
+
 The full webui suite was not used as acceptance: unrelated pre-existing tests
 (i18n resource parity, settings channels) fail in this worktree, and this branch
 touches no file under `webui/`.
