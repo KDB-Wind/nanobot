@@ -1,0 +1,1 @@
+{"probe": "serve_inbox", "capabilities_status": 200, "capabilities_inbox_flag": true, "inbox_post_status": 404, "inbox_post_body": {}, "route_exists": false, "verdict": "RED"}

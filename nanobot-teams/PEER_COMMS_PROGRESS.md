@@ -13,8 +13,8 @@
 
 | 阶段 | 状态 | 说明 |
 | --- | --- | --- |
-| P0 基线、审计与恢复点 | in_progress | 文档已读；备份完成；基线测试运行中；backlog 待产出 |
-| P1 设计与威胁模型 | pending | |
+| P0 基线、审计与恢复点 | verified | 提交 36e099fd1（目标契约入库）+ f44122aff（基线/backlog）；备份与基线测试见 P0 记录 |
+| P1 设计与威胁模型 | verified | 提交（本条）；PEER_COMMS_DESIGN.md：领域对象、三方案对比（选定 A：每 Bot inbox 绑定 + runs 协议）、威胁模型、ADR-001（serve 可选 inbox）；运行时问题已用真实进程探针回答 |
 | P2 失败探针（先红） | pending | |
 | P3 身份、绑定与迁移 | pending | |
 | P4 授权图、派发与环路保护 | pending | |
@@ -34,6 +34,12 @@
 - 首个提交：`36e099fd1 docs(teams): copy the peer comms goal contract into the repo`（nanobot-teams/PEER_COMMS_GOAL.md，SHA-256 445cbf0cd325... 与 D:\ 源逐字节一致）。
 - 代码现状勘察：Explore 子代理运行中，结果待记。
 
+## P1 记录
+
+- 运行时探针（真实 `nanobot serve` 子进程）：`.audit/serve_inbox_probe.py`，证据 `review/peer-comms/p1-serve-inbox-probe.txt`，退出码 1（RED）。事实：serve 配置 `inboxEnabled:true` 后 capabilities 宣告 inbox:true 但 `POST /v1/agent-inbox` 404。结论：单进程收发需要 ADR-001 宿主改动（serve 挂 inbox），双进程共享 home 被架构禁止。
+- 设计文档：PEER_COMMS_DESIGN.md（领域对象 7 个；方案对比选定 A，拒绝 B 代持/C 消息总线；威胁模型 7 项；`send_to_bot` 新工具而非改 submit_task 的理由；usage 读取器边界）。
+- 代码勘察证据：Explore 子代理报告（2026-11-10），关键 file:line 已固化进 backlog 与设计文档。
+
 ## 剩余项 / 下一动作
 
-- P0 剩余：PEER_COMMS_BACKLOG.md（等勘察结果）。
+- P2：写 `nanobot-teams/acceptance/peer_comms_probe.py` 四 Bot 拓扑失败探针（先红）。
