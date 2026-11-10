@@ -25,7 +25,7 @@ from nanobot.runs.service import (
     InvalidSubmitError,
     RunService,
 )
-from nanobot.runs.store import OperationKeyRetiredError
+from nanobot.runs.store import OperationKeyRetiredError, StoreUnavailableError
 from nanobot.runs.types import (
     EVENT_MAX_BYTES,
     INPUT_MAX_BYTES,
@@ -33,6 +33,7 @@ from nanobot.runs.types import (
     RESULT_MAX_BYTES,
     Run,
     RunSubmit,
+    UnknownRunError,
     parse_rfc3339,
     rfc3339,
 )
@@ -56,6 +57,7 @@ _STATUS_EXCEPTIONS: dict[int, type[web.HTTPException]] = {
     409: web.HTTPConflict,
     410: web.HTTPGone,
     413: web.HTTPRequestEntityTooLarge,
+    503: web.HTTPServiceUnavailable,
 }
 
 
@@ -260,7 +262,15 @@ async def handle_lookup(request: web.Request) -> web.Response:
     operation_key = request.query.get("operation_key", "")
     if not operation_key:
         raise protocol_error(400, "operation_key_required", "operation_key is required.")
-    run = await service.lookup(config.principal_id, operation_key)
+    try:
+        run = await service.lookup(config.principal_id, operation_key)
+    except StoreUnavailableError:
+        raise protocol_error(
+            503,
+            "storage_unavailable",
+            "The runs store is temporarily unavailable; retry the same request.",
+            retryable=True,
+        )
     if run is None:
         raise protocol_error(
             404, "run_not_found", "No run for that key. Reconciliation does not authorize a new key."
@@ -268,23 +278,32 @@ async def handle_lookup(request: web.Request) -> web.Response:
     return _protocol_json_response(_run_status(run))
 
 
+async def _get_run_or_error(service: RunService, run_id: str) -> Run:
+    """Map only a genuinely missing run to 404; a storage fault is retryable 503."""
+    try:
+        return await service.get(run_id)
+    except UnknownRunError:
+        raise protocol_error(404, "run_not_found", "No run with that id.")
+    except StoreUnavailableError:
+        raise protocol_error(
+            503,
+            "storage_unavailable",
+            "The runs store is temporarily unavailable; retry the same request.",
+            retryable=True,
+        )
+
+
 async def handle_get_run(request: web.Request) -> web.Response:
     _require_runs_auth(request)
     service: RunService = request.app[_RUNS_SERVICE_KEY]
-    try:
-        run = await service.get(request.match_info["run_id"])
-    except Exception:
-        raise protocol_error(404, "run_not_found", "No run with that id.")
+    run = await _get_run_or_error(service, request.match_info["run_id"])
     return _protocol_json_response(_run_status(run))
 
 
 async def handle_get_result(request: web.Request) -> web.Response:
     _require_runs_auth(request)
     service: RunService = request.app[_RUNS_SERVICE_KEY]
-    try:
-        run = await service.get(request.match_info["run_id"])
-    except Exception:
-        raise protocol_error(404, "run_not_found", "No run with that id.")
+    run = await _get_run_or_error(service, request.match_info["run_id"])
     if not run.terminal:
         raise protocol_error(409, "not_finished", "The result exists only in a terminal state.")
     if run.result_cleaned_at is not None:
@@ -313,10 +332,52 @@ async def handle_cancel(request: web.Request) -> web.Response:
     service: RunService = request.app[_RUNS_SERVICE_KEY]
     try:
         run = await service.cancel(request.match_info["run_id"])
-    except Exception:
+    except UnknownRunError:
         raise protocol_error(404, "run_not_found", "No run with that id.")
+    except StoreUnavailableError:
+        raise protocol_error(
+            503,
+            "storage_unavailable",
+            "The runs store is temporarily unavailable; retry the same request.",
+            retryable=True,
+        )
     return _protocol_json_response(
         _run_status(run), status=202
+    )
+
+
+async def handle_clear_isolation(request: web.Request) -> web.Response:
+    """Operator recovery: clear the instance quarantine and audit who did it.
+
+    This is maintenance, not execution: it never starts an executor and never
+    touches a run row.
+    """
+    _require_runs_auth(request)
+    service: RunService = request.app[_RUNS_SERVICE_KEY]
+    body = await parse_protocol_json(request)
+    actor = body.get("actor")
+    reason = body.get("reason")
+    if not isinstance(actor, str) or not actor.strip():
+        raise protocol_error(400, "invalid_field", "actor must be a non-empty string.")
+    if not isinstance(reason, str) or not reason.strip():
+        raise protocol_error(400, "invalid_field", "reason must be a non-empty string.")
+    try:
+        previous_isolated, previous_reason = service.clear_isolation(
+            actor.strip(), reason.strip()
+        )
+    except StoreUnavailableError:
+        raise protocol_error(
+            503,
+            "storage_unavailable",
+            "The runs store is temporarily unavailable; retry the same request.",
+            retryable=True,
+        )
+    return _protocol_json_response(
+        {
+            "cleared": True,
+            "previous_isolated": previous_isolated,
+            "previous_reason": previous_reason,
+        }
     )
 
 
@@ -414,6 +475,9 @@ def register_runs_routes(app: web.Application, service: RunService, config: ApiR
     app.router.add_get("/v1/agent-capabilities", handle_capabilities)
     app.router.add_post("/v1/agent-runs", handle_submit)
     app.router.add_get("/v1/agent-runs/lookup", handle_lookup)
+    app.router.add_post(
+        "/v1/agent-runs/maintenance/clear-isolation", handle_clear_isolation
+    )
     app.router.add_get("/v1/agent-runs/events", handle_events)
     app.router.add_get("/v1/agent-runs/{run_id}", handle_get_run)
     app.router.add_get("/v1/agent-runs/{run_id}/result", handle_get_result)
@@ -426,6 +490,7 @@ __all__ = [
     "RUNS_ROUTE_PREFIX",
     "handle_capabilities",
     "handle_cancel",
+    "handle_clear_isolation",
     "handle_events",
     "handle_get_result",
     "handle_get_run",

@@ -201,6 +201,38 @@ async def test_q1a_b4_revoked_workflow_stays_revoked_after_new_mint(harness):
     assert exc.value.code == "auto_continue_revoked"
 
 
+async def test_revoke_workflow_flips_only_that_workflow(harness):
+    """Workflow stop revokes one grant; other workflows keep theirs."""
+    inbox, state, key, generation = harness
+    first = inbox.mint_capability(
+        session_key=key, session_generation=generation, workflow_id="wf-a",
+        operation_key="op-a", bot_id="research", instance_id="inst_r",
+        principal_id="coordinator",
+    )
+    second = inbox.mint_capability(
+        session_key=key, session_generation=generation, workflow_id="wf-b",
+        operation_key="op-b", bot_id="research", instance_id="inst_r",
+        principal_id="coordinator",
+    )
+    assert inbox.revoke_workflow("wf-a") is True
+    assert inbox.workflow_allows_auto_continue("wf-a") is False
+    assert inbox.workflow_allows_auto_continue("wf-b") is True
+    with pytest.raises(InboxError) as exc:
+        inbox.validate_capability(
+            token=first.token, workflow_id="wf-a", operation_key="op-a",
+            bot_id="research", instance_id="inst_r", principal_id="coordinator",
+        )
+    assert exc.value.code == "auto_continue_revoked"
+    assert inbox.validate_capability(
+        token=second.token, workflow_id="wf-b", operation_key="op-b",
+        bot_id="research", instance_id="inst_r", principal_id="coordinator",
+    ).workflow_id == "wf-b"
+    # The async path is the HTTP entry: idempotent, and only wf-b is left.
+    assert await inbox.revoke_workflow_async("wf-a") is False
+    assert await inbox.revoke_workflow_async("wf-b") is True
+    assert inbox.workflow_allows_auto_continue("wf-b") is False
+
+
 async def test_q1a_b6_concurrent_first_use_binds_exactly_once(harness):
     """Two validates racing different keys on wildcards: one wins, one loses."""
     inbox, state, key, generation = harness

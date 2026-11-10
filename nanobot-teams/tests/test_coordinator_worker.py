@@ -325,3 +325,169 @@ async def test_cancel_request_drives_remote_cancel(store):
         assert bot_app.cancel_calls == [store.get_task(task.task_id).remote_run_id]
     finally:
         await server.close()
+
+
+class GatedBotApp(FakeBotApp):
+    """Holds the submit handler open so a cancel can race the in-flight POST."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.submit_entered = asyncio.Event()
+        self.release_submit = asyncio.Event()
+
+    async def submit(self, request: web.Request) -> web.Response:
+        key = request.headers.get("Idempotency-Key", "")
+        body = await request.json()
+        self.submit_entered.set()
+        await self.release_submit.wait()
+        self.submit_count += 1
+        run_id = self._persist(key, body)
+        return web.json_response(self._status(self.runs[run_id]), status=202)
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_cancel_while_submit_in_flight_stays_unconfirmed_and_stops_run(store):
+    """N01: a cancel during the first POST must not confirm a phantom stop."""
+    store.create_project("proj", "Main")
+    bot_app = GatedBotApp()
+    server = await make_bot_server(bot_app)
+    try:
+        register_bot(store, str(server.make_url("")).rstrip("/"), instance="inst_bot_a")
+        task, _ = admit(store)
+        worker = DispatchWorker(store, factory())
+        pump = asyncio.create_task(worker.pump_once())
+        await asyncio.wait_for(bot_app.submit_entered.wait(), 3)
+        in_flight = store.dispatch_entry_for_task(task.task_id)
+        assert in_flight is not None and in_flight.submit_started_at is not None
+        cancel = store.request_cancel(task.task_id)
+        assert cancel is not None
+        assert cancel.cancel_state.value == "unconfirmed"
+        assert cancel.stop_confirmed is False
+        bot_app.release_submit.set()
+        await asyncio.wait_for(pump, 5)
+        current = store.get_task(task.task_id)
+        assert current.dispatch_state.value == "accepted"
+        assert current.remote_run_id is not None
+        assert current.remote_run_id in bot_app.cancel_calls, (
+            "an accepted run must be stopped in the same pump"
+        )
+        assert len(store.tasks_to_observe()) == 1
+    finally:
+        await server.close()
+
+
+class QuarantiningCapsApp(FakeBotApp):
+    """Quarantines the bot instance while the capabilities preflight is awaited."""
+
+    def __init__(self, store, **kwargs):
+        super().__init__(**kwargs)
+        self._store = store
+
+    async def capabilities(self, request: web.Request) -> web.Response:
+        response = await super().capabilities(request)
+        self._store.quarantine_instance(self.instance_id, "incident during preflight")
+        return response
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_quarantine_during_preflight_defers_before_any_send(store):
+    """N01: isolation re-checked after awaited preflight stops the submit."""
+    store.create_project("proj", "Main")
+    bot_app = QuarantiningCapsApp(store)
+    server = await make_bot_server(bot_app)
+    try:
+        register_bot(store, str(server.make_url("")).rstrip("/"), instance="inst_bot_a")
+        task, _ = admit(store)
+        worker = DispatchWorker(store, factory())
+        await worker.pump_once()
+        current = store.get_task(task.task_id)
+        assert current.dispatch_state.value == "pending"
+        entry = store.dispatch_entry_for_task(task.task_id)
+        assert entry is not None and entry.state == "pending"
+        assert "quarantined" in entry.last_error
+        assert bot_app.submit_count == 0, "the submit must not leave the coordinator"
+    finally:
+        await server.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_terminal_unconfirmed_stop_still_drives_remote_cancel(store):
+    """N01/N08: a terminal state is not stop evidence; unconfirmed keeps driving."""
+    store.create_project("proj", "Main")
+    bot_app = FakeBotApp()
+    server = await make_bot_server(bot_app)
+    try:
+        register_bot(store, str(server.make_url("")).rstrip("/"), instance="inst_bot_a")
+        unconfirmed, _ = admit(store)
+        store.update_after_submit(
+            unconfirmed.task_id, remote_run_id="run_stop_unconfirmed",
+            remote_instance_id="inst_bot_a",
+        )
+        store.request_cancel(unconfirmed.task_id)
+        observed = store.record_observation(
+            unconfirmed.task_id, revision=2, run_state="interrupted", stop_confirmed=False,
+        )
+        assert observed is not None and observed.cancel_state.value == "unconfirmed"
+        worker = DispatchWorker(store, factory())
+        bot = store.get_bot("research")
+        assert bot is not None
+        client = factory().for_bot(bot.endpoint, bot.secret_env)
+        try:
+            assert await worker._drive_cancel(observed, client) is True
+            assert bot_app.cancel_calls == ["run_stop_unconfirmed"]
+            # A confirmed terminal stop is settled and must not be driven again.
+            settled, _ = admit(store, key=str(uuid.uuid4()), workflow="wf-2")
+            store.update_after_submit(
+                settled.task_id, remote_run_id="run_stop_confirmed",
+                remote_instance_id="inst_bot_a",
+            )
+            store.request_cancel(settled.task_id)
+            done = store.record_observation(
+                settled.task_id, revision=2, run_state="cancelled", stop_confirmed=True,
+            )
+            assert done is not None and done.cancel_state.value == "confirmed"
+            assert await worker._drive_cancel(done, client) is False
+        finally:
+            await client.aclose()
+        assert bot_app.cancel_calls == ["run_stop_unconfirmed"]
+    finally:
+        await server.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_pump_drives_cancel_for_terminal_unconfirmed_run(store):
+    """N08: observation stops at terminal; the cancel pump must keep driving."""
+    store.create_project("proj", "Main")
+    bot_app = FakeBotApp()
+    # The run exists remotely and is terminal without a confirmed stop; a
+    # missing run here would instead exercise the lost-storage path.
+    bot_app.runs["run_terminal"] = {
+        "run_id": "run_terminal",
+        "state": "interrupted",
+        "revision": 2,
+        "instance_id": "inst_bot_a",
+        "stop_confirmed": False,
+        "effects_uncertain": False,
+        "outcome": {"code": "interrupted"},
+        "result_available": False,
+    }
+    server = await make_bot_server(bot_app)
+    try:
+        register_bot(
+            store, str(server.make_url("")).rstrip("/"), instance="inst_bot_a"
+        )
+        task, _ = admit(store)
+        store.update_after_submit(
+            task.task_id, remote_run_id="run_terminal", remote_instance_id="inst_bot_a"
+        )
+        store.request_cancel(task.task_id)
+        store.record_observation(
+            task.task_id, revision=2, run_state="interrupted", stop_confirmed=False
+        )
+        worker = DispatchWorker(store, factory())
+        await worker.pump_once()
+        assert bot_app.cancel_calls == ["run_terminal"], (
+            "a terminal unconfirmed run still needs a remote stop"
+        )
+    finally:
+        await server.close()

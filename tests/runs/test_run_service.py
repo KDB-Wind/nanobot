@@ -8,6 +8,7 @@ from datetime import timedelta
 
 import pytest
 
+from nanobot.runs.executor import RunCancelled
 from nanobot.runs.service import (
     EventCursorExpiredError,
     IdempotencyConflictError,
@@ -57,7 +58,7 @@ class FakeExecutor:
             await self.gate.wait()
         except asyncio.CancelledError:
             if not self.resist_cancel:
-                raise
+                raise RunCancelled(stop_confirmed=True) from None
             await self.after_cancel_gate.wait()
             return ExecutionResult(code=OutcomeCode.CANCELLED)
         return self.result
@@ -327,7 +328,6 @@ async def test_events_stream_and_floor(tmp_path, make):
     assert events[-1].seq > events[0].seq
     fresh = await service.events(events[-1].seq)
     assert fresh == []
-    # Backdate events past retention and run cleanup on the same store.
     service._store._conn.execute(
         "UPDATE run_events SET at = ?", ((utc_now() - timedelta(days=31)).isoformat(),)
     )
@@ -417,10 +417,11 @@ async def test_q1a_b2_cancel_racing_the_worker_pump_is_honored(make):
         assert result.run_id == accepted.run.run_id
 
 
-async def test_q1a_b3_store_failure_does_not_leak_the_slot_forever(make):
-    """A result write failing leaves the run reaped and the instance isolated."""
+async def test_q1a_b3_failed_result_commit_is_retried_not_reaped(make):
+    """N10: a held result is never cancelled as an orphan and never re-run."""
     service, fake = make()
-    fake.gate = asyncio.Event()
+    fake.gate = asyncio.Event()  # hold the run so the write can be broken first
+    fake.result = ExecutionResult(code=OutcomeCode.SUCCEEDED, text="PERSIST_ME")
     await service.start()
     accepted = await service.submit(submit_req())
     await wait_for_state(service, accepted.run.run_id, RunState.RUNNING)
@@ -434,22 +435,61 @@ async def test_q1a_b3_store_failure_does_not_leak_the_slot_forever(make):
     service._store.transition = broken  # type: ignore[method-assign]
     fake.gate.set()
     for _ in range(300):
-        task = service._tasks.get(accepted.run.run_id)
-        if task is not None and task.done():
+        if service._pending_results:
             break
         await asyncio.sleep(0.01)
-    service._store.transition = original  # type: ignore[method-assign]
-    # The sweep must reap the orphaned cancelling run and isolate the instance.
-    from nanobot.runs.types import InstanceIsolatedError
-
-    reaped = False
-    for _ in range(200):
+    assert service._pending_results, "the exact result must be held in memory"
+    for _ in range(10):
         await service._pump_once()
-        run = await service.get(accepted.run.run_id)
-        if run.state is RunState.CANCELLED:
-            reaped = True
+    held = await service.get(accepted.run.run_id)
+    assert held.state is RunState.RUNNING, "a run with a pending result is not an orphan"
+    assert held.stop_confirmed is False
+    assert service._store.isolation() == (False, "")
+    service._store.transition = original  # type: ignore[method-assign]
+    await service._pump_once()
+    final = await service.get(accepted.run.run_id)
+    assert final.state is RunState.SUCCEEDED
+    assert final.outcome is not None and final.outcome.partial == "PERSIST_ME"
+    assert final.effects_uncertain is False
+    assert fake.calls == [accepted.run.run_id], "the held result is never re-executed"
+
+
+async def test_executor_exception_result_is_held_while_the_store_is_down(make):
+    """N10: the exception exit path's typed result is held the same way."""
+
+    class GatedExplodingExecutor:
+        def __init__(self) -> None:
+            self.gate = asyncio.Event()
+
+        async def execute(self, run):
+            await self.gate.wait()
+            raise RuntimeError("boom")
+
+    executor = GatedExplodingExecutor()
+    service, _ = make(executor=executor)
+    await service.start()
+    accepted = await service.submit(submit_req(task_id="boom"))
+    await wait_for_state(service, accepted.run.run_id, RunState.RUNNING)
+    original = service._store.transition
+
+    def broken(*args, **kwargs):
+        from nanobot.runs.store import StoreUnavailableError
+
+        raise StoreUnavailableError("disk full")
+
+    service._store.transition = broken  # type: ignore[method-assign]
+    executor.gate.set()
+    for _ in range(300):
+        if service._pending_results:
             break
         await asyncio.sleep(0.01)
-    assert reaped, "the orphaned cancelling run must be finalized by the sweep"
-    with pytest.raises(InstanceIsolatedError):
-        await service.submit(submit_req(key=str(uuid.uuid4()), task_id="next"))
+    assert service._pending_results
+    await service._pump_once()
+    assert (await service.get(accepted.run.run_id)).state is RunState.RUNNING
+    service._store.transition = original  # type: ignore[method-assign]
+    await service._pump_once()
+    final = await service.get(accepted.run.run_id)
+    assert final.state is RunState.FAILED
+    assert final.outcome is not None
+    assert final.outcome.code is OutcomeCode.EXECUTION_ERROR
+    assert "RuntimeError" in final.outcome.message

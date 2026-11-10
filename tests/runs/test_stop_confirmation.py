@@ -12,6 +12,7 @@ from datetime import timedelta
 
 import pytest
 
+from nanobot.agent.stop_report import SessionStopReport
 from nanobot.runs.executor import AgentLoopRunExecutor
 from nanobot.runs.service import RunService
 from nanobot.runs.store import RunStore
@@ -148,6 +149,8 @@ async def test_retention_keeps_unconfirmed_stops(tmp_path):
     assert kept is not None, "an unconfirmed run must survive retention cleanup"
     assert counts["runs"] == 0
     assert counts["result_bodies"] == 0
+    assert counts["events"] == 0, "the investigation log leaves only with its row"
+    assert store.events_after(0) != [], "an unconfirmed run keeps its events"
     await service.aclose()
     store.close()
 
@@ -168,11 +171,20 @@ async def test_retention_still_deletes_confirmed_runs(tmp_path):
 
 
 class ReapingLoop:
-    """Records session reaps; can fail the cleanup like a broken tool stop."""
+    """Records session reaps; its report is the stop fact the executor trusts."""
 
-    def __init__(self, *, reap_fails: bool = False, stop_reason: str = "completed") -> None:
+    def __init__(
+        self,
+        *,
+        reap_fails: bool = False,
+        stop_reason: str = "completed",
+        live_subagents: int = 0,
+        live_exec_sessions: tuple[str, ...] = (),
+    ) -> None:
         self.reap_fails = reap_fails
         self.stop_reason = stop_reason
+        self.live_subagents = live_subagents
+        self.live_exec_sessions = live_exec_sessions
         self.reaped: list[str] = []
 
     async def process_direct(self, *, content, session_key, hooks, **kwargs):
@@ -187,11 +199,15 @@ class ReapingLoop:
 
         return _Message()
 
-    async def cancel_session_work(self, session_key: str) -> int:
+    async def stop_session_work(self, session_key: str) -> SessionStopReport:
         if self.reap_fails:
             raise RuntimeError("exec stop refused")
         self.reaped.append(session_key)
-        return 0
+        return SessionStopReport(
+            cancelled=0,
+            live_subagents=self.live_subagents,
+            live_exec_sessions=self.live_exec_sessions,
+        )
 
 
 def _run() -> object:
@@ -229,6 +245,16 @@ async def test_failed_reap_reports_unverified_stop():
     loop = ReapingLoop(reap_fails=True)
     executor = AgentLoopRunExecutor(loop)
     result = await executor.execute(_run())
+    assert result.stop_confirmed is False
+    assert result.effects_uncertain is True
+
+
+async def test_live_work_in_the_report_reports_unverified_stop():
+    """N06: a bounded wait that left work alive is not a confirmed stop."""
+    loop = ReapingLoop(live_subagents=1)
+    executor = AgentLoopRunExecutor(loop)
+    result = await executor.execute(_run())
+    assert result.code is OutcomeCode.SUCCEEDED
     assert result.stop_confirmed is False
     assert result.effects_uncertain is True
 

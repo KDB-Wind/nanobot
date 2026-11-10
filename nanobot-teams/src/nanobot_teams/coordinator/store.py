@@ -14,6 +14,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from ..file_lock import FileLock
 from .models import (
@@ -25,6 +26,7 @@ from .models import (
     DispatchEntry,
     DispatchState,
     Event,
+    LegacyEndpointGuard,
     Project,
     Quarantine,
     Task,
@@ -93,7 +95,8 @@ CREATE TABLE IF NOT EXISTS dispatch_outbox (
     state TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT NOT NULL,
-    last_error TEXT NOT NULL DEFAULT ''
+    last_error TEXT NOT NULL DEFAULT '',
+    submit_started_at TEXT
 );
 CREATE INDEX IF NOT EXISTS dispatch_due ON dispatch_outbox(state, next_attempt_at);
 CREATE TABLE IF NOT EXISTS delivery_outbox (
@@ -128,6 +131,14 @@ CREATE TABLE IF NOT EXISTS instance_quarantine (
     resolved_at TEXT,
     resolved_by TEXT NOT NULL DEFAULT '',
     resolution_note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS legacy_endpoint_guards (
+    guard_key TEXT PRIMARY KEY,
+    endpoint TEXT NOT NULL,
+    secret_env TEXT NOT NULL DEFAULT '',
+    instance_id TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
 );
 CREATE TABLE IF NOT EXISTS migration_records (
     record_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,6 +225,30 @@ def task_digest(
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def normalize_endpoint(endpoint: str) -> str:
+    """Canonical form for matching the same endpoint across registrations."""
+    raw = endpoint.strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    parts = urlsplit(raw)
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    path = parts.path.rstrip("/")
+    return f"{host}:{port}{path}" if port else f"{host}{path}"
+
+
+def endpoint_guard_key(endpoint: str) -> str:
+    """Quarantine key for an endpoint whose bot has no bound instance yet.
+
+    A bot registered over HTTP carries no instance identity until its first
+    dispatch preflight. The migration import isolates the endpoint itself, so
+    admission and dispatch must look under the same key.
+    """
+    return f"legacy:{normalize_endpoint(endpoint)}"
+
+
 DEFAULT_QUOTAS = {
     "parallel_bots": 4,
     "workflow_tasks": 20,
@@ -231,6 +266,15 @@ RESULT_RESERVATION_BYTES = 32 * 1024
 # accepted has a live run, indeterminate means the remote state is unknown.
 _UNKNOWN_DISPATCH_STATES = "('pending','accepted','indeterminate')"
 _TERMINAL_RUN_STATES_SQL = "('succeeded','failed','cancelled','interrupted')"
+_UNSETTLED_SQL = (
+    f"dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND (run_state NOT IN "
+    f"{_TERMINAL_RUN_STATES_SQL} OR stop_confirmed=0 OR effects_uncertain=1)"
+)
+# Bytes settle on the body, not on execution or stop. An advertised body
+# that was never persisted still owns the maximum reservation.
+_RESULT_UNSETTLED_SQL = (
+    f"({_UNSETTLED_SQL} OR (result_available=1 AND result_fetched=0))"
+)
 
 
 class CoordinatorStore:
@@ -265,6 +309,26 @@ class CoordinatorStore:
                 self._conn.execute(
                     "ALTER TABLE tasks ADD COLUMN result_fetched INTEGER NOT NULL DEFAULT 0"
                 )
+            outbox_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(dispatch_outbox)")
+            }
+            if "submit_started_at" not in outbox_columns:
+                self._conn.execute(
+                    "ALTER TABLE dispatch_outbox ADD COLUMN submit_started_at TEXT"
+                )
+                # Rows written by older versions counted attempts only after a
+                # failed delivery; attempts>0 was their "may have been sent"
+                # signal. Keep that safety on upgrade instead of confirming a
+                # cancel for a submit this version never observed.
+                self._conn.execute(
+                    "UPDATE dispatch_outbox SET submit_started_at=? "
+                    "WHERE attempts>0 AND submit_started_at IS NULL",
+                    (iso(utc_now()),),
+                )
+            # Older databases recorded a legacy unknown only as a quarantine
+            # key; dispatch identity checks read the guard table. Derive the
+            # missing rows before any worker can run.
+            self._backfill_legacy_guards()
         except (OSError, sqlite3.Error, StoreError) as exc:
             self.close()
             raise StoreError("Cannot open the coordinator store (another writer?)") from exc
@@ -454,15 +518,36 @@ class CoordinatorStore:
 
     # ---- quarantine ----
 
+    def _quarantine_locked(self, instance_id: str, reason: str) -> None:
+        """Reopen an instance as a new incident; caller holds the transaction.
+
+        A resolved row is not a permanent licence: each incident needs its own
+        acknowledgement. Clearing the current resolution fields makes the
+        instance active again, while the previous actor, note and reason stay
+        in the event log as the historical audit.
+        """
+        assert self._conn is not None
+        prior = self._conn.execute(
+            "SELECT reason, resolved_at FROM instance_quarantine WHERE instance_id=?",
+            (instance_id,),
+        ).fetchone()
+        self._conn.execute(
+            "INSERT INTO instance_quarantine(instance_id, reason, created_at) VALUES (?,?,?) "
+            "ON CONFLICT(instance_id) DO UPDATE SET reason=excluded.reason, "
+            "created_at=excluded.created_at, resolved_at=NULL, resolved_by='', "
+            "resolution_note=''",
+            (instance_id, reason, iso(utc_now())),
+        )
+        data = {"instance": instance_id, "reason": reason}
+        if prior is not None:
+            data["prior_reason"] = prior[0]
+            if prior[1] is not None:
+                data["prior_resolved_at"] = prior[1]
+        self._emit("instance_quarantined", None, data)
+
     def quarantine_instance(self, instance_id: str, reason: str) -> None:
         with self._transaction():
-            assert self._conn is not None
-            self._conn.execute(
-                "INSERT INTO instance_quarantine(instance_id, reason, created_at) VALUES (?,?,?) "
-                "ON CONFLICT(instance_id) DO UPDATE SET reason=excluded.reason",
-                (instance_id, reason, iso(utc_now())),
-            )
-            self._emit("instance_quarantined", None, {"instance": instance_id, "reason": reason})
+            self._quarantine_locked(instance_id, reason)
 
     def resolve_quarantine(self, instance_id: str, actor: str, note: str) -> None:
         with self._transaction():
@@ -472,7 +557,18 @@ class CoordinatorStore:
                 "WHERE instance_id=? AND resolved_at IS NULL",
                 (iso(utc_now()), actor, note, instance_id),
             )
-            self._emit("quarantine_resolved", None, {"instance": instance_id, "actor": actor})
+            self._conn.execute(
+                "UPDATE legacy_endpoint_guards SET resolved_at=? "
+                "WHERE guard_key=? AND resolved_at IS NULL",
+                (iso(utc_now()), instance_id),
+            )
+            # The row's resolution fields are cleared by the next incident, so
+            # the audit of who cleared this one lives in the event log.
+            self._emit(
+                "quarantine_resolved",
+                None,
+                {"instance": instance_id, "actor": actor, "note": note},
+            )
 
     def active_quarantines(self) -> dict[str, Quarantine]:
         assert self._conn is not None
@@ -488,6 +584,99 @@ class CoordinatorStore:
             )
             for r in rows
         }
+
+    def _backfill_legacy_guards(self) -> None:
+        """Give active endpoint quarantines the identity rows dispatch reads.
+
+        Older databases recorded a 0.4 unknown only under a legacy:<endpoint>
+        key. Recover the endpoint and credential from the registered bot that
+        matches it; without a match the guard stays unresolved and keeps
+        dispatch closed until an operator resolves it. Re-running is a no-op.
+        """
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT instance_id, created_at FROM instance_quarantine "
+            "WHERE resolved_at IS NULL AND instance_id LIKE 'legacy:%'"
+        ).fetchall()
+        if not rows:
+            return
+        bots = self._conn.execute(
+            "SELECT endpoint, secret_env FROM bots ORDER BY created_at"
+        ).fetchall()
+        by_endpoint: dict[str, tuple[str, str]] = {}
+        for endpoint, secret_env in bots:
+            by_endpoint.setdefault(
+                normalize_endpoint(str(endpoint)), (str(endpoint), str(secret_env))
+            )
+        with self._transaction():
+            for guard_key, created_at in rows:
+                normalized = str(guard_key)[len("legacy:"):]
+                endpoint, secret_env = by_endpoint.get(
+                    normalized, (f"http://{normalized}", "")
+                )
+                cursor = self._conn.execute(
+                    "INSERT INTO legacy_endpoint_guards(guard_key, endpoint, secret_env, "
+                    "created_at) VALUES (?,?,?,?) ON CONFLICT(guard_key) DO NOTHING",
+                    (guard_key, endpoint, secret_env, created_at),
+                )
+                self._conn.execute(
+                    "UPDATE legacy_endpoint_guards SET resolved_at=NULL WHERE guard_key=?",
+                    (guard_key,),
+                )
+                if cursor.rowcount == 1:
+                    self._emit(
+                        "legacy_guard_backfilled",
+                        None,
+                        {
+                            "guard": str(guard_key),
+                            "endpoint": endpoint,
+                            "credential": "recovered" if secret_env else "missing",
+                        },
+                    )
+
+    def quarantine_legacy_endpoint(
+        self, endpoint: str, reason: str, *, secret_env: str = ""
+    ) -> None:
+        """Record the endpoint behind a 0.4 unknown and isolate its guard key."""
+        guard_key = endpoint_guard_key(endpoint)
+        with self._transaction():
+            assert self._conn is not None
+            self._quarantine_locked(guard_key, reason)
+            self._conn.execute(
+                "INSERT INTO legacy_endpoint_guards(guard_key, endpoint, secret_env, "
+                "created_at) VALUES (?,?,?,?) ON CONFLICT(guard_key) DO UPDATE SET "
+                "endpoint=excluded.endpoint, secret_env=excluded.secret_env, "
+                "created_at=excluded.created_at, instance_id=NULL, resolved_at=NULL",
+                (guard_key, endpoint, secret_env, iso(utc_now())),
+            )
+
+    def active_legacy_guards(self) -> list[LegacyEndpointGuard]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT g.guard_key, g.endpoint, g.secret_env, g.instance_id, g.created_at "
+            "FROM legacy_endpoint_guards g JOIN instance_quarantine q "
+            "ON q.instance_id=g.guard_key "
+            "WHERE q.resolved_at IS NULL AND g.resolved_at IS NULL "
+            "ORDER BY g.created_at"
+        ).fetchall()
+        return [
+            LegacyEndpointGuard(
+                guard_key=r[0],
+                endpoint=r[1],
+                secret_env=r[2],
+                instance_id=r[3],
+                created_at=datetime.fromisoformat(r[4]),
+            )
+            for r in rows
+        ]
+
+    def map_legacy_guard(self, guard_key: str, instance_id: str) -> None:
+        with self._transaction():
+            assert self._conn is not None
+            self._conn.execute(
+                "UPDATE legacy_endpoint_guards SET instance_id=? WHERE guard_key=?",
+                (instance_id, guard_key),
+            )
 
     # ---- admission ----
 
@@ -506,19 +695,20 @@ class CoordinatorStore:
                 "SELECT COUNT(*) FROM tasks WHERE workflow_id=?", (workflow_id,)
             ).fetchone()[0]
         )
-        unknown_open = (
-            f"dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND run_state NOT IN "
-            f"{_TERMINAL_RUN_STATES_SQL}"
-        )
+        # An execution state alone does not settle a task: a terminal run whose
+        # stop is unconfirmed, or whose effects stayed uncertain, still owns the
+        # same open-slot and result reservation as a running one.
+        unsettled = _UNSETTLED_SQL
+        result_unsettled = _RESULT_UNSETTLED_SQL
         principal_open = int(
             self._conn.execute(
-                f"SELECT COUNT(*) FROM tasks WHERE caller_principal=? AND {unknown_open}",
+                f"SELECT COUNT(*) FROM tasks WHERE caller_principal=? AND {unsettled}",
                 (caller_principal,),
             ).fetchone()[0]
         )
         global_open = int(
             self._conn.execute(
-                f"SELECT COUNT(*) FROM tasks WHERE {unknown_open}"
+                f"SELECT COUNT(*) FROM tasks WHERE {unsettled}"
             ).fetchone()[0]
         )
         # Queue quotas attach to the instance identity, not the bot row: alias
@@ -531,17 +721,18 @@ class CoordinatorStore:
             self._conn.execute(
                 "SELECT COUNT(*) FROM tasks JOIN bots ON bots.bot_id=tasks.bot_id "
                 "WHERE COALESCE(bots.instance_id, bots.bot_id)=? AND "
-                f"tasks.dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND tasks.run_state "
-                f"NOT IN {_TERMINAL_RUN_STATES_SQL}",
+                f"tasks.dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND (tasks.run_state "
+                f"NOT IN {_TERMINAL_RUN_STATES_SQL} OR tasks.stop_confirmed=0 OR "
+                "tasks.effects_uncertain=1)",
                 (queue_key,),
             ).fetchone()[0]
         )
         # Admission reserves the protocol result cap per unsettled task; only a
-        # terminal task's actual stored body replaces its reservation.
+        # settled terminal task's actual stored body replaces its reservation.
         workflow_result_bytes = int(
             self._conn.execute(
-                "SELECT COALESCE(SUM(CASE WHEN dispatch_state IN "
-                f"{_UNKNOWN_DISPATCH_STATES} AND run_state NOT IN {_TERMINAL_RUN_STATES_SQL} "
+                "SELECT COALESCE(SUM(CASE WHEN "
+                f"{result_unsettled} "
                 "THEN ? ELSE LENGTH(CAST(result_text AS BLOB)) END),0) FROM tasks "
                 "WHERE workflow_id=?",
                 (RESULT_RESERVATION_BYTES, workflow_id),
@@ -613,15 +804,25 @@ class CoordinatorStore:
             if live_bot is None or not live_bot.enabled:
                 raise AdmissionError("bot_unavailable", "Bot is missing or disabled.")
             quarantines = self.active_quarantines()
-            if bot.instance_id and bot.instance_id in quarantines:
+            # A bot registered without an instance has no instance identity to
+            # guard yet; the migration import isolated exactly this endpoint, so
+            # admission must look under the endpoint guard key too. The endpoint
+            # key also stays relevant after a bind: it names the topology the
+            # legacy unknown was recorded against.
+            guard_keys = [endpoint_guard_key(live_bot.endpoint)]
+            if live_bot.instance_id:
+                guard_keys.insert(0, live_bot.instance_id)
+            blocked = next((key for key in guard_keys if key in quarantines), None)
+            if blocked is not None:
                 raise AdmissionError(
                     "bot_quarantined",
-                    f"The bot instance is quarantined: {quarantines[bot.instance_id].reason}",
+                    f"The bot is quarantined: {quarantines[blocked].reason}",
                 )
             # Imported 0.4 usage is a real guard: a migrated caller cannot admit
             # new work until an operator confirms fresh quota for it.
             quota_row = self._conn.execute(
-                "SELECT delegations_used, delegations_limit, imported_at, confirmed "
+                "SELECT delegations_used, delegations_limit, imported_at, confirmed, "
+                "result_bytes_used, result_bytes_limit "
                 "FROM caller_quotas WHERE caller_principal=?",
                 (caller_principal,),
             ).fetchone()
@@ -642,6 +843,27 @@ class CoordinatorStore:
                     raise AdmissionError(
                         "migrated_quota_exhausted",
                         "The confirmed delegation budget for this caller is exhausted.",
+                    )
+                # The imported byte usage is a real budget too: reservations and
+                # settled bodies of tasks admitted since the import count
+                # against it, so a migrated caller cannot outspend its confirmed
+                # result quota by ignoring the count.
+                admitted_bytes = int(
+                    self._conn.execute(
+                        "SELECT COALESCE(SUM(CASE WHEN "
+                        f"{_RESULT_UNSETTLED_SQL} THEN ? ELSE "
+                        "LENGTH(CAST(result_text AS BLOB)) END),0) FROM tasks "
+                        "WHERE caller_principal=? AND created_at>=?",
+                        (RESULT_RESERVATION_BYTES, caller_principal, quota_row[2]),
+                    ).fetchone()[0]
+                )
+                if (
+                    int(quota_row[4]) + admitted_bytes + RESULT_RESERVATION_BYTES
+                    >= int(quota_row[5])
+                ):
+                    raise AdmissionError(
+                        "migrated_quota_exhausted",
+                        "The confirmed result-byte budget for this caller is exhausted.",
                     )
             snapshot = self.quota_snapshot(
                 workflow_id=workflow_id,
@@ -765,6 +987,21 @@ class CoordinatorStore:
             self._emit("task_accepted", task_id, {"run": remote_run_id})
             return self._load_task(task_id)
 
+    def mark_submit_started(self, entry_id: int) -> None:
+        """Persist that this entry may reach the remote before the first byte.
+
+        Written in its own transaction so a cancel that races the worker sees
+        the fact; never cleared, because a later cancel cannot prove the
+        request did not leave the process.
+        """
+        with self._transaction():
+            assert self._conn is not None
+            self._conn.execute(
+                "UPDATE dispatch_outbox SET submit_started_at=COALESCE(submit_started_at, ?) "
+                "WHERE entry_id=?",
+                (iso(utc_now()), entry_id),
+            )
+
     def mark_dispatch_failure(
         self, task_id: str, *, error: str, retry_at: datetime | None = None, attempts: int = 0
     ) -> None:
@@ -867,8 +1104,9 @@ class CoordinatorStore:
     def dispatch_entry_for_task(self, task_id: str) -> DispatchEntry | None:
         assert self._conn is not None
         row = self._conn.execute(
-            "SELECT entry_id, task_id, state, attempts, next_attempt_at, last_error FROM "
-            "dispatch_outbox WHERE task_id=? ORDER BY entry_id DESC LIMIT 1",
+            "SELECT entry_id, task_id, state, attempts, next_attempt_at, last_error, "
+            "submit_started_at FROM dispatch_outbox WHERE task_id=? "
+            "ORDER BY entry_id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         if row is None:
@@ -876,28 +1114,41 @@ class CoordinatorStore:
         return DispatchEntry(
             entry_id=int(row[0]), task_id=row[1], state=row[2], attempts=int(row[3]),
             next_attempt_at=datetime.fromisoformat(row[4]), last_error=row[5],
+            submit_started_at=None if row[6] is None else datetime.fromisoformat(row[6]),
         )
 
     def request_cancel(self, task_id: str) -> Task | None:
         with self._transaction():
             assert self._conn is not None
             row = self._conn.execute(
-                "SELECT dispatch_state, cancel_state, run_state FROM tasks WHERE task_id=?",
+                "SELECT dispatch_state, cancel_state, run_state, stop_confirmed, "
+                "effects_uncertain FROM tasks WHERE task_id=?",
                 (task_id,),
             ).fetchone()
             if row is None:
                 return None
-            dispatch, cancel, run_state = row
+            dispatch, cancel, run_state, stop_confirmed, effects_uncertain = row
             if cancel != CancelState.NONE.value:
                 return self._load_task(task_id)
             if run_state in TERMINAL_RUN_STATES:
-                # Terminal observation already settles the cancel; only the
-                # state name is unified here.
+                # An execution terminal state is not stop evidence. Only a
+                # confirmed stop without uncertain effects settles the cancel;
+                # otherwise the worker keeps driving a remote stop.
+                settled = bool(stop_confirmed) and not bool(effects_uncertain)
                 self._conn.execute(
                     "UPDATE tasks SET cancel_state=? WHERE task_id=?",
-                    (CancelState.CONFIRMED.value, task_id),
+                    (
+                        CancelState.CONFIRMED.value
+                        if settled
+                        else CancelState.UNCONFIRMED.value,
+                        task_id,
+                    ),
                 )
-                self._emit("task_cancel_requested", task_id, {})
+                self._emit(
+                    "task_cancel_requested",
+                    task_id,
+                    {"stop_confirmed": "true" if settled else "false"},
+                )
                 return self._load_task(task_id)
             if dispatch == DispatchState.ACCEPTED.value:
                 new_cancel = CancelState.REQUESTED.value
@@ -915,13 +1166,14 @@ class CoordinatorStore:
                 new_cancel = CancelState.UNCONFIRMED.value
             else:
                 entry = self._conn.execute(
-                    "SELECT attempts FROM dispatch_outbox WHERE task_id=? AND "
+                    "SELECT submit_started_at FROM dispatch_outbox WHERE task_id=? AND "
                     "state='pending' ORDER BY entry_id DESC LIMIT 1",
                     (task_id,),
                 ).fetchone()
-                if entry is not None and int(entry[0]) == 0:
-                    # Definitely never sent: close the task and its outbox in
-                    # this same transaction instead of confirming a phantom.
+                if entry is not None and entry[0] is None:
+                    # No submit was ever started for this entry (persisted
+                    # fact): close the task and its outbox in this same
+                    # transaction instead of confirming a phantom.
                     self._conn.execute(
                         "UPDATE tasks SET cancel_state=?, run_state='cancelled', "
                         "outcome_code='cancelled', outcome_message='Cancelled before "
@@ -939,8 +1191,9 @@ class CoordinatorStore:
                     )
                     self._emit("task_cancelled_before_dispatch", task_id, {})
                     return self._load_task(task_id)
-                # Attempts > 0: the submit may have reached the remote; keep the
-                # unknown until the dispatch worker reconciles by the key.
+                # A submit was started: it may have reached the remote, so
+                # the cancel stays unconfirmed until the dispatch worker
+                # reconciles by the original key.
                 new_cancel = CancelState.UNCONFIRMED.value
             self._conn.execute(
                 "UPDATE tasks SET cancel_state=? WHERE task_id=?", (new_cancel, task_id)
@@ -964,38 +1217,6 @@ class CoordinatorStore:
                 (reason, task_id),
             )
             self._emit("task_expired_before_dispatch", task_id, {"reason": reason})
-            return self._load_task(task_id)
-
-    def close_cancelled_unknown(self, task_id: str, reason: str) -> Task | None:
-        """Finish a never-created task whose unconfirmed cancel reconciled to nothing.
-
-        The dispatch worker calls this after a lookup by the original key proves
-        no remote run exists: no work was ever created, so the cancel confirms.
-        """
-        with self._transaction():
-            assert self._conn is not None
-            row = self._conn.execute(
-                "SELECT dispatch_state, run_state, remote_run_id FROM tasks WHERE task_id=?",
-                (task_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            if row[0] != DispatchState.PENDING.value or row[2] is not None:
-                # An accepted or bound task owns remote work; cancel stays
-                # unconfirmed and the normal cancel path handles it.
-                return self._load_task(task_id)
-            self._conn.execute(
-                "UPDATE tasks SET cancel_state=?, run_state='cancelled', "
-                "outcome_code='cancelled', outcome_message=?, stop_confirmed=1, "
-                "dispatch_state='rejected', finished_at=? WHERE task_id=?",
-                (CancelState.CONFIRMED.value, reason, iso(utc_now()), task_id),
-            )
-            self._conn.execute(
-                "UPDATE dispatch_outbox SET state='failed', last_error=? WHERE task_id=? "
-                "AND state='pending'",
-                (reason, task_id),
-            )
-            self._emit("task_cancelled_before_dispatch", task_id, {})
             return self._load_task(task_id)
 
     def defer_dispatch(self, entry_id: int, next_at: datetime, error: str) -> None:
@@ -1024,16 +1245,7 @@ class CoordinatorStore:
                 (reason, task_id),
             )
             if quarantine_instance:
-                self._conn.execute(
-                    "INSERT INTO instance_quarantine(instance_id, reason, created_at) "
-                    "VALUES (?,?,?) ON CONFLICT(instance_id) DO UPDATE SET "
-                    "reason=excluded.reason",
-                    (quarantine_instance, reason, iso(utc_now())),
-                )
-                self._emit(
-                    "instance_quarantined", None,
-                    {"instance": quarantine_instance, "reason": reason},
-                )
+                self._quarantine_locked(quarantine_instance, reason)
             self._emit("task_indeterminate", task_id, {"reason": reason})
             return self._load_task(task_id)
 
@@ -1084,15 +1296,16 @@ class CoordinatorStore:
     def pending_dispatch(self, now: datetime, limit: int = 10) -> list[DispatchEntry]:
         assert self._conn is not None
         rows = self._conn.execute(
-            "SELECT entry_id, task_id, state, attempts, next_attempt_at, last_error FROM "
-            "dispatch_outbox WHERE state='pending' AND next_attempt_at<=? ORDER BY entry_id "
-            "LIMIT ?",
+            "SELECT entry_id, task_id, state, attempts, next_attempt_at, last_error, "
+            "submit_started_at FROM dispatch_outbox WHERE state='pending' AND "
+            "next_attempt_at<=? ORDER BY entry_id LIMIT ?",
             (iso(now), limit),
         ).fetchall()
         return [
             DispatchEntry(
                 entry_id=int(r[0]), task_id=r[1], state=r[2], attempts=int(r[3]),
                 next_attempt_at=datetime.fromisoformat(r[4]), last_error=r[5],
+                submit_started_at=None if r[6] is None else datetime.fromisoformat(r[6]),
             )
             for r in rows
         ]
@@ -1109,8 +1322,25 @@ class CoordinatorStore:
     def tasks_to_observe(self, limit: int = 20) -> list[Task]:
         assert self._conn is not None
         rows = self._conn.execute(
-            "SELECT task_id FROM tasks WHERE dispatch_state='accepted' AND run_state NOT IN "
-            "('succeeded','failed','cancelled','interrupted') ORDER BY created_at LIMIT ?",
+            "SELECT task_id FROM tasks WHERE dispatch_state='accepted' AND ("
+            "run_state NOT IN ('succeeded','failed','cancelled','interrupted') OR ("
+            "cancel_state IN ('requested','unconfirmed') AND stop_confirmed=0)) "
+            "ORDER BY created_at LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._load_task(r[0]) for r in rows]
+
+    def tasks_with_pending_cancel(self, limit: int = 20) -> list[Task]:
+        """Accepted tasks whose cancel is not backed by a confirmed stop.
+
+        A terminal run is not stop evidence: these are driven until the remote
+        reports a confirmed stop; a newer observation may confirm it first.
+        """
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT task_id FROM tasks WHERE dispatch_state='accepted' AND "
+            "cancel_state IN ('requested','unconfirmed') AND (run_state NOT IN "
+            f"{_TERMINAL_RUN_STATES_SQL} OR stop_confirmed=0) ORDER BY created_at LIMIT ?",
             (limit,),
         ).fetchall()
         return [self._load_task(r[0]) for r in rows]

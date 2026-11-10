@@ -33,35 +33,39 @@ class _RunOutcomeCaptureHook(AgentHook):
         self.error = context.error
 
 
+class RunCancelled(asyncio.CancelledError):
+    """A cancelled execution carrying its own cleanup conclusion.
+
+    The conclusion belongs to the coroutine that observed it, so overlapping
+    cancellations cannot overwrite each other's stop evidence.
+    """
+
+    def __init__(self, *, stop_confirmed: bool) -> None:
+        super().__init__()
+        self.stop_confirmed = stop_confirmed
+
+
 class AgentLoopRunExecutor:
     """Execute one run in its own isolated ephemeral session on the bot's loop."""
 
     def __init__(self, loop: "AgentLoop") -> None:
         self._loop = loop
-        self._cancel_unverified = False
-
-    def consume_cancel_unverified(self) -> bool:
-        """One-shot flag: the last cancellation could not confirm cleanup."""
-        value = self._cancel_unverified
-        self._cancel_unverified = False
-        return value
 
     async def _reap_session_work(self, session_key: str) -> bool:
         """Stop the run session's tools, subagents, and exec sessions.
 
-        Returns False when the cleanup could not be confirmed; the caller must
-        then report an unverified stop instead of a clean finish.
+        Returns True only when the loop reports that nothing it owns is still
+        alive; a normal return from the stop call is not that evidence.
         """
         try:
-            await self._loop.cancel_session_work(session_key)
+            report = await self._loop.stop_session_work(session_key)
         except Exception:
             return False
-        return True
+        return report.confirmed
 
     async def execute(self, run: Run) -> ExecutionResult:
         capture = _RunOutcomeCaptureHook()
         session_key = f"run:{run.run_id}"
-        message: Any = None
         try:
             message = await self._loop.process_direct(
                 content=run.input_text,
@@ -78,32 +82,43 @@ class AgentLoopRunExecutor:
         except asyncio.CancelledError:
             # Cancel the loop-owned work for this run's session before letting
             # the cancellation surface: stop confirmation needs the background
-            # tools and exec sessions gone, not just this coroutine.
-            if not await self._reap_session_work(session_key):
-                # Background tool/exec cleanup could not be confirmed; the
-                # service must isolate the instance instead of trusting stop.
-                self._cancel_unverified = True
-            raise
+            # tools and exec sessions gone, not just this coroutine. The
+            # conclusion stays conservative until the reap proves otherwise, and
+            # a second cancel raises this same typed result as unconfirmed.
+            stop_confirmed = False
+            try:
+                if await self._reap_session_work(session_key):
+                    stop_confirmed = True
+            finally:
+                raise RunCancelled(stop_confirmed=stop_confirmed) from None
         except Exception as exc:
-            return ExecutionResult(
+            # The loop may have started tools or subprocesses before failing;
+            # the reap below owns them like every other exit path.
+            result = ExecutionResult(
                 code=OutcomeCode.EXECUTION_ERROR,
                 message=f"{type(exc).__name__}: {exc}"[:512],
             )
-        text = _response_text(message)
-        stop_reason = capture.stop_reason or ""
-        code = _STOP_REASON_TO_OUTCOME.get(stop_reason, OutcomeCode.EXECUTION_ERROR)
-        message_text = ""
-        if code is not OutcomeCode.SUCCEEDED:
-            message_text = (capture.error or stop_reason or "execution failed")[:512]
+        else:
+            text = _response_text(message)
+            stop_reason = capture.stop_reason or ""
+            code = _STOP_REASON_TO_OUTCOME.get(stop_reason, OutcomeCode.EXECUTION_ERROR)
+            message_text = ""
+            if code is not OutcomeCode.SUCCEEDED:
+                message_text = (capture.error or stop_reason or "execution failed")[:512]
+            result = ExecutionResult(code=code, text=text, message=message_text)
         # Every terminal path reaps the session's background work before the
         # result is recorded: success, provider error, iteration limit, and
         # execution error all own tools and subprocesses they started.
-        result = ExecutionResult(code=code, text=text, message=message_text)
-        if not await self._reap_session_work(session_key):
+        try:
+            stopped = await self._reap_session_work(session_key)
+        except asyncio.CancelledError:
+            raise RunCancelled(stop_confirmed=False) from None
+        if not stopped:
             result = ExecutionResult(
-                code=code,
-                text=text,
-                message=message_text or "background cleanup after the run was unconfirmed"[:512],
+                code=result.code,
+                text=result.text,
+                message=result.message
+                or "background cleanup after the run was unconfirmed"[:512],
                 stop_confirmed=False,
                 effects_uncertain=True,
             )

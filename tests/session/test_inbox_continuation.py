@@ -87,8 +87,8 @@ async def test_apply_persists_wake_obligation(harness):
     )
 
 
-async def test_wake_pump_queues_turn_and_clears_obligation(harness):
-    """F02: the pump turns obligations into real session-bound system turns."""
+async def test_wake_pump_keeps_obligation_until_consumed(harness):
+    """N02: publishing is not acceptance; the lease only prevents a double send."""
     inbox, state, key, generation = harness
     delivery = make_delivery(key, generation)
     inbox.receive(delivery)
@@ -103,15 +103,93 @@ async def test_wake_pump_queues_turn_and_clears_obligation(harness):
 
     pump = InboxWakePump(inbox, publish, session_exists)
     assert await pump.pump_once() == 1
-    assert not inbox.wake_due_deliveries(), "queued obligations must clear"
+    due = inbox.wake_due_deliveries()
+    assert [entry["delivery_id"] for entry in due] == [delivery.delivery_id], (
+        "a bus publish is not the turn accepting the message"
+    )
+    assert due[0]["session_generation"] == generation
+    assert due[0]["result_text"] == "the findings"
     assert len(published) == 1
     message = published[0]
     assert message.session_key == key
     assert message.channel == "system"
+    assert message.session_generation == generation
     assert message.metadata["source_workflow"] == delivery.workflow_id
     assert "external_delivery" in message.metadata["external_delivery_id"]
-    # Idempotent: a second scan finds nothing.
+    assert message.metadata["wake_delivery_id"] == delivery.delivery_id
+    assert message.metadata["external_task_id"] == delivery.task_id
+    assert message.metadata["_skip_user_persist"] is True
+    assert "An async task report has been added" in message.content
+    assert "the findings" in message.content, (
+        "the wake carries the report body, not only a notice"
+    )
+    assert "external data" in message.content
+    assert "not a user instruction or approval" in message.content
+    # The in-process lease keeps a second tick from republishing the same wake.
     assert await pump.pump_once() == 0
+    assert len(published) == 1
+    # Only the accepted turn clears the durable obligation.
+    assert inbox.mark_wake_consumed(delivery.delivery_id) is True
+    assert inbox.wake_due_deliveries() == []
+    assert await pump.pump_once() == 0
+
+
+async def test_completion_settles_only_the_accepting_turns_marker(harness):
+    """A completed wake releases its marker; another turn cannot release it."""
+    inbox, state, key, generation = harness
+    delivery = make_delivery(key, generation)
+    inbox.receive(delivery)
+    assert await _apply(inbox, delivery.delivery_id) == "injected"
+
+    # Turn drafts are read before the accepting turn writes the marker, as in
+    # the loop: the inbox write is the only place the marker enters storage.
+    wrong_turn = await state.read(key)
+    owning_turn = await state.read(key)
+    assert inbox.mark_wake_consumed(
+        delivery.delivery_id, turn_id="turn-1"
+    ) is True
+
+    persisted = await state.read(key)
+    assert persisted.metadata["pending_user_turn"] is True
+    assert persisted.metadata["pending_user_turn_owner"] == {
+        "delivery_id": delivery.delivery_id,
+        "generation": generation,
+        "turn_id": "turn-1",
+    }
+
+    await state.finish_turn(wrong_turn, pending_turn_owner="turn-2")
+    still = await state.read(key)
+    assert still.metadata["pending_user_turn"] is True, (
+        "a different turn must not erase the wake obligation"
+    )
+
+    await state.finish_turn(owning_turn, pending_turn_owner="turn-1")
+    settled = await state.read(key)
+    assert "pending_user_turn" not in settled.metadata
+    assert "pending_user_turn_owner" not in settled.metadata
+
+
+async def test_explicit_stop_settles_the_marker_and_its_owner(harness):
+    """The stop save settles without an owner; the pair must not split."""
+    inbox, state, key, generation = harness
+    delivery = make_delivery(key, generation)
+    inbox.receive(delivery)
+    assert await _apply(inbox, delivery.delivery_id) == "injected"
+    assert inbox.mark_wake_consumed(
+        delivery.delivery_id, turn_id="turn-1"
+    ) is True
+
+    # The cancelled-turn save reads the session after consumption.
+    cancelled_turn = await state.read(key)
+    assert cancelled_turn is not None
+    await state.finish_turn(cancelled_turn)
+
+    settled = await state.read(key)
+    assert settled is not None
+    assert "pending_user_turn" not in settled.metadata
+    assert "pending_user_turn_owner" not in settled.metadata, (
+        "the owner key must not survive the marker it belongs to"
+    )
 
 
 async def test_wake_pump_orphans_when_session_is_gone(harness):
@@ -164,8 +242,9 @@ async def test_revoked_capability_delivers_card_only(harness):
         "a revoked workflow's result is stored as a durable card"
     )
     assert inbox.wake_due_deliveries() == [], "card-only results never wake"
-    # The row never enters the received pipeline again.
-    assert await _apply(inbox, delivery.delivery_id) == "already_handled"
+    # The row never enters the received pipeline again; replay reports its
+    # closed state rather than a generic handled marker.
+    assert await _apply(inbox, delivery.delivery_id) == "card_only"
 
 
 async def test_late_grant_recheck_blocks_revoke_race_injection(harness):

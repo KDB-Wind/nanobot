@@ -27,6 +27,7 @@ from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
+from nanobot.agent.stop_report import SessionStopReport
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.exec_session import ExecSessionManager
@@ -128,6 +129,15 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 _SUBAGENT_PROVIDER_TASK_META = "subagent_provider_task_id"
 _SUBAGENT_TERMINAL_WAIT_SECONDS = 300.0
+
+
+class _DropPendingMessage:
+    """Injected message consumed without becoming model input (stale or revoked)."""
+
+    __slots__ = ()
+
+
+_DROP_PENDING = _DropPendingMessage()
 
 
 def _prompt_scope_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -269,6 +279,7 @@ class AgentLoop:
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
+    _PENDING_USER_TURN_OWNER_KEY = "pending_user_turn_owner"
     _PROVIDER_STATE_CHECKPOINT_VERSION_KEY = "provider_state_checkpoint_version"
     _PROVIDER_STATE_CHECKPOINT_VERSION = "v1"
 
@@ -935,15 +946,72 @@ class AgentLoop:
         except Exception:
             logger.debug("external inbox revocation skipped for {}", session_key)
 
-    async def cancel_session_work(self, session_key: str) -> int:
-        """Cancel one session's tasks, subagents, and exec sessions.
+    @staticmethod
+    def _wake_delivery_id(msg: InboundMessage) -> str | None:
+        value = msg.metadata.get("wake_delivery_id")
+        return value if isinstance(value, str) and value else None
+
+    def _orphan_wake(self, delivery_id: str, reason: str) -> None:
+        inbox = getattr(self, "external_inbox", None)
+        if inbox is None:
+            return
+        try:
+            inbox.mark_wake_orphaned(delivery_id, reason)
+        except Exception:
+            logger.debug("external inbox wake orphan skipped for {}", delivery_id)
+
+    def _consume_wake_obligation(self, msg: InboundMessage, *, turn_id: str) -> bool:
+        """Clear a wake only when the turn accepts it under the live grant.
+
+        The pump keeps ``wake_due`` set after publishing; this is the
+        acceptance boundary. The accepting turn's identity is recorded with the
+        obligation so only that turn's completion can settle it. A revoked
+        workflow ends the obligation without giving the message a model turn.
+        """
+        inbox = getattr(self, "external_inbox", None)
+        delivery_id = self._wake_delivery_id(msg)
+        if inbox is None or delivery_id is None:
+            return True
+        workflow_id = msg.metadata.get("source_workflow")
+        if (
+            isinstance(workflow_id, str)
+            and workflow_id
+            and not inbox.workflow_allows_auto_continue(workflow_id)
+        ):
+            inbox.drop_wake(
+                delivery_id,
+                "workflow revoked auto-continue before wake consumption",
+            )
+            return False
+        if not inbox.mark_wake_consumed(delivery_id, turn_id=turn_id):
+            # Another accepted turn (or an orphan/drop) already ended this
+            # obligation; a republished duplicate must not repeat the report.
+            return False
+        return True
+
+    async def stop_session_work(self, session_key: str) -> SessionStopReport:
+        """Stop one session's tasks, subagents, and exec sessions.
 
         Public stop path for adapters that drive ``process_direct`` in their own
-        tasks (for example the agent-runs executor); returns the number of
-        cancelled work items. Awaiting this is what makes executor stop
-        confirmation real rather than assumed.
+        tasks (for example the agent-runs executor). The report is read after
+        the cancellation pass: a bounded wait that times out still leaves the
+        work alive, and only this observation can prove otherwise.
         """
-        return await self._cancel_active_tasks(session_key)
+        cancelled = await self._cancel_active_tasks(session_key)
+        exec_sessions = await self._exec_session_manager.list(
+            owner_session_key=session_key
+        )
+        return SessionStopReport(
+            cancelled=cancelled,
+            live_subagents=self.subagents.get_running_count_by_session(session_key),
+            live_exec_sessions=tuple(
+                info.session_id for info in exec_sessions if info.returncode is None
+            ),
+        )
+
+    async def cancel_session_work(self, session_key: str) -> int:
+        """Stop the session's work and return the count for legacy callers."""
+        return (await self.stop_session_work(session_key)).cancelled
 
     async def _cancel_active_tasks(self, key: str) -> int:
         pending = self._pending_queues.get(key)
@@ -1062,6 +1130,7 @@ class AgentLoop:
         provider_state: ProviderConversationState | None = None,
         initial_message: InboundMessage | None = None,
         commit_session: bool = True,
+        turn_owner_id: str | None = None,
     ) -> AgentRunResult:
         self._sync_subagent_runtime_limits()
 
@@ -1116,7 +1185,25 @@ class AgentLoop:
                 except asyncio.QueueEmpty:
                     break
 
-            async def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any] | None:
+            async def _to_user_message(
+                pending_msg: InboundMessage,
+            ) -> dict[str, Any] | None | _DropPendingMessage:
+                wake_delivery_id = self._wake_delivery_id(pending_msg)
+                if pending_msg.session_generation is not None and (
+                    session is None
+                    or session.generation != pending_msg.session_generation
+                ):
+                    # The same admission rule as a new turn: a replaced
+                    # generation never enters the active transcript.
+                    if wake_delivery_id is not None:
+                        self._orphan_wake(
+                            wake_delivery_id,
+                            "session generation replaced before injected wake consumption",
+                        )
+                    return _DROP_PENDING
+                if pending_msg.is_user_input:
+                    # An injected genuine user input revokes like a new turn.
+                    await self._arevoke_external_workflows(active_session_key)
                 content = pending_msg.content
                 image_paths = pending_msg.media if pending_msg.media else None
                 if image_paths:
@@ -1133,6 +1220,10 @@ class AgentLoop:
                     "role": "user", "content": user_content,
                     "_meta": self._input_history_extra(pending_msg),
                 }
+                if wake_delivery_id is not None:
+                    # The report already sits in durable history; the wake body
+                    # is model input for this turn only.
+                    row["_meta"][turn_continuation.SKIP_USER_PERSIST_META] = True
                 if HIDDEN_HISTORY_META in pending_msg.metadata:
                     row[HIDDEN_HISTORY_META] = pending_msg.metadata[HIDDEN_HISTORY_META]
                 metadata_value = cast(object, pending_msg.metadata)
@@ -1193,18 +1284,28 @@ class AgentLoop:
                 followup_id = metadata.get(PENDING_FOLLOWUP_ID_KEY)
                 if isinstance(followup_id, str) and followup_id:
                     row[PENDING_FOLLOWUP_ID_KEY] = followup_id
+                if wake_delivery_id is not None and not self._consume_wake_obligation(
+                    pending_msg, turn_id=turn_owner_id or request_ctx.turn_id or ""
+                ):
+                    return _DROP_PENDING
                 return row
 
             consumed = 0
             try:
                 converted: list[dict[str, Any]] = []
                 consumed_inputs: list[InboundMessage] = []
+                dropped = 0
                 for pending_msg in pending_messages:
                     # Independent turns are FIFO barriers. Their worker path
                     # owns completion, command dispatch, and control metadata.
                     if not self._can_inject_message(pending_msg):
                         break
                     row = await _to_user_message(pending_msg)
+                    if isinstance(row, _DropPendingMessage):
+                        # Consumed without model input: never requeue a stale or
+                        # revoked wake ahead of later arrivals.
+                        dropped += 1
+                        continue
                     if row is None:
                         break
                     converted.append(row)
@@ -1214,7 +1315,7 @@ class AgentLoop:
                         execution_scope.consume_inputs(consumed_inputs)
                     except Exception as exc:
                         raise ExecutionControlError("could not accept consumed inputs") from exc
-                consumed = len(converted)
+                consumed = len(converted) + dropped
                 return converted
             finally:
                 # Commit only a successfully converted prefix. On failure or
@@ -1732,6 +1833,9 @@ class AgentLoop:
                             skip_idle = True
                             raise exc
                         restore_runtime_checkpoint(session)
+                        # An explicit stop saves the partial turn and ends the
+                        # wake obligation with it. The shutdown branch above
+                        # returns first, keeping the marker for recovery.
                         await self.sessions.state.finish_turn(session)
                         logger.info("Saved cancelled turn for session {}", key)
                     except SessionConflictError:
@@ -1899,16 +2003,33 @@ class AgentLoop:
             session = (await self.sessions.state.read(key)
                        if msg.require_existing_session or msg.session_generation is not None
                        else await self.sessions.state.get(key))
+        wake_delivery_id = self._wake_delivery_id(msg)
         if msg.require_existing_session and session is None:
+            if wake_delivery_id is not None:
+                self._orphan_wake(
+                    wake_delivery_id, "origin session is gone before wake consumption"
+                )
+                return None
             raise RuntimeError("required session is not active")
         if msg.session_generation is not None and (
             session is None or session.generation != msg.session_generation
         ):
+            if wake_delivery_id is not None:
+                # A wake published before a replacement never reaches the new
+                # generation; its receipt keeps the report as orphaned.
+                self._orphan_wake(
+                    wake_delivery_id,
+                    "session generation replaced before wake consumption",
+                )
+                return None
             raise RuntimeError("required session generation was replaced")
         if kind is TurnKind.USER:
             # Revocation happens only after admission and generation validation:
             # a stale user input must not revoke the current generation's grant.
             await self._arevoke_external_workflows(key)
+        turn_id = f"{key}:{time.time_ns()}"
+        if not self._consume_wake_obligation(msg, turn_id=turn_id):
+            return None
         if delivery is None:
             delivery = self.turn_delivery_factory.create(msg, key)
         elif delivery.session_key != key:
@@ -1918,7 +2039,7 @@ class AgentLoop:
             msg=msg,
             session=session,
             session_key=key,
-            turn_id=f"{key}:{time.time_ns()}",
+            turn_id=turn_id,
             runtime=runtime,
             kind=kind,
             delivery=delivery,
@@ -2343,6 +2464,7 @@ class AgentLoop:
                 initial_message=ctx.msg,
                 events=ctx.events,
                 commit_session=ctx.commit_session,
+                turn_owner_id=ctx.turn_id,
             )
         ctx.final_content = result.final_content
         ctx.all_messages = result.messages
@@ -2405,7 +2527,9 @@ class AgentLoop:
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
         if ctx.commit_session:
-            await self.sessions.state.finish_turn(session)
+            await self.sessions.state.finish_turn(
+                session, pending_turn_owner=ctx.turn_id
+            )
         if not ctx.ephemeral:
             await self.runtime_event_publisher.session_turn_persisted(
                 ctx.msg,
@@ -2547,6 +2671,10 @@ class AgentLoop:
                 if isinstance(internal_meta, dict)
                 else None
             )
+            skip_user_persist = (
+                isinstance(internal_meta, dict)
+                and internal_meta.get(turn_continuation.SKIP_USER_PERSIST_META) is True
+            )
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
@@ -2578,6 +2706,8 @@ class AgentLoop:
                         ]
                     entry["content"] = filtered
             elif role == "user":
+                if skip_user_persist:
+                    continue
                 if isinstance(content, list):
                     filtered = self._sanitize_persisted_blocks(
                         cast(list[object], content),
@@ -2650,6 +2780,7 @@ class AgentLoop:
 
     def _clear_pending_user_turn(self, session: Session) -> None:
         session.metadata.pop(self._PENDING_USER_TURN_KEY, None)
+        session.metadata.pop(self._PENDING_USER_TURN_OWNER_KEY, None)
 
     def _clear_runtime_checkpoint(self, session: Session) -> None:
         if self._RUNTIME_CHECKPOINT_KEY in session.metadata:

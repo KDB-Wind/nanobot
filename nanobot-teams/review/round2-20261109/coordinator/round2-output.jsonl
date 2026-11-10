@@ -1,0 +1,4 @@
+{"mode": "cancel_race", "attempts_while_submit_in_flight": 0, "cancel_response": "confirmed", "stop_claim_while_in_flight": true, "submits": 1, "cancels": 0, "final_cancel": "confirmed", "final_run": "cancelled", "final_dispatch": "accepted", "observable": 0}
+{"mode": "uncertainty", "effects_uncertain": true, "stop_confirmed": false, "principal_open": 0, "reserved_bytes": 0, "cancel_after_terminal_uncertain": "confirmed", "old_observations_remaining": 0, "old_run_after_remote_resolved": "interrupted", "new_task_admitted_after_ack": true}
+{"mode": "mcp_bounds", "gzip_accepted": true, "decoded_bytes": 1048576}
+{"mode": "migration_bytes", "imported_result_used": 32768, "confirmed_result_limit": 32768, "new_task_admitted": true}

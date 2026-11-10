@@ -1944,6 +1944,7 @@
       "cancel": "Cancel",
       "delivery": "Delivery",
       "cancelAction": "Request cancel",
+      "stopWorkflow": "Stop workflow",
       "noTasks": "No tasks yet.",
       "quarantined": "Some instances are quarantined pending operator review."
     }

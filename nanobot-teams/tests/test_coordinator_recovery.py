@@ -311,7 +311,11 @@ def test_import_04_ledger_is_idempotent_and_preserves_unknown(tmp_path):
         assert result["usage_delegations"] == 2
         assert result["unknown_isolated"] == 1
         quarantines = service.store.active_quarantines()
-        assert any(q.startswith("legacy:") for q in quarantines)
+        from nanobot_teams.coordinator.store import endpoint_guard_key
+
+        assert endpoint_guard_key("http://127.0.0.1:8921") in quarantines, (
+            "an unmatched legacy endpoint guards its normalized endpoint key"
+        )
         again = service.import_04_ledger(
             teams_config={"team_id": "team-x"},
             ledger_path=ledger_path,

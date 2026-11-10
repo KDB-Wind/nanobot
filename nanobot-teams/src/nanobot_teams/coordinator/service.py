@@ -11,7 +11,11 @@ from typing import Any, Callable
 
 from .config import CoordinatorConfig, load_coordinator_config
 from .models import DeliveryMode
-from .store import AdmissionError, CoordinatorStore
+from .store import (
+    AdmissionError,
+    CoordinatorStore,
+    normalize_endpoint,
+)
 from .worker import ClientFactory, DispatchWorker
 
 log = logging.getLogger("nanobot_teams.coordinator.service")
@@ -75,29 +79,13 @@ class CoordinatorService:
 
     # ---- 0.4 migration import ----
 
-    @staticmethod
-    def _normalize_endpoint(endpoint: str) -> str:
-        """Canonical form for matching legacy 0.4 endpoints to registered bots."""
-        from urllib.parse import urlsplit
-
-        raw = endpoint.strip()
-        if not raw:
-            return ""
-        if "://" not in raw:
-            raw = f"http://{raw}"
-        parts = urlsplit(raw)
-        host = (parts.hostname or "").lower()
-        port = parts.port
-        path = parts.path.rstrip("/")
-        return f"{host}:{port}{path}" if port else f"{host}{path}"
-
     def _instance_for_endpoint(self, endpoint: str) -> str | None:
         """Map a legacy endpoint to a registered bot's instance identity."""
-        normalized = self._normalize_endpoint(endpoint)
+        normalized = normalize_endpoint(endpoint)
         if not normalized:
             return None
         for bot in self.store.list_bots():
-            if bot.instance_id and self._normalize_endpoint(bot.endpoint) == normalized:
+            if bot.instance_id and normalize_endpoint(bot.endpoint) == normalized:
                 return bot.instance_id
         return None
 
@@ -164,10 +152,14 @@ class CoordinatorService:
                             f"{endpoint}; verify before reuse",
                         )
                     else:
-                        self.store.quarantine_instance(
-                            f"legacy:{endpoint}",
+                        target_bot = (
+                            self.store.get_bot(record.target) if record.target else None
+                        )
+                        self.store.quarantine_legacy_endpoint(
+                            endpoint,
                             f"0.4 unknown outcome for task {record.task_id}; verify "
                             "before reuse",
+                            secret_env=target_bot.secret_env if target_bot else "",
                         )
                     imported["unknown_isolated"] += 1
         finally:

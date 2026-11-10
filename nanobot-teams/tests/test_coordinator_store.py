@@ -153,6 +153,53 @@ def test_quarantined_instance_rejects_new_tasks_and_resolution_restores(store):
     assert created
 
 
+def test_open_backfills_an_active_legacy_quarantine(tmp_path):
+    path = tmp_path / "coord.sqlite3"
+    bot = make_bot("legacy")
+    store = CoordinatorStore(path)
+    store.open()
+    store.upsert_bot(bot)
+    guard_key = "legacy:127.0.0.1:8921"
+    store.quarantine_instance(guard_key, "0.4 unknown outcome")
+    assert store.active_legacy_guards() == []
+    store.close()
+
+    upgraded = CoordinatorStore(path)
+    upgraded.open()
+    try:
+        guards = upgraded.active_legacy_guards()
+        assert [guard.guard_key for guard in guards] == [guard_key]
+        assert guards[0].endpoint == bot.endpoint
+        assert guards[0].secret_env == bot.secret_env
+    finally:
+        upgraded.close()
+
+    reopened = CoordinatorStore(path)
+    reopened.open()
+    try:
+        assert len(reopened.active_legacy_guards()) == 1
+    finally:
+        reopened.close()
+
+
+def test_open_keeps_an_unmapped_legacy_guard_unresolved(tmp_path):
+    path = tmp_path / "coord.sqlite3"
+    store = CoordinatorStore(path)
+    store.open()
+    guard_key = "legacy:127.0.0.1:9"
+    store.quarantine_instance(guard_key, "0.4 unknown outcome")
+    store.close()
+
+    upgraded = CoordinatorStore(path)
+    upgraded.open()
+    try:
+        guards = upgraded.active_legacy_guards()
+        assert [guard.endpoint for guard in guards] == ["http://127.0.0.1:9"]
+        assert guards[0].secret_env == ""
+    finally:
+        upgraded.close()
+
+
 def test_alias_shares_isolation_through_instance_identity(store):
     store.create_project("proj-1", "Main")
     bot = make_bot()
@@ -215,6 +262,73 @@ def test_cancel_request_states(store):
     )
     settled = store.get_task(task2.task_id)
     assert settled.cancel_state.value == "confirmed"
+
+
+def test_submit_started_is_the_cancel_send_fact(store):
+    """N01: only the persisted send fact makes a cancel unconfirmed."""
+    store.create_project("proj-1", "Main")
+    task, _ = admit(store)
+    entry = store.dispatch_entry_for_task(task.task_id)
+    assert entry is not None and entry.submit_started_at is None
+    store.mark_submit_started(entry.entry_id)
+    started = store.dispatch_entry_for_task(task.task_id)
+    assert started is not None and started.submit_started_at is not None
+    first_stamp = started.submit_started_at
+    store.mark_submit_started(entry.entry_id)
+    again = store.dispatch_entry_for_task(task.task_id)
+    assert again is not None and again.submit_started_at == first_stamp, (
+        "the send fact must never be rewritten"
+    )
+    cancelled = store.request_cancel(task.task_id)
+    assert cancelled is not None
+    assert cancelled.cancel_state.value == "unconfirmed"
+    assert cancelled.stop_confirmed is False
+    assert cancelled.run_state == "unobserved"
+
+
+def test_open_migrates_dispatch_outbox_send_fact(tmp_path):
+    """N01: an existing database gains submit_started_at without losing rows."""
+    import sqlite3
+
+    path = tmp_path / "old-coord.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE dispatch_outbox ("
+        "entry_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " task_id TEXT NOT NULL,"
+        " state TEXT NOT NULL,"
+        " attempts INTEGER NOT NULL DEFAULT 0,"
+        " next_attempt_at TEXT NOT NULL,"
+        " last_error TEXT NOT NULL DEFAULT ''"
+        ");"
+    )
+    conn.execute(
+        "INSERT INTO dispatch_outbox(task_id, state, next_attempt_at) VALUES (?,?,?)",
+        ("task_legacy", "pending", "2026-01-01T00:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO dispatch_outbox(task_id, state, attempts, next_attempt_at) "
+        "VALUES (?,?,?,?)",
+        ("task_in_doubt", "pending", 2, "2026-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+    store = CoordinatorStore(path)
+    store.open()
+    try:
+        columns = {
+            row[1] for row in store._conn.execute("PRAGMA table_info(dispatch_outbox)")
+        }
+        assert "submit_started_at" in columns
+        entries = {entry.task_id: entry for entry in store.pending_dispatch(utc_now())}
+        assert entries["task_legacy"].submit_started_at is None
+        # An old retried row keeps its "may have been sent" meaning.
+        assert entries["task_in_doubt"].submit_started_at is not None
+        store.mark_submit_started(entries["task_legacy"].entry_id)
+        migrated = store.dispatch_entry_for_task("task_legacy")
+        assert migrated is not None and migrated.submit_started_at is not None
+    finally:
+        store.close()
 
 
 def test_new_task_id_shape():

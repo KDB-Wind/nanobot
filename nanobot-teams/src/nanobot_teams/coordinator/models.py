@@ -117,6 +117,9 @@ class DispatchEntry:
     attempts: int
     next_attempt_at: datetime
     last_error: str = ""
+    # Persisted before the first submit byte; never cleared. It is the only
+    # proof that a cancel can no longer claim "never sent".
+    submit_started_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,15 @@ class Quarantine:
     resolved_at: datetime | None = None
     resolved_by: str = ""
     resolution_note: str = ""
+
+
+@dataclass(frozen=True)
+class LegacyEndpointGuard:
+    guard_key: str
+    endpoint: str
+    secret_env: str
+    instance_id: str | None
+    created_at: datetime
 
 
 @dataclass(frozen=True)

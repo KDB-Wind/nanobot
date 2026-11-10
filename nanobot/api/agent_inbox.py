@@ -74,7 +74,10 @@ def _error_from_protocol(exc: web.HTTPException) -> web.Response:
 def _bounded_int(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError("terminal_revision must be an integer")
-    parsed = int(value)
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError("terminal_revision must be an integer") from None
     if parsed < 0:
         raise ValueError("terminal_revision must be >= 0")
     return parsed
@@ -151,6 +154,10 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
     result_text = str(body.get("result_text", ""))
     if len(result_text.encode("utf-8")) > 32 * 1024:
         return _error(413, "result_too_large", "result_text exceeds 32 KiB.")
+    try:
+        terminal_revision = _bounded_int(body.get("terminal_revision", 0))
+    except ValueError as exc:
+        return _error(400, "invalid_field", str(exc))
     outcome = body.get("outcome")
     outcome_code = ""
     if isinstance(outcome, dict):
@@ -167,7 +174,7 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
         bot_id=capability.bot_id,
         instance_id=capability.instance_id,
         run_id=str(body.get("run_id", "")),
-        terminal_revision=_bounded_int(body.get("terminal_revision", 0)),
+        terminal_revision=terminal_revision,
         outcome_code=outcome_code,
         result_text=result_text,
         result_truncated=bool(body.get("result_truncated", False)),
@@ -176,7 +183,7 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
             bot_id=capability.bot_id,
             instance_id=capability.instance_id,
             run_id=str(body.get("run_id", "")),
-            terminal_revision=_bounded_int(body.get("terminal_revision", 0)),
+            terminal_revision=terminal_revision,
             outcome_code=outcome_code,
             result_text=result_text,
         ),
@@ -207,6 +214,19 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
     return response
 
 
+async def handle_workflow_revoke(request: web.Request) -> web.Response:
+    """Operator stop: revoke one workflow's auto-continue grant."""
+    denied = _require_inbox_auth(request)
+    if denied is not None:
+        return denied
+    inbox: ExternalInbox = request.app[_INBOX_KEY]
+    workflow_id = request.match_info["workflow_id"].strip()
+    if not workflow_id:
+        return _error(400, "invalid_field", "workflow_id is required.")
+    revoked = await inbox.revoke_workflow_async(workflow_id)
+    return _json({"workflow_id": workflow_id, "revoked": revoked})
+
+
 async def handle_inbox_receipt(request: web.Request) -> web.Response:
     denied = _require_inbox_auth(request)
     if denied is not None:
@@ -231,6 +251,9 @@ def register_inbox_routes(
     app[_INBOX_KEY] = inbox
     app[_INBOX_CONFIG_KEY] = config
     app.router.add_post("/v1/agent-inbox/capabilities/validate", handle_capability_validate)
+    app.router.add_post(
+        "/v1/agent-inbox/workflows/{workflow_id}/revoke", handle_workflow_revoke
+    )
     app.router.add_post("/v1/agent-inbox", handle_inbox_receive)
     app.router.add_get("/v1/agent-inbox/{delivery_id}", handle_inbox_receipt)
 

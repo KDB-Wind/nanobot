@@ -22,6 +22,12 @@ from . import __version__
 
 _SERVER_NAME = "nanobot-teams-async"
 
+# Same bounded read contract as the bot-side control client (F15/M04): the
+# coordinator control client must not decode compression, must cap the raw
+# body at the protocol limit, and must reject non-JSON through its typed error.
+MAX_RESPONSE_BYTES = 256 * 1024
+MAX_JSON_DEPTH = 16
+
 _LIST_BOTS_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
 _SUBMIT_SCHEMA: dict[str, Any] = {
@@ -94,6 +100,72 @@ class CoordinatorHttpError(Exception):
         self.message = message
 
 
+def _strict_json_object(raw: bytes) -> dict[str, Any] | None:
+    """Parse a bounded JSON object; duplicate keys and over-deep nests fail."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+    def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate object key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(text, object_pairs_hook=pairs_hook)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(parsed, dict) or _depth(parsed) > MAX_JSON_DEPTH:
+        return None
+    return parsed
+
+
+def _depth(value: object, level: int = 0) -> int:
+    if isinstance(value, dict):
+        return max((_depth(v, level + 1) for v in value.values()), default=level + 1)
+    if isinstance(value, list):
+        return max((_depth(v, level + 1) for v in value), default=level + 1)
+    return level
+
+
+async def _bounded_payload(response: httpx.Response) -> dict[str, Any]:
+    """Read a coordinator reply within the same bounds the bot client uses.
+
+    Compression is rejected from the headers before decoding, the declared
+    length is checked, and the raw stream stops at the 256 KiB cap (M04).
+    """
+    status = response.status_code
+    encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+    if encoding not in ("", "identity"):
+        raise CoordinatorHttpError(
+            status, "response_compressed", "Compressed replies are not accepted."
+        )
+    declared = response.headers.get("Content-Length", "")
+    if declared:
+        try:
+            if int(declared) > MAX_RESPONSE_BYTES:
+                raise CoordinatorHttpError(
+                    status, "response_too_large", "Reply exceeds the 256 KiB protocol limit."
+                )
+        except ValueError:
+            raise CoordinatorHttpError(status, "invalid_response", "Invalid Content-Length.")
+    raw = b""
+    async for chunk in response.aiter_raw():
+        raw += chunk
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise CoordinatorHttpError(
+                status, "response_too_large", "Reply exceeds the 256 KiB protocol limit."
+            )
+    payload = _strict_json_object(raw)
+    if payload is None:
+        raise CoordinatorHttpError(status, "invalid_response", "Non-JSON reply.")
+    return payload
+
+
 class CoordinatorClient:
     def __init__(self, base_url: str, token: str, *, timeout_s: float = 10.0) -> None:
         self._client = httpx.AsyncClient(
@@ -109,17 +181,16 @@ class CoordinatorClient:
         await self._client.aclose()
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        response = await self._client.request(method, path, **kwargs)
+        request = self._client.build_request(method, path, **kwargs)
+        response = await self._client.send(request, stream=True)
         try:
-            payload = response.json()
-        except ValueError:
-            raise CoordinatorHttpError(response.status_code, "invalid_response", "Non-JSON reply.")
+            payload = await _bounded_payload(response)
+        finally:
+            await response.aclose()
         if response.status_code >= 400:
-            code = str(payload.get("code", "error")) if isinstance(payload, dict) else "error"
-            message = str(payload.get("message", "")) if isinstance(payload, dict) else ""
+            code = str(payload.get("code", "error"))
+            message = str(payload.get("message", ""))
             raise CoordinatorHttpError(response.status_code, code, message)
-        if not isinstance(payload, dict):
-            raise CoordinatorHttpError(response.status_code, "invalid_response", "Expected an object.")
         return payload
 
     async def list_bots(self) -> list[dict[str, Any]]:

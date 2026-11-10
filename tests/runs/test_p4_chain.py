@@ -370,3 +370,75 @@ async def test_session_reset_routes_delivery_orphaned(chain):
     session = await state.read(chain["session_key"])
     assert session is not None
     assert not any(m.get("injected_event") == "external_delivery" for m in session.messages)
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_inbox_rejects_non_integer_terminal_revision(chain):
+    """M06: a malformed revision is a structured 400, not a text/plain 500."""
+    inbox = chain["inbox"]
+    capability = inbox.mint_capability(
+        session_key=chain["session_key"],
+        session_generation=chain["generation"],
+        workflow_id="wf_rev",
+        operation_key="op_rev",
+        bot_id="research",
+        instance_id="inst_research",
+        principal_id="teams-coordinator",
+    )
+    payload = {
+        "delivery_id": "del_bad_revision",
+        "reply_capability": capability.token,
+        "operation_key": "op_rev",
+        "workflow_id": "wf_rev",
+        "bot_id": "research",
+        "instance_id": "inst_research",
+        "task_id": "task_rev",
+        "run_id": "run_rev",
+        "terminal_revision": "bad",
+        "outcome": {"code": "succeeded"},
+        "result_text": "REPORT",
+        "result_truncated": False,
+    }
+    response = await chain["inbox_client"].post(
+        "/v1/agent-inbox",
+        headers={"Authorization": f"Bearer {RUNS_KEY}"},
+        json=payload,
+    )
+    assert response.status == 400, await response.text()
+    assert response.content_type == "application/json"
+    body = await response.json()
+    assert body["code"] == "invalid_field"
+    assert "terminal_revision" in body["message"]
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_inbox_workflow_revoke_route_requires_key_and_flips_one_grant(chain):
+    """T5: the planner inbox exposes the operator workflow-stop entry."""
+    inbox = chain["inbox"]
+    inbox_client = chain["inbox_client"]
+    for workflow in ("wf-stop-route", "wf-keep-route"):
+        inbox.mint_capability(
+            session_key=chain["session_key"],
+            session_generation=chain["generation"],
+            workflow_id=workflow,
+            operation_key=f"op-{workflow}",
+            bot_id="research",
+            instance_id="inst_research",
+            principal_id="teams-coordinator",
+        )
+    url = "/v1/agent-inbox/workflows/wf-stop-route/revoke"
+    denied = await inbox_client.post(url)
+    assert denied.status == 401
+    auth = {"Authorization": f"Bearer {RUNS_KEY}"}
+    response = await inbox_client.post(url, headers=auth)
+    assert response.status == 200, await response.text()
+    assert await response.json() == {"workflow_id": "wf-stop-route", "revoked": True}
+    assert inbox.workflow_allows_auto_continue("wf-stop-route") is False
+    assert inbox.workflow_allows_auto_continue("wf-keep-route") is True
+    replay = await inbox_client.post(url, headers=auth)
+    assert replay.status == 200
+    assert (await replay.json())["revoked"] is False
+    blank = await inbox_client.post(
+        "/v1/agent-inbox/workflows/%20/revoke", headers=auth
+    )
+    assert blank.status == 400
+    assert (await blank.json())["code"] == "invalid_field"

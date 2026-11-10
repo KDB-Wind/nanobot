@@ -1944,6 +1944,7 @@
       "cancel": "取消",
       "delivery": "回传",
       "cancelAction": "请求取消",
+      "stopWorkflow": "停止工作流",
       "noTasks": "暂无任务。",
       "quarantined": "部分实例待操作者核查,已隔离。"
     }

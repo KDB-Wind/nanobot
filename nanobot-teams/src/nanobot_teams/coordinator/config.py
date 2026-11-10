@@ -15,6 +15,8 @@ _ALLOWED_KEYS = frozenset(
         "planner_token_env",
         "planner",
         "bot_homes_root",
+        "scaffold_model_preset",
+        "scaffold_user_config",
     }
 )
 
@@ -99,6 +101,22 @@ def load_coordinator_config(path: str | Path) -> CoordinatorConfig:
         )
     control_dir = Path(raw.get("control_dir") or (file_path.parent / "coordinator-data")).resolve()
     homes = raw.get("bot_homes_root")
+    preset_raw = raw.get("scaffold_model_preset")
+    if preset_raw is None:
+        scaffold_preset = ""
+    else:
+        if not isinstance(preset_raw, str):
+            raise ConfigError("scaffold_model_preset must be a string.")
+        scaffold_preset = preset_raw.strip()
+        if not scaffold_preset:
+            raise ConfigError("scaffold_model_preset must be non-empty when set.")
+    user_config_raw = raw.get("scaffold_user_config")
+    if user_config_raw is None:
+        scaffold_user_config: Path | None = None
+    else:
+        if not isinstance(user_config_raw, str) or not user_config_raw.strip():
+            raise ConfigError("scaffold_user_config must be a non-empty path string.")
+        scaffold_user_config = Path(user_config_raw).expanduser().resolve()
     config = CoordinatorConfig(
         control_dir=control_dir,
         host=str(listen.get("host", "127.0.0.1")),
@@ -107,6 +125,8 @@ def load_coordinator_config(path: str | Path) -> CoordinatorConfig:
         planner_token_env=str(raw.get("planner_token_env", "TEAMS_COORDINATOR_PLANNER_TOKEN")),
         planner=planner,
         bot_homes_root=Path(homes).resolve() if homes else None,
+        scaffold_model_preset=scaffold_preset,
+        scaffold_user_config=scaffold_user_config,
         source_path=file_path,
     )
     config.validate()

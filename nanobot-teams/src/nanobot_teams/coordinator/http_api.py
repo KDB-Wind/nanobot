@@ -12,8 +12,14 @@ from typing import Any
 
 from aiohttp import web
 
-from .config import CoordinatorConfig
-from .models import Bot, DeliveryMode
+from .config import CoordinatorConfig, PlannerBinding
+from .models import (
+    TERMINAL_RUN_STATES,
+    Bot,
+    CancelState,
+    DeliveryMode,
+    DispatchState,
+)
 from .store import (
     AdmissionError,
     CoordinatorStore,
@@ -24,6 +30,7 @@ from .worker import task_public_json
 
 PAGE_MAX = 100
 SSE_HEARTBEAT_SECONDS = 15.0
+WORKFLOW_STOP_TASK_LIMIT = 500
 _STORE_KEY = web.AppKey[CoordinatorStore]("coordinator_store")
 _CONFIG_KEY = web.AppKey[CoordinatorConfig]("coordinator_config")
 _ROLE_KEY = web.RequestKey[str]("coordinator_role")
@@ -107,6 +114,47 @@ def _is_loopback_http_endpoint(endpoint: str) -> bool:
     if parts.scheme != "http" or parts.username is not None or parts.password is not None:
         return False
     return parts.hostname in ("127.0.0.1", "localhost", "::1")
+
+
+async def _revoke_planner_workflow(planner: PlannerBinding, workflow_id: str) -> bool:
+    """Revoke one workflow grant at the planner inbox, within protocol bounds.
+
+    Any missing key, transport failure, or non-conforming answer reports
+    False: the operator stop still cancels the workflow's tasks, it just
+    cannot claim the planner grant was withdrawn.
+    """
+    import os
+    from urllib.parse import quote as urlquote
+
+    import httpx
+
+    from .client import _bounded_json_payload  # pyright: ignore[reportPrivateUsage]
+
+    inbox_key = os.environ.get(planner.inbox_key_env, "").strip()
+    if not inbox_key:
+        return False
+    url = (
+        planner.inbox_url.rstrip("/")
+        + "/v1/agent-inbox/workflows/"
+        + urlquote(workflow_id, safe="")
+        + "/revoke"
+    )
+    async with httpx.AsyncClient(
+        timeout=10.0, follow_redirects=False, trust_env=False
+    ) as client:
+        request = client.build_request(
+            "POST", url, headers={"Authorization": f"Bearer {inbox_key}"}
+        )
+        response = await client.send(request, stream=True)
+        try:
+            payload = await _bounded_json_payload(  # pyright: ignore[reportPrivateUsage]
+                response
+            )
+        finally:
+            await response.aclose()
+    if response.status_code != 200 or payload is None:
+        return False
+    return bool(payload.get("revoked", False))
 
 
 def bot_public_json(bot: Bot, *, include_secret_env: bool = True) -> dict[str, Any]:
@@ -286,7 +334,10 @@ def build_app(
         except IdempotencyConflictError as exc:
             return api_error(409, exc.code, exc.detail)
         except AdmissionError as exc:
-            return api_error(422, exc.code, exc.detail)
+            # A quarantined bot is a state conflict, not a malformed request:
+            # the same body becomes admissible once the operator resolves it.
+            status = 409 if exc.code == "bot_quarantined" else 422
+            return api_error(status, exc.code, exc.detail)
         return _json_response(task_public_json(task), status=201 if created else 200)
 
     async def list_tasks(request: web.Request) -> web.Response:
@@ -660,6 +711,89 @@ def build_app(
             return api_error(404, "quota_not_found", "No imported usage for that caller.")
         return _json_response({"confirmed": True})
 
+    async def stop_workflow(request: web.Request) -> web.Response:
+        """Stop a whole workflow: revoke its grant, then cancel its open tasks."""
+        denied = require_role(request, ("operator", "planner"))
+        if denied is not None:
+            return denied
+        workflow_id = request.match_info["workflow_id"].strip()
+        if not workflow_id:
+            return api_error(400, "invalid_field", "workflow_id is required.")
+        # Authorize the workflow before any grant revocation or task write. A
+        # planner owns only its own tasks; an operator owns the whole workflow.
+        planner_scope = "planner" if request[_ROLE_KEY] == "planner" else None
+        tasks = store.list_tasks(
+            workflow_id=workflow_id,
+            caller_principal=planner_scope,
+            limit=WORKFLOW_STOP_TASK_LIMIT,
+        )
+        if planner_scope is not None and not tasks:
+            return api_error(403, "forbidden", "Not your workflow.")
+        revoked = False
+        if config.planner is not None:
+            try:
+                revoked = await _revoke_planner_workflow(config.planner, workflow_id)
+            except Exception:  # noqa: BLE001 - the cancel pass must still run
+                revoked = False
+        cancelled: list[str] = []
+        unconfirmed: list[str] = []
+        for task in tasks:
+            if task.cancel_state is not CancelState.NONE:
+                continue
+            if task.dispatch_state not in (
+                DispatchState.ACCEPTED,
+                DispatchState.PENDING,
+            ):
+                continue
+            if (
+                task.run_state in TERMINAL_RUN_STATES
+                and task.stop_confirmed
+                and not task.effects_uncertain
+            ):
+                # Already finished with a confirmed stop: no cancel to send.
+                continue
+            updated = store.request_cancel(task.task_id)
+            if updated is None:
+                continue
+            if updated.cancel_state is CancelState.CONFIRMED:
+                cancelled.append(updated.task_id)
+            else:
+                # Requested or unconfirmed: the stop is not proven yet, so the
+                # operator must not read it as cancelled.
+                unconfirmed.append(updated.task_id)
+        return _json_response(
+            {
+                "workflow_id": workflow_id,
+                "revoked": revoked,
+                "cancelled": cancelled,
+                "unconfirmed": unconfirmed,
+                "total": len(tasks),
+            }
+        )
+
+    async def resolve_quarantine(request: web.Request) -> web.Response:
+        """Operator resolution for one quarantine key (instance or endpoint)."""
+        denied = require_role(request, ("operator",))
+        if denied is not None:
+            return denied
+        try:
+            body = await request.json()
+        except ValueError:
+            return api_error(400, "invalid_json", "A JSON body is required.")
+        if not isinstance(body, dict):
+            return api_error(400, "invalid_json", "Body must be an object.")
+        actor = body.get("actor")
+        note = body.get("note")
+        if not isinstance(actor, str) or not actor.strip():
+            return api_error(400, "invalid_field", "actor must be a non-empty string.")
+        if not isinstance(note, str) or not note.strip():
+            return api_error(400, "invalid_field", "note must be a non-empty string.")
+        from urllib.parse import unquote
+
+        key = unquote(request.match_info["key"])
+        store.resolve_quarantine(key, actor.strip(), note.strip())
+        return _json_response({"key": key, "resolved": True})
+
     app.router.add_get("/v1/teams/capabilities", capabilities)
     app.router.add_post("/v1/teams/tasks", create_task)
     app.router.add_get("/v1/teams/tasks", list_tasks)
@@ -676,6 +810,8 @@ def build_app(
     app.router.add_get("/v1/teams/bots", list_bots_route)
     app.router.add_get("/v1/teams/quota/{caller}", caller_quota_route)
     app.router.add_post("/v1/teams/quota/{caller}/confirm", confirm_caller_quota)
+    app.router.add_post("/v1/teams/workflows/{workflow_id}/stop", stop_workflow)
+    app.router.add_post("/v1/teams/quarantine/{key}/resolve", resolve_quarantine)
     return app
 
 

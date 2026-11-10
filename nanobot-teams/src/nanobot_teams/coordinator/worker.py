@@ -12,7 +12,7 @@ from typing import Any
 
 from .client import BotRunClient, BotUnreachableError
 from .models import TERMINAL_RUN_STATES, DeliveryState
-from .store import CoordinatorStore, utc_now
+from .store import CoordinatorStore, endpoint_guard_key, utc_now
 
 log = logging.getLogger("nanobot_teams.coordinator.worker")
 
@@ -82,6 +82,7 @@ class DispatchWorker:
         progressed = False
         progressed |= await self._dispatch_due()
         progressed |= await self._observe_accepted()
+        await self._drive_pending_cancels()
         progressed |= await self._fetch_missing_results()
         progressed |= await self._deliver_results()
         return progressed
@@ -129,12 +130,9 @@ class DispatchWorker:
             return True
         # Isolation is re-checked at dispatch time, not only at admission: a
         # task admitted before a quarantine must not create remote work now.
-        if bot.instance_id and bot.instance_id in self._store.active_quarantines():
-            self._store.defer_dispatch(
-                entry.entry_id,
-                utc_now() + timedelta(seconds=QUARANTINE_RECHECK_S),
-                "bot instance quarantined; dispatch deferred",
-            )
+        reason = self._quarantine_reason(bot)
+        if reason is not None:
+            self._defer_for_quarantine(entry, reason)
             return True
         # An unconfirmed cancel on a never-accepted task means a submit may
         # have been lost in flight: reconcile by the original key first, and
@@ -163,22 +161,70 @@ class DispatchWorker:
             "input_text": task.input_text,
             "deadline_at": task.deadline_at.isoformat(),
         }
-        if bot.instance_id:
-            # Verify the endpoint identity before creating any run on it.
-            try:
-                caps = await client.capabilities()
-            except BotUnreachableError as exc:
-                await self._reconcile_unknown(client, task, entry, str(exc))
-                return True
-            if caps.status != 200 or not isinstance(caps.payload, dict):
-                await self._reconcile_unknown(
-                    client, task, entry, f"capabilities returned {caps.status}"
+        # Authenticate the endpoint before creating any run on it. An unbound
+        # bot is bound here, in one committed step, so the instance quarantine
+        # and the migration's legacy endpoint guard both apply before a submit.
+        # A probe failure proves nothing reached the remote: retry it as a defer
+        # rather than reconciling a delivery that never happened.
+        try:
+            caps = await client.capabilities()
+        except BotUnreachableError as exc:
+            self._defer_preflight(entry, f"capabilities unreachable: {exc}")
+            return True
+        if caps.status != 200 or not isinstance(caps.payload, dict):
+            self._defer_preflight(entry, f"capabilities returned {caps.status}")
+            return True
+        seen_instance = str(caps.payload.get("instance_id", ""))
+        if not seen_instance:
+            self._defer_preflight(entry, "capabilities did not report an instance id")
+            return True
+        legacy_reason = await self._legacy_guard_reason(bot, seen_instance)
+        if legacy_reason is not None:
+            self._defer_for_quarantine(entry, legacy_reason)
+            return True
+        if not bot.instance_id:
+            if not self._store.bind_instance(bot.bot_id, seen_instance):
+                await self._indeterminate_identity(
+                    task, bot.instance_id or "unbound", seen_instance
                 )
                 return True
-            seen_instance = str(caps.payload.get("instance_id", ""))
-            if seen_instance and seen_instance != bot.instance_id:
-                await self._indeterminate_identity(task, bot.instance_id, seen_instance)
+            bound = self._store.get_bot(bot.bot_id)
+            if bound is None:
+                self._defer_preflight(entry, "bot vanished while binding its instance")
                 return True
+            if seen_instance in self._store.active_quarantines():
+                self._defer_for_quarantine(
+                    entry,
+                    f"instance {seen_instance} is quarantined: "
+                    f"{self._store.active_quarantines()[seen_instance].reason}",
+                )
+                return True
+            bot = bound
+        elif seen_instance != bot.instance_id:
+            await self._indeterminate_identity(task, bot.instance_id, seen_instance)
+            return True
+        # The quarantine may have been written while the probe was awaited.
+        reason = self._quarantine_reason(bot)
+        if reason is not None:
+            self._defer_for_quarantine(entry, reason)
+            return True
+        # Every awaited preflight is done. Record the send fact before the
+        # first submit byte, then re-read the task so a cancel or quarantine
+        # that landed during those awaits stops the submit.
+        self._store.mark_submit_started(entry.entry_id)
+        fresh = self._store.get_task(task.task_id)
+        if fresh is None:
+            return True
+        reason = self._quarantine_reason(bot)
+        if reason is not None:
+            self._defer_for_quarantine(entry, reason)
+            return True
+        if fresh.cancel_state.value != "none":
+            # A cancel that beat the send needs the same key lookup a lost
+            # submit would: it either finds the run to stop or proves none.
+            if fresh.dispatch_state.value == "pending" and fresh.remote_run_id is None:
+                await self._reconcile_cancelled_pending(client, fresh, entry)
+            return True
         try:
             response = await client.submit(operation_key=task.operation_key, protocol_body=body)
         except BotUnreachableError as exc:
@@ -199,9 +245,17 @@ class DispatchWorker:
                 return True
             if instance:
                 self._store.bind_instance(bot.bot_id, instance)
-            self._store.update_after_submit(
+            accepted = self._store.update_after_submit(
                 task.task_id, remote_run_id=run_id, remote_instance_id=instance
             )
+            if accepted.cancel_state.value != "none":
+                # The cancel arrived while the request was in flight: the run
+                # exists, so keep its accepted id and ask the remote to stop it
+                # in this same pump instead of confirming a phantom cancel.
+                try:
+                    await client.cancel(run_id)
+                except BotUnreachableError:
+                    pass  # the unconfirmed cancel keeps driving on later pumps
             return True
         if response.status == 409 and (response.payload or {}).get("code") in (
             "idempotency_conflict",
@@ -242,6 +296,73 @@ class DispatchWorker:
         )
         return True
 
+    def _quarantine_reason(self, bot) -> str | None:
+        """Match both identities a bot can be isolated under.
+
+        The instance key covers a bound bot; the legacy endpoint key covers a
+        bot registered without one and stays valid after it binds, because the
+        0.4 unknown was recorded against the endpoint topology itself.
+        """
+        active = self._store.active_quarantines()
+        if bot.instance_id and bot.instance_id in active:
+            return active[bot.instance_id].reason
+        key = endpoint_guard_key(bot.endpoint)
+        if key in active:
+            return active[key].reason
+        return None
+
+    async def _legacy_guard_reason(self, bot, seen_instance: str) -> str | None:
+        """Refuse a target that may be the legacy unknown's alias.
+
+        The guard records the original endpoint and the credential the 0.4
+        task used. Probing that endpoint with that credential is the only
+        evidence that links a newly seen instance to the incident. An unmapped
+        or unreachable guard stays closed until an operator resolves it.
+        """
+        for guard in self._store.active_legacy_guards():
+            if guard.instance_id == seen_instance:
+                return f"legacy guard {guard.guard_key} maps to this instance"
+            if guard.instance_id:
+                continue
+            if not guard.secret_env:
+                return (
+                    f"legacy guard {guard.guard_key} has no credential mapping; "
+                    "an operator must resolve it"
+                )
+            try:
+                probe = await self._clients.for_bot(
+                    guard.endpoint, guard.secret_env
+                ).capabilities()
+            except (MissingSecretError, BotUnreachableError):
+                return (
+                    f"legacy guard {guard.guard_key} is unresolved and "
+                    f"{guard.endpoint} is unreachable"
+                )
+            if probe.status != 200 or not isinstance(probe.payload, dict):
+                return f"legacy guard {guard.guard_key} probe returned {probe.status}"
+            instance = str(probe.payload.get("instance_id", ""))
+            if not instance:
+                return f"legacy guard {guard.guard_key} probe reported no instance"
+            self._store.map_legacy_guard(guard.guard_key, instance)
+            if instance == seen_instance:
+                return f"legacy guard {guard.guard_key} maps to this instance"
+        return None
+
+    def _defer_for_quarantine(self, entry, reason: str) -> None:
+        self._store.defer_dispatch(
+            entry.entry_id,
+            utc_now() + timedelta(seconds=QUARANTINE_RECHECK_S),
+            f"bot quarantined ({reason}); dispatch deferred",
+        )
+
+    def _defer_preflight(self, entry, error: str) -> None:
+        """Retry a pre-submit probe failure; it never proves a delivery."""
+        delay = BACKOFF_SECONDS[min(entry.attempts, len(BACKOFF_SECONDS) - 1)]
+        jitter = random.uniform(0, delay * 0.25)
+        self._store.bump_dispatch_attempt(
+            entry.entry_id, utc_now() + timedelta(seconds=delay + jitter), error
+        )
+
     async def _reconcile_unknown(
         self, client: BotRunClient, task, entry, reason: str
     ) -> None:
@@ -272,11 +393,12 @@ class DispatchWorker:
     async def _reconcile_cancelled_pending(
         self, client: BotRunClient, task, entry
     ) -> None:
-        """Settle an unconfirmed cancel on a never-accepted task.
+        """Reconcile an unconfirmed cancel on a task with no bound run.
 
-        The lookup proves whether the lost submit created a run: found means the
-        cancel becomes a real remote cancel; not found means nothing was ever
-        created and the task closes as cancelled-before-dispatch.
+        A lookup that finds a run binds it and cancels. A 404 is one
+        observation, not a fence: the original POST may still commit, so the
+        cancel stays unknown and the same key is reconciled again. Nothing new
+        is submitted after the cancel request.
         """
         try:
             lookup = await client.lookup(task.operation_key)
@@ -299,9 +421,15 @@ class DispatchWorker:
                 pass  # the accepted task's cancel path keeps driving the stop
             return
         if lookup is not None and lookup.status == 404:
-            # The remote definitively never saw this key: no work exists.
-            self._store.close_cancelled_unknown(
-                task.task_id, "reconciled: remote never created this run"
+            # A missing row at this instant is not a fence: the original POST
+            # may still be in flight and can commit later. Keep the cancel
+            # unknown and reconcile the same key again.
+            delay = BACKOFF_SECONDS[min(entry.attempts, len(BACKOFF_SECONDS) - 1)]
+            jitter = random.uniform(0, delay * 0.25)
+            self._store.bump_dispatch_attempt(
+                entry.entry_id,
+                utc_now() + timedelta(seconds=delay + jitter),
+                "cancel reconciliation pending: lookup returned 404",
             )
             return
         # Unknown transport: retry the same key on the normal backoff.
@@ -474,7 +602,6 @@ class DispatchWorker:
             if self._store.get_task(task.task_id).remote_revision >= int(
                 payload.get("revision", 0)
             ):
-                progressed |= await self._drive_cancel(task, client)
                 continue
             terminal = run_state in TERMINAL_RUN_STATES
             result_text = None
@@ -514,7 +641,6 @@ class DispatchWorker:
                     f"Task {task.task_id} reported unconfirmed background effects.",
                 )
             progressed = True
-            progressed |= await self._drive_cancel(task, client)
         return progressed
 
     async def _fetch_missing_results(self) -> bool:
@@ -557,14 +683,41 @@ class DispatchWorker:
                 progressed = True
         return progressed
 
+    async def _drive_pending_cancels(self) -> None:
+        """Keep driving cancels whose stop is not confirmed.
+
+        These tasks may already be terminal: a terminal run state is not stop
+        evidence, so a cancel that is still unconfirmed keeps being driven
+        until the remote confirms the stop or a newer observation does. This is
+        background reconciliation, not dispatch progress, so it does not force
+        the loop out of its idle sleep.
+        """
+        for task in self._store.tasks_with_pending_cancel(limit=16):
+            bot = self._store.get_bot(task.bot_id)
+            if bot is None:
+                continue
+            try:
+                client = self._clients.for_bot(bot.endpoint, bot.secret_env)
+            except MissingSecretError:
+                continue
+            await self._drive_cancel(task, client)
+
     async def _drive_cancel(self, task, client: BotRunClient) -> bool:
+        """Drive a remote stop for both requested and unconfirmed cancels.
+
+        An unconfirmed cancel is exactly the case where a run may exist without
+        a local stop observation; it must keep driving. A terminal run is only
+        exempt when its stop is actually confirmed: a terminal state is not
+        stop evidence.
+        """
         current = self._store.get_task(task.task_id)
         if (
             current is None
-            or current.cancel_state.value != "requested"
+            or current.cancel_state.value not in ("requested", "unconfirmed")
             or current.remote_run_id is None
-            or current.run_state in TERMINAL_RUN_STATES
         ):
+            return False
+        if current.run_state in TERMINAL_RUN_STATES and current.stop_confirmed:
             return False
         try:
             response = await client.cancel(current.remote_run_id)
