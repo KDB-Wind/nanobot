@@ -32,6 +32,12 @@ The end-to-end test `test_active_turn_settles_its_wake_under_a_public_turn_id`
 drives a live turn with the channel id `public-42`, injects a wake mid-turn and
 asserts the marker is gone; it fails on the pre-fix code and passes now.
 
+An explicit Stop and a preservation-mode shutdown have separate probes.
+`inbox/probe_explicit_stop.py` reports `cancelled=1, pending=null, owner=null`
+and a restart with `recovery=null`; on the pre-fix code it fails on the owner
+assertion. `inbox/probe_shutdown_wake.py` keeps `pending=true` and the full
+owner through shutdown, and the restart yields `restart_requires_confirmation`.
+
 ## Changes
 
 - `nanobot/runs/executor.py`, `nanobot/runs/service.py`: `RunCancelled` carries
@@ -47,10 +53,14 @@ asserts the marker is gone; it fails on the pre-fix code and passes now.
   records `{delivery_id, generation, turn_id}`. The loop creates the turn id
   before consuming the wake and passes it to `finish_turn`, which clears the
   marker only when the persisted owner matches the completing turn.
+  `finish_turn` and `_clear_pending_user_turn` also pop the owner key when they
+  settle the marker without an owner, so the pair never splits.
 - The mid-turn injection path takes the owner id from `_run_turn`
   (`turn_owner_id=ctx.turn_id`) instead of `RequestContext.turn_id`, which
-  carries the channel's public id and may differ or be absent. A cancelled
-  turn keeps the marker: it did not finish the wake it accepted.
+  carries the channel's public id and may differ or be absent. An explicit
+  Stop saves the partial turn and clears the obligation together with its
+  owner key. Only a gateway shutdown in preservation mode returns before that
+  save and keeps the marker for `RecoveryCoordinator`.
 
 ## Suites
 
@@ -58,7 +68,7 @@ asserts the marker is gone; it fails on the pre-fix code and passes now.
 pytest nanobot-teams/tests -q                              280 passed
 pytest tests/runs tests/session \
        tests/tools/test_mcp_teams_meta.py \
-       tests/test_openai_api.py -q                        371 passed, 3 skipped
+       tests/test_openai_api.py -q                        372 passed, 3 skipped
 pytest tests/agent/test_loop_save_turn.py \
        tests/agent/test_auto_compact.py -q                141 passed
 bun run test src/tests/teams-workbench.test.tsx \

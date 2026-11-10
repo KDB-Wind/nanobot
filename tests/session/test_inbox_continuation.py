@@ -169,6 +169,29 @@ async def test_completion_settles_only_the_accepting_turns_marker(harness):
     assert "pending_user_turn_owner" not in settled.metadata
 
 
+async def test_explicit_stop_settles_the_marker_and_its_owner(harness):
+    """The stop save settles without an owner; the pair must not split."""
+    inbox, state, key, generation = harness
+    delivery = make_delivery(key, generation)
+    inbox.receive(delivery)
+    assert await _apply(inbox, delivery.delivery_id) == "injected"
+    assert inbox.mark_wake_consumed(
+        delivery.delivery_id, turn_id="turn-1"
+    ) is True
+
+    # The cancelled-turn save reads the session after consumption.
+    cancelled_turn = await state.read(key)
+    assert cancelled_turn is not None
+    await state.finish_turn(cancelled_turn)
+
+    settled = await state.read(key)
+    assert settled is not None
+    assert "pending_user_turn" not in settled.metadata
+    assert "pending_user_turn_owner" not in settled.metadata, (
+        "the owner key must not survive the marker it belongs to"
+    )
+
+
 async def test_wake_pump_orphans_when_session_is_gone(harness):
     """F02: a dead origin session must not produce a phantom turn."""
     inbox, state, key, generation = harness

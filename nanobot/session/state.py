@@ -699,7 +699,10 @@ class SessionState:
         self, session: Session, *, pending_turn_owner: str | None = None
     ) -> None:
         """Commit the transcript and settle the wake this turn accepted."""
+        # The pair is one fact. A caller that settles without an owner (the
+        # explicit-stop save) must not leave the owner key behind.
         session.metadata.pop(_PENDING_KEY, None)
+        session.metadata.pop(_PENDING_OWNER_KEY, None)
         session.metadata.pop(_CHECKPOINT_KEY, None)
         await self._submit_draft(session, pending_turn_owner=pending_turn_owner)
 

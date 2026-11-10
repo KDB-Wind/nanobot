@@ -279,6 +279,7 @@ class AgentLoop:
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
+    _PENDING_USER_TURN_OWNER_KEY = "pending_user_turn_owner"
     _PROVIDER_STATE_CHECKPOINT_VERSION_KEY = "provider_state_checkpoint_version"
     _PROVIDER_STATE_CHECKPOINT_VERSION = "v1"
 
@@ -1832,8 +1833,9 @@ class AgentLoop:
                             skip_idle = True
                             raise exc
                         restore_runtime_checkpoint(session)
-                        # The marker stays: this turn did not finish the wake it
-                        # accepted, so a restart still offers the continuation.
+                        # An explicit stop saves the partial turn and ends the
+                        # wake obligation with it. The shutdown branch above
+                        # returns first, keeping the marker for recovery.
                         await self.sessions.state.finish_turn(session)
                         logger.info("Saved cancelled turn for session {}", key)
                     except SessionConflictError:
@@ -2778,6 +2780,7 @@ class AgentLoop:
 
     def _clear_pending_user_turn(self, session: Session) -> None:
         session.metadata.pop(self._PENDING_USER_TURN_KEY, None)
+        session.metadata.pop(self._PENDING_USER_TURN_OWNER_KEY, None)
 
     def _clear_runtime_checkpoint(self, session: Session) -> None:
         if self._RUNTIME_CHECKPOINT_KEY in session.metadata:
