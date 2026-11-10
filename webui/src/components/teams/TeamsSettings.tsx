@@ -59,8 +59,8 @@ export function TeamsSettings() {
   const [scaffold, setScaffold] = useState<TeamsScaffoldResult | null>(null);
   const [scaffoldId, setScaffoldId] = useState("");
   const [newProject, setNewProject] = useState("");
-  // The whole-workflow stop is one operation per workflow; every row sharing
-  // that workflow stays disabled until the coordinator reports back.
+  // The whole-workflow stop is one operation at a time; every stop button
+  // stays disabled until the coordinator reports back.
   const [stopPending, setStopPending] = useState<string | null>(null);
 
   const tx = useCallback(

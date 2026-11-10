@@ -1312,8 +1312,6 @@ class AgentLoop:
                         execution_scope.consume_inputs(consumed_inputs)
                     except Exception as exc:
                         raise ExecutionControlError("could not accept consumed inputs") from exc
-                # Commit the whole snapshot only after every conversion
-                # succeeded; a later failure rolls all arrivals back.
                 consumed = len(converted) + dropped
                 return converted
             finally:
