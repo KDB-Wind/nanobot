@@ -143,6 +143,62 @@ async def test_stdio_mcp_carries_host_meta_to_coordinator(tmp_path, monkeypatch)
         await server.close()
 
 
+@pytest.mark.skipif(not HAS_MCP, reason="mcp or aiohttp is not installed")
+async def test_stdio_mcp_auto_resume_pins_workflow_root(tmp_path, monkeypatch):
+    """F11 live-found rule: an auto_resume submit cannot fragment the chain.
+
+    The model supplied a different workflow; the host-minted reply_workflow
+    must win, so the async chain stays under one workflow root.
+    """
+    received: list[dict] = []
+
+    async def submit_with_capture(request):
+        received.append(await request.json())
+        return web.json_response(
+            {"task_id": "task_meta", "workflow_id": "wf", "operation_key": "k"},
+            status=201,
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/teams/tasks", submit_with_capture)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        monkeypatch.setenv("STDIO_TEST_TOKEN", PLANNER_TOKEN)
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-m", "nanobot_teams", "async-mcp",
+                "--url", str(server.make_url("")),
+                "--token-env", "STDIO_TEST_TOKEN",
+            ],
+            env={**os.environ, "STDIO_TEST_TOKEN": PLANNER_TOKEN,
+                 "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "submit_task",
+                    {"project": "proj", "bot": "research", "input": "continuity task",
+                     "operation_key": str(uuid.uuid4()),
+                     "delivery_mode": "auto_resume",
+                     "workflow": "model-fresh-root"},
+                    meta={
+                        "reply_capability": "host-minted-capability",
+                        "reply_workflow": "trusted-workflow",
+                        "coordinator_principal": "teams-coordinator",
+                    },
+                )
+                assert not result.isError, f"unexpected error: {result.content!r}"
+        assert len(received) == 1
+        assert received[0].get("workflow") == "trusted-workflow", (
+            "auto_resume must pin the submit to the host-minted workflow root"
+        )
+    finally:
+        await server.close()
+
+
 async def test_stdio_mcp_roundtrip_and_reopen(coord_server, tmp_path, monkeypatch):
     application, store = coord_server
     server = TestServer(application)

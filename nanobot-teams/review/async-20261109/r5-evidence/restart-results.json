@@ -1,0 +1,47 @@
+[
+  {
+    "check": "restart: project created",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "restart: bot research registered",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "restart: bot writer registered",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "restart: task admitted",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "restart: dispatch observed a remote run",
+    "ok": true,
+    "detail": "run=run_ebd52b69-91d5-4296-a98a-5f3876f5d1d8"
+  },
+  {
+    "check": "restart: coordinator killed mid-flight",
+    "ok": true,
+    "detail": "pid=74776"
+  },
+  {
+    "check": "restart: coordinator restarted",
+    "ok": true,
+    "detail": "port=40231"
+  },
+  {
+    "check": "restart: same task id settled on the same remote run",
+    "ok": true,
+    "detail": "state=succeeded run=run_ebd52b69-91d5-4296-a98a-5f3876f5d1d8 (expected run_ebd52b69-91d5-4296-a98a-5f3876f5d1d8)"
+  },
+  {
+    "check": "restart: settled replay returns the same task",
+    "ok": true,
+    "detail": "200"
+  }
+]

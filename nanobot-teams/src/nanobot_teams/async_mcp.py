@@ -280,6 +280,11 @@ def build_async_server(client: CoordinatorClient) -> Server:
                             is_error=True,
                         )
                     body["reply_capability"] = meta["reply_capability"]
+                    if meta.get("reply_workflow"):
+                        # Workflow root continuity (F11): an auto-resume chain
+                        # stays under the session's original workflow root;
+                        # the model cannot fragment it into a fresh root.
+                        body["workflow"] = meta["reply_workflow"]
                 task = await client.submit_task(body)
                 return _text(task)
             if name == "get_async_task":

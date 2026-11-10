@@ -156,13 +156,18 @@ Enable three sides (all loopback in v1):
 
 1. Each managed bot needs `api.runs` in its Nanobot config with a dedicated
    key, `executionEnabled = true`, and `exclusiveExecution = true`. The
-   workbench scaffold prints a ready-to-edit config and a manual start
-   command; it never starts a process and shows the key once.
+   workbench scaffold generates a loadable JSON config (`config.json`) from
+   the operator-named model preset, validates it with the real Nanobot loader
+   before answering, and writes the raw service key to an operator-local
+   `service-key.env` file — the browser and the config only ever carry
+   `${ENV}` references, never the key itself. The start command in the
+   response quotes the path; the scaffold never starts a process.
 2. Start the resident coordinator: `nanobot-teams coordinator --config
    coordinator.json`. The config names a control directory (outside any
    workspace), a loopback listener, two role token environment names (they
-   must differ and be non-empty), the fixed Planner inbox address, and the
-   `botHomesRoot` used by scaffolding.
+   must differ and be non-empty), the fixed Planner inbox address, the
+   `botHomesRoot` used by scaffolding, and the `scaffoldModelPreset` copied
+   into new bot homes.
 3. On the Planner host set `config.teams.coordinatorUrl` (and
    `coordinatorTokenEnv`) so the gateway proxies `/api/teams/*`, and mark the
    Teams MCP server with `teamsAsync = true` so the host can attach trusted
@@ -176,7 +181,14 @@ is requested, then confirmed by observation; unconfirmed stops keep the
 instance slot and quarantine it if background effects cannot be proven gone.
 Delivery modes: `workbench_only` (result stays in the workbench) or
 `auto_resume` (the result is injected into the originating Planner session; a
-new user turn or session reset turns late results into cards only).
+new user turn or session reset turns late results into cards only). An
+`auto_resume` submit is pinned to the host-minted workflow root — a model
+cannot fragment the chain into a fresh workflow. Result bodies are read back
+through the coordinator's public route (`GET /v1/teams/tasks/{id}/result`,
+MCP `get_async_task` with `include_result = true`, or the workbench Result
+view) — never with bot service credentials; a fetched-late body is retried
+until it is persisted, and an unfetched body is never delivered as an empty
+success.
 
 Versioned state: the coordinator database owns projects, bots, tasks, and
 deliveries. Result bodies are kept 14 days, events 30 days, task metadata 90

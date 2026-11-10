@@ -13,11 +13,19 @@
 | R0 | 撤回声明、基线冻结 | done(§-1;阶段表回退为 blocked) |
 | R1 | F03/F04/F05/F06/F16/S01/S06/S07 | done,commit `9740000b0`;探针复跑翻转;回归 `tests/runs/test_stop_confirmation.py`、`tests/runs/test_kill_recovery.py`、`nanobot-teams/tests/test_coordinator_guards.py` |
 | R2 | F01/F02/F10/F11/S03/S04/S11/S12 | done,commit `0fe040a7e`;真实 stdio MCP meta 端到端、inbox wake 持久化、真实 AgentLoop 回归 `tests/session/test_inbox_continuation.py`、`nanobot-teams/tests/test_async_mcp_stdio.py` |
-| R3 | F07/F08/F09/S08/S10 | done;`lost_result` 探针翻转为 `result_fetch_requests=2, result_available=true, result_text=retained answer`;`truncation` 翻转为 `coordinator_truncated=true`;`missing_result` 翻转为 result 路由 200(详情仍元数据,浏览器零 Bot 凭据);`cleaned-result` 翻转为 `result_available=false` + 410;UI 双击/丢响应探针 `{"calls":1,"distinctKeys":1}`、`{"calls":2,"distinctKeys":1}`;回归 `nanobot-teams/tests/test_result_pipeline.py`(7)、`tests/runs/test_agent_runs_http.py::test_cleaned_result_stops_being_advertised`、webui `teams-workbench.test.tsx`(8,含 3 项新契约) |
-| R4 | F12/F13/F14/F15/S02/S05/S09 | pending |
-| R5 | 真实 Planner 集成验收 + 文档重建 | pending |
+| R3 | F07/F08/F09/S08/S10 | done,commit `d8440d971`;`lost_result` 探针翻转为 `result_fetch_requests=2, result_available=true, result_text=retained answer`;`truncation` 翻转为 `coordinator_truncated=true`;`missing_result` 翻转为 result 路由 200(详情仍元数据,浏览器零 Bot 凭据);`cleaned-result` 翻转为 `result_available=false` + 410;UI 双击/丢响应探针 `{"calls":1,"distinctKeys":1}`、`{"calls":2,"distinctKeys":1}`;回归 `nanobot-teams/tests/test_result_pipeline.py`(7)、`tests/runs/test_agent_runs_http.py::test_cleaned_result_stops_being_advertised`、webui `teams-workbench.test.tsx`(8,含 3 项新契约) |
+| R4 | F12/F13/F14/F15/S02 已在 R1/S05/S09 | done,commit `ff99a2f92`;`environment_proxy` 翻转(代理零 bearer,直连)、`response_bounds` 翻转(gzip 拒收)、`invalid-json`/`duplicate-key` 翻转为结构化 400、`expired-sse` 翻转为流前 410;scaffold 翻转:真实可加载 config.json + 真实 `nanobot serve` 启动回归、浏览器/配置零原始 key(env-ref + operator 本地 service-key.env);回归 `test_scaffold_bot.py`(4)、`test_control_client_bounds.py`(4)、agent_runs_http malformed-4xx/expired-cursor、coordinator_http scaffold 契约、webui 8 tests + tsc 0 错 |
+| R5 | 真实 Planner 集成验收 + 文档重建 | done;`acceptance/live_workbench_r5.py` 全量 4 场景一次性通过(exit 0,36/36 checks,证据 `review/async-20261109/r5-evidence/`):chain(真实 glm-5.3 Planner 经 MCP auto_resume 提交 Research;浏览器 socket 在发出用户轮后立即关闭;Research 终态后报告注入 inbox 并唤醒续接(`delivery=injected`);Writer 任务由唤醒后的 Planner 模型提交,其结果包含 Research 的 marker(`marker_in_writer=True`),全程零 Bot 凭据、零驱动器提交)、restart(coordinator 强杀重启,同 task/同 remote run 收敛 succeeded,同键重放 200 同任务)、cancel(运行中真人 Bot 取消,`cancel=confirmed, stop_confirmed=True`)、migrate(0.4 账本导入,planner 准入 422 `migrated_quota_unconfirmed`,操作者确认后放行 201) |
 
 R3 落地说明:结果获取改为"广告可用(body advertised)≠ 已取回(body persisted)"两态,`tasks.result_fetched` 在正文落库的事务里才置 1;worker 新增 `_fetch_missing_results` 轮询,直到正文持久化才结算(404 视为存储丢失并入隔离);`auto_resume` 就绪查询排除未取回正文,空成功报告不再投递;结果正文统一 32KiB 有界 + 截断标记(inbox 与 coordinator 一致);`GET /v1/teams/tasks/{id}/result` 按 detail 同款角色边界开放正文,MCP `get_async_task` 增 `include_result`,工作台任务表新增 Result 列;工作台提交 key 绑定业务草稿,pending 禁用、失败复用原 key。
+
+R4 落地说明:结果正文与控制客户端读取全部有界(256KiB raw 上限、压缩拒收、严格 JSON、深度≤16、重复键拒绝);五个认证控制客户端 `trust_env=False`(BotRunClient/MCP CoordinatorClient/inbox validate+deliver+poll/teams proxy);scaffold 重写为可加载 JSON(操作者用户配置的 preset 引用、受限 workspace、api.runs env-ref、加载校验含 serve 同款 env 解析与 key 回读断言),原始 key 只落 operator 本地 `service-key.env`,浏览器响应与配置文件零明文;`except protocol_error` 改捕 `web.HTTPException`;SSE 游标在 prepare 前验证返回协议 410。R5 中实测发现并修复:auto_resume 提交的 workflow 根必须钉在宿主铸造的 `reply_workflow`(模型无法把链路分裂到新根),回归 `test_stdio_mcp_auto_resume_pins_workflow_root`。
+
+### R5 收尾声明(2026-11-10)
+
+R5 用 `acceptance/live_workbench_r5.py` 在真实拓扑上重做了集成验收:真 glm-5.3 Planner 网关(WS 通道 + inbox sidecar + wake pump + teamsAsync MCP)、两个真 serve Bot、常驻 coordinator,全部临时目录与独立端口,进程收尾按 pid/端口清理。审核报告要求的"Planner→Research→Planner→Writer 且 Writer 输入来自 Research 结果"由 chain 场景闭合;浏览器退出、服务重启、取消、迁移各有独立场景实测。审核反例脚本(`lost_result`/`truncation`/`missing_result`/`cleaned-result`/`scaffold`/`environment_proxy`/`response_bounds`/`invalid-json`/`duplicate-key`/`expired-sse` 与 UI 双击/丢响应探针)全部翻转为对应回归断言。审核报告中的旧探针代码本身仍断言修复前行为,其对照值以 §-0.5 各行翻转记录与回归测试为准。
+
+如实限制:本节不宣称零缺陷。R5 验收覆盖上述四场景与审核清单中的已复现项;未覆盖的组合(如跨宿主部署、真实浏览器多标签、真实外部模型提供商配额行为)仍是 §7"限制"小节所列的开放项。审核探针源码保留在 `review/async-20261109/`,可随时复跑对照。
 
 ## 0. 退出谓词(完成条件,可核验)
 
@@ -49,10 +57,10 @@ R3 落地说明:结果获取改为"广告可用(body advertised)≠ 已取回(bo
 | P4 可信回传 + 续接 | verified | §4 P4:inbox 领域 4 + P4 链路 3 + Teams 210/parent 99 全绿 | A09 wrapper 单测、A10 进程级交错、A12 → Q1/Q2/P5/P7 | P5 |
 | P5 WebUI 工作台 | in_progress | §4 P5:后端提交 ffca428ff;前端组件 5 测试过 + 五门禁过 | 全量 vitest/browser 运行中;真实网关浏览器验收在 P7 | 等待套件结果
 | P6 cron 定时任务 | verified | §4 P6:teams_task kind + 确定性提交键(3 tests)+ 回归 312 绿 | 真实 cron 触发链路(A24)在 P7 live | P7 |
-| P7 真实验收/迁移/交付 | blocked | §4 P7 + §7(完成结论已被 §-1 撤回,审核不通过) | REVIEW F01–F16 | R1–R5 |
+| P7 真实验收/迁移/交付 | verified(按 R5 重建) | §4 P7 记录保留;R5 全量 4 场景 live 证据 `review/async-20261109/r5-evidence/`(chain/restart/cancel/migrate,36/36) | - | - |
 | Q1 独立审核 | verified | §7 Q1:两个新上下文只读审核(状态与安全/HTTP 与 worker),8 blocking+minors | - | Q2(已完成) |
-| Q2 缺陷修复与故障验证 | blocked | §7 Q2 记录保留;GPT 复审发现 16 P1,结论不通过 | REVIEW F01–F16 | R1–R4 |
-| Q3 最终交付核对 | blocked | §7 Q3 门禁快照保留;完成声明被撤回 | REVIEW §5 证据偏差 | R5 |
+| Q2 缺陷修复与故障验证 | verified(按 R0–R4 重建) | §7 Q2 记录保留;GPT 复审 16 P1 + 12 S 已按 R0–R4 全部修复并回归锁定(见 §-0.5) | - | - |
+| Q3 最终交付核对 | verified(按 R5 重建) | R5 最终门禁:Teams 243 passed、nanobot 触及选择 87 passed、双包 ruff 0、webui vitest 8 + tsc 0、wheel `dist/nanobot_teams-0.5.0-py3-none-any.whl` SHA-256 `d9a050573e1e7defd36ff8f4cf88349f2fb19afba4a91828d3e6c877cd7c9ca8` 干净目录导入 0.5.0 | - | - |
 
 状态取值:pending / in_progress / verified / blocked。
 
