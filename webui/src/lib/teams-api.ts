@@ -31,6 +31,8 @@ export interface TeamsTaskSummary {
   delivery_state: string;
   outcome_code: string | null;
   result_available: boolean;
+  result_fetched?: boolean;
+  result_truncated?: boolean;
   deadline_at: string;
   created_at: string;
   finished_at: string | null;
@@ -43,6 +45,14 @@ export interface TeamsSnapshot {
   tasks: TeamsTaskSummary[];
   quarantines: Record<string, { reason: string; created_at: string }>;
   protocol: number;
+}
+
+export interface TeamsTaskResult {
+  task_id: string;
+  run_state: string;
+  outcome_code: string | null;
+  result_text: string;
+  result_truncated: boolean;
 }
 
 export interface TeamsScaffoldResult {
@@ -67,6 +77,20 @@ export function fetchTeamsTask(
 ): Promise<TeamsTaskSummary> {
   return request<TeamsTaskSummary>(
     `${base}/api/teams/tasks/${encodeURIComponent(taskId)}`,
+    token,
+    { signal },
+    20_000,
+  );
+}
+
+export function fetchTeamsTaskResult(
+  token: string,
+  taskId: string,
+  base: string = "",
+  signal?: AbortSignal,
+): Promise<TeamsTaskResult> {
+  return request<TeamsTaskResult>(
+    `${base}/api/teams/tasks/${encodeURIComponent(taskId)}/result`,
     token,
     { signal },
     20_000,

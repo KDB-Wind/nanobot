@@ -6,6 +6,19 @@
 
 **本文件此前 §7 的"Q1–Q3 全部 verified / 目标完成"结论自本声明起撤回。** 独立 GPT 家族审核([ASYNC_WORKBENCH_REVIEW.md](ASYNC_WORKBENCH_REVIEW.md))在 HEAD `2e9c28cf4` 用真实反例复现了 16 项 P1(F01–F16)与 12 项次级(S01–S12)缺陷,核心包括:真实 stdio MCP 丢失回传 meta(F01)、Planner 从未被唤醒(F02)、已确认取消仍派发(F03)、stop_confirmed 假阳性(F04)、无单 writer 锁(F05)、隔离不贯穿恢复/准入(F06)、结果一次性读取后永久丢失(F07)、无公开结果读取入口(F08)、工作台重试破坏幂等(F09)等。原 A25"13/13 live 全链"证据不足(脚本未启动 Planner)。本节保留原始记录;阶段表已按当前真实行为回退为 blocked,完成状态须按修复顺序 R1–R5([ASYNC_WORKBENCH_REVIEW.md §6](ASYNC_WORKBENCH_REVIEW.md))重建后才能重新声明。反例脚本在 `review/async-20261109/`,修复前先复跑确认失败、修复后转为回归断言。
 
+## -0.5 审核修复进度(按 R0–R5,追加式)
+
+| 轮次 | 范围(审核编号) | 状态与证据 |
+| --- | --- | --- |
+| R0 | 撤回声明、基线冻结 | done(§-1;阶段表回退为 blocked) |
+| R1 | F03/F04/F05/F06/F16/S01/S06/S07 | done,commit `9740000b0`;探针复跑翻转;回归 `tests/runs/test_stop_confirmation.py`、`tests/runs/test_kill_recovery.py`、`nanobot-teams/tests/test_coordinator_guards.py` |
+| R2 | F01/F02/F10/F11/S03/S04/S11/S12 | done,commit `0fe040a7e`;真实 stdio MCP meta 端到端、inbox wake 持久化、真实 AgentLoop 回归 `tests/session/test_inbox_continuation.py`、`nanobot-teams/tests/test_async_mcp_stdio.py` |
+| R3 | F07/F08/F09/S08/S10 | done;`lost_result` 探针翻转为 `result_fetch_requests=2, result_available=true, result_text=retained answer`;`truncation` 翻转为 `coordinator_truncated=true`;`missing_result` 翻转为 result 路由 200(详情仍元数据,浏览器零 Bot 凭据);`cleaned-result` 翻转为 `result_available=false` + 410;UI 双击/丢响应探针 `{"calls":1,"distinctKeys":1}`、`{"calls":2,"distinctKeys":1}`;回归 `nanobot-teams/tests/test_result_pipeline.py`(7)、`tests/runs/test_agent_runs_http.py::test_cleaned_result_stops_being_advertised`、webui `teams-workbench.test.tsx`(8,含 3 项新契约) |
+| R4 | F12/F13/F14/F15/S02/S05/S09 | pending |
+| R5 | 真实 Planner 集成验收 + 文档重建 | pending |
+
+R3 落地说明:结果获取改为"广告可用(body advertised)≠ 已取回(body persisted)"两态,`tasks.result_fetched` 在正文落库的事务里才置 1;worker 新增 `_fetch_missing_results` 轮询,直到正文持久化才结算(404 视为存储丢失并入隔离);`auto_resume` 就绪查询排除未取回正文,空成功报告不再投递;结果正文统一 32KiB 有界 + 截断标记(inbox 与 coordinator 一致);`GET /v1/teams/tasks/{id}/result` 按 detail 同款角色边界开放正文,MCP `get_async_task` 增 `include_result`,工作台任务表新增 Result 列;工作台提交 key 绑定业务草稿,pending 禁用、失败复用原 key。
+
 ## 0. 退出谓词(完成条件,可核验)
 
 全部满足才算完成,任何一项缺失不得宣布完成:

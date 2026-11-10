@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     result_text TEXT NOT NULL DEFAULT '',
     result_truncated INTEGER NOT NULL DEFAULT 0,
     result_available INTEGER NOT NULL DEFAULT 0,
+    result_fetched INTEGER NOT NULL DEFAULT 0,
     cancel_state TEXT NOT NULL DEFAULT 'none',
     delivery_state TEXT NOT NULL DEFAULT 'not_ready',
     created_at TEXT NOT NULL,
@@ -157,8 +158,8 @@ TASK_COLUMNS = (
     "request_digest, input_text, deadline_at, delivery_mode, dispatch_state, remote_run_id, "
     "remote_instance_id, remote_revision, run_state, stop_confirmed, effects_uncertain, "
     "outcome_code, outcome_message, result_text, result_truncated, result_available, "
-    "cancel_state, delivery_state, created_at, finished_at, last_error, reply_capability, "
-    "migrated_usage"
+    "result_fetched, cancel_state, delivery_state, created_at, finished_at, last_error, "
+    "reply_capability, migrated_usage"
 )
 
 
@@ -260,10 +261,9 @@ class CoordinatorStore:
                 self._conn.execute(
                     "ALTER TABLE tasks ADD COLUMN reply_capability TEXT NOT NULL DEFAULT ''"
                 )
-            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(tasks)")}
-            if "reply_capability" not in columns:
+            if "result_fetched" not in columns:
                 self._conn.execute(
-                    "ALTER TABLE tasks ADD COLUMN reply_capability TEXT NOT NULL DEFAULT ''"
+                    "ALTER TABLE tasks ADD COLUMN result_fetched INTEGER NOT NULL DEFAULT 0"
                 )
         except (OSError, sqlite3.Error, StoreError) as exc:
             self.close()
@@ -679,8 +679,8 @@ class CoordinatorStore:
                     task_id, project_id, workflow_id, caller_principal, bot_id, operation_key,
                     digest, input_text, iso(effective_deadline), delivery_mode.value,
                     DispatchState.PENDING.value, None, None, 0, "unobserved", 0, 0, None, "",
-                    "", 0, 0, CancelState.NONE.value, DeliveryState.NOT_READY.value, iso(now),
-                    None, "", reply_capability, 0,
+                    "", 0, 0, 0, CancelState.NONE.value, DeliveryState.NOT_READY.value,
+                    iso(now), None, "", reply_capability, 0,
                 ),
             )
             self._conn.execute(
@@ -788,8 +788,14 @@ class CoordinatorStore:
         outcome_message: str | None = None,
         result_text: str | None = None,
         result_truncated: bool | None = None,
+        result_advertised: bool = False,
     ) -> Task | None:
-        """Apply one remote observation; only newer revisions are recorded."""
+        """Apply one remote observation; only newer revisions are recorded.
+
+        ``result_available`` records that the remote advertises a terminal
+        result body; ``result_fetched`` only settles once that body is
+        persisted here, so a failed fetch keeps the task in the fetch queue.
+        """
         with self._transaction():
             assert self._conn is not None
             current = self._load_task(task_id, none_on_missing=True)
@@ -814,8 +820,19 @@ class CoordinatorStore:
                 assignments.append("outcome_message=?")
                 params.append(outcome_message)
             if result_text is not None:
-                assignments.extend(["result_text=?", "result_available=?"])
-                params.extend([result_text, int(terminal)])
+                body = result_text.encode("utf-8")
+                if len(body) > RESULT_RESERVATION_BYTES:
+                    # Same bound as every other result surface; an oversized
+                    # remote body keeps its prefix and the truncation marker.
+                    result_text = body[:RESULT_RESERVATION_BYTES].decode(
+                        "utf-8", errors="ignore"
+                    )
+                    result_truncated = True
+                assignments.extend(["result_text=?", "result_available=?", "result_fetched=?"])
+                params.extend([result_text, 1, 1])
+            elif terminal and result_advertised:
+                assignments.extend(["result_available=?", "result_fetched=?"])
+                params.extend([1, 0])
             if result_truncated is not None:
                 assignments.append("result_truncated=?")
                 params.append(int(result_truncated))
@@ -1025,9 +1042,36 @@ class CoordinatorStore:
         rows = self._conn.execute(
             "SELECT task_id FROM tasks WHERE delivery_mode='auto_resume' AND "
             "run_state IN ('succeeded','failed','cancelled','interrupted') AND "
-            "delivery_state IN ('not_ready','pending','persisted')"
+            "delivery_state IN ('not_ready','pending','persisted') AND "
+            # An advertised-but-unfetched body must never be delivered as an
+            # empty success report (F07): the fetch queue settles it first.
+            "NOT (result_available=1 AND result_fetched=0)"
         ).fetchall()
         return [self._load_task(r[0]) for r in rows]
+
+    def persist_result_body(
+        self, task_id: str, *, result_text: str, result_truncated: bool
+    ) -> None:
+        """Settle one result fetch: persist the body after the terminal state.
+
+        The stored body is bounded like every other result surface (the inbox
+        delivery path uses the same cap); an oversized remote body keeps its
+        bounded prefix and the truncation marker, so the artifact never
+        silently claims completeness.
+        """
+        body = result_text.encode("utf-8")
+        if len(body) > RESULT_RESERVATION_BYTES:
+            body = body[:RESULT_RESERVATION_BYTES]
+            result_text = body.decode("utf-8", errors="ignore")
+            result_truncated = True
+        with self._transaction():
+            assert self._conn is not None
+            self._conn.execute(
+                "UPDATE tasks SET result_text=?, result_truncated=?, result_available=1, "
+                "result_fetched=1 WHERE task_id=?",
+                (result_text, int(result_truncated), task_id),
+            )
+            self._emit("task_result_persisted", task_id, {})
 
     def set_delivery_state(self, task_id: str, state: DeliveryState) -> None:
         with self._transaction():
@@ -1067,6 +1111,21 @@ class CoordinatorStore:
         rows = self._conn.execute(
             "SELECT task_id FROM tasks WHERE dispatch_state='accepted' AND run_state NOT IN "
             "('succeeded','failed','cancelled','interrupted') ORDER BY created_at LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._load_task(r[0]) for r in rows]
+
+    def tasks_with_unfetched_results(self, limit: int = 20) -> list[Task]:
+        """Terminal tasks whose advertised result body was never persisted.
+
+        A result read is not settled until the body lands in the control store;
+        these tasks keep being polled no matter their run state.
+        """
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT task_id FROM tasks WHERE dispatch_state='accepted' AND "
+            "run_state IN ('succeeded','failed','cancelled','interrupted') AND "
+            "result_available=1 AND result_fetched=0 ORDER BY created_at LIMIT ?",
             (limit,),
         ).fetchall()
         return [self._load_task(r[0]) for r in rows]
@@ -1190,6 +1249,7 @@ def _row_to_task(values: dict) -> Task:
         result_text=values["result_text"] or "",
         result_truncated=bool(values["result_truncated"]),
         result_available=bool(values["result_available"]),
+        result_fetched=bool(values.get("result_fetched")),
         cancel_state=CancelState(values["cancel_state"]),
         delivery_state=DeliveryState(values["delivery_state"]),
         finished_at=None if values["finished_at"] is None

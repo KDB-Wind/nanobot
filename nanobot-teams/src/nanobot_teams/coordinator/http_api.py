@@ -291,6 +291,37 @@ def build_app(
             return api_error(403, "forbidden", "Not your task.")
         return _json_response(task_public_json(task))
 
+    async def get_task_result(request: web.Request) -> web.Response:
+        """Public result read path (F08): no bot credentials reach the caller.
+
+        Same ownership rules as the detail route. A terminal run whose body is
+        still being fetched answers 409 result_fetch_pending instead of a
+        silent empty success.
+        """
+        denied = require_role(request, ("planner", "operator"))
+        if denied is not None:
+            return denied
+        task = store.get_task(request.match_info["task_id"])
+        if task is None:
+            return api_error(404, "task_not_found", "No task with that id.")
+        if request[_ROLE_KEY] == "planner" and task.caller_principal != "planner":
+            return api_error(403, "forbidden", "Not your task.")
+        if not task.result_available or not task.result_fetched:
+            return api_error(
+                409,
+                "result_fetch_pending",
+                "The terminal result body is not persisted yet; retry shortly.",
+            )
+        return _json_response(
+            {
+                "task_id": task.task_id,
+                "run_state": task.run_state,
+                "outcome_code": task.outcome_code,
+                "result_text": task.result_text,
+                "result_truncated": task.result_truncated,
+            }
+        )
+
     async def cancel_task(request: web.Request) -> web.Response:
         denied = require_role(request, ("planner", "operator"))
         if denied is not None:
@@ -570,6 +601,7 @@ def build_app(
     app.router.add_get("/v1/teams/tasks", list_tasks)
     app.router.add_get("/v1/teams/tasks/lookup", lookup_task)
     app.router.add_get("/v1/teams/tasks/{task_id}", get_task)
+    app.router.add_get("/v1/teams/tasks/{task_id}/result", get_task_result)
     app.router.add_post("/v1/teams/tasks/{task_id}/cancel", cancel_task)
     app.router.add_get("/v1/teams/snapshot", snapshot)
     app.router.add_get("/v1/teams/events", events)

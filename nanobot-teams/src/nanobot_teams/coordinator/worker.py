@@ -82,6 +82,7 @@ class DispatchWorker:
         progressed = False
         progressed |= await self._dispatch_due()
         progressed |= await self._observe_accepted()
+        progressed |= await self._fetch_missing_results()
         progressed |= await self._deliver_results()
         return progressed
 
@@ -473,12 +474,16 @@ class DispatchWorker:
                 continue
             terminal = run_state in TERMINAL_RUN_STATES
             result_text = None
+            result_truncated = None
             if terminal and payload.get("result_available"):
                 try:
                     result = await client.get_result(task.remote_run_id)
                     if result.status == 200 and isinstance(result.payload, dict):
                         outcome = result.payload.get("outcome") or {}
                         result_text = str(outcome.get("text", ""))
+                        # Preserve the remote's typed truncation metadata (S08):
+                        # a partial body must never present as a full artifact.
+                        result_truncated = bool(outcome.get("truncated", False))
                 except BotUnreachableError:
                     result_text = None
             self._store.record_observation(
@@ -493,7 +498,8 @@ class DispatchWorker:
                     else None
                 ),
                 result_text=result_text,
-                result_truncated=None if result_text is None else False,
+                result_truncated=result_truncated,
+                result_advertised=bool(payload.get("result_available", False)),
             )
             # Unverified effects from the remote isolate the instance here, not
             # only at admission: no new task may start on it until an operator
@@ -505,6 +511,46 @@ class DispatchWorker:
                 )
             progressed = True
             progressed |= await self._drive_cancel(task, client)
+        return progressed
+
+    async def _fetch_missing_results(self) -> bool:
+        """Retry result fetches whose body never landed (F07).
+
+        A terminal run whose result body was not persisted keeps being polled
+        here; the observation state is already terminal, so this is a pure read
+        until the body settles. A definitive 404 means the remote lost the
+        result storage: the task becomes indeterminate and the instance
+        quarantines, consistent with the observation 404 path.
+        """
+        tasks = self._store.tasks_with_unfetched_results(limit=16)
+        if not tasks:
+            return False
+        progressed = False
+        for task in tasks:
+            if task.remote_run_id is None:
+                continue
+            bot = self._store.get_bot(task.bot_id)
+            if bot is None:
+                continue
+            try:
+                client = self._clients.for_bot(bot.endpoint, bot.secret_env)
+            except MissingSecretError:
+                continue
+            try:
+                result = await client.get_result(task.remote_run_id)
+            except BotUnreachableError:
+                continue  # transient; the same task is retried next pump
+            if result.status == 200 and isinstance(result.payload, dict):
+                outcome = result.payload.get("outcome") or {}
+                self._store.persist_result_body(
+                    task.task_id,
+                    result_text=str(outcome.get("text", "")),
+                    result_truncated=bool(outcome.get("truncated", False)),
+                )
+                progressed = True
+            elif result.status == 404:
+                await self._check_identity_or_indeterminate(task, bot, client)
+                progressed = True
         return progressed
 
     async def _drive_cancel(self, task, client: BotRunClient) -> bool:
@@ -560,6 +606,8 @@ def task_public_json(task) -> dict:
         "delivery_state": task.delivery_state.value,
         "outcome_code": task.outcome_code,
         "result_available": task.result_available,
+        "result_fetched": task.result_fetched,
+        "result_truncated": task.result_truncated,
         "deadline_at": task.deadline_at.isoformat(),
         "created_at": task.created_at.isoformat(),
         "finished_at": None if task.finished_at is None else task.finished_at.isoformat(),

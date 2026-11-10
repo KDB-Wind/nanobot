@@ -94,6 +94,7 @@ class Task:
     result_text: str = ""
     result_truncated: bool = False
     result_available: bool = False
+    result_fetched: bool = False
     cancel_state: CancelState = CancelState.NONE
     delivery_state: DeliveryState = DeliveryState.NOT_READY
     finished_at: datetime | None = None

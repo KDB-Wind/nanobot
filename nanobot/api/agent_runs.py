@@ -135,7 +135,7 @@ def _check_depth(value: Any, depth: int) -> None:
         _check_depth(item, depth + 1)
 
 
-def _run_status(run: Run, *, result_available: bool) -> dict[str, Any]:
+def _run_status(run: Run) -> dict[str, Any]:
     outcome: dict[str, Any] | None = None
     if run.outcome is not None:
         outcome = {
@@ -156,7 +156,10 @@ def _run_status(run: Run, *, result_available: bool) -> dict[str, Any]:
         "stop_confirmed": run.stop_confirmed,
         "effects_uncertain": run.effects_uncertain,
         "outcome": outcome,
-        "result_available": result_available,
+        # Availability requires a terminal run whose result body was not
+        # cleaned by retention (S10): advertising a cleaned result sends
+        # consumers to a 410.
+        "result_available": run.terminal and run.result_cleaned_at is None,
     }
 
 
@@ -244,7 +247,7 @@ async def handle_submit(request: web.Request) -> web.Response:
         raise protocol_error(400, "invalid_submit", exc.detail)
     run = acceptance.run
     status = 200 if run.terminal else 202
-    return _protocol_json_response(_run_status(run, result_available=run.terminal), status=status)
+    return _protocol_json_response(_run_status(run), status=status)
 
 
 async def handle_lookup(request: web.Request) -> web.Response:
@@ -260,7 +263,7 @@ async def handle_lookup(request: web.Request) -> web.Response:
         raise protocol_error(
             404, "run_not_found", "No run for that key. Reconciliation does not authorize a new key."
         )
-    return _protocol_json_response(_run_status(run, result_available=run.terminal))
+    return _protocol_json_response(_run_status(run))
 
 
 async def handle_get_run(request: web.Request) -> web.Response:
@@ -270,7 +273,7 @@ async def handle_get_run(request: web.Request) -> web.Response:
         run = await service.get(request.match_info["run_id"])
     except Exception:
         raise protocol_error(404, "run_not_found", "No run with that id.")
-    return _protocol_json_response(_run_status(run, result_available=run.terminal))
+    return _protocol_json_response(_run_status(run))
 
 
 async def handle_get_result(request: web.Request) -> web.Response:
@@ -311,7 +314,7 @@ async def handle_cancel(request: web.Request) -> web.Response:
     except Exception:
         raise protocol_error(404, "run_not_found", "No run with that id.")
     return _protocol_json_response(
-        _run_status(run, result_available=run.terminal), status=202
+        _run_status(run), status=202
     )
 
 

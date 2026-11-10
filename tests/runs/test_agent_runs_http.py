@@ -209,6 +209,37 @@ async def test_result_endpoint_lifecycle(client_factory):
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_cleaned_result_stops_being_advertised(client_factory):
+    """S10: availability checks the terminal state AND retention kept the body."""
+    client, service, fake = await client_factory()
+    fake.result = ExecutionResult(code=OutcomeCode.SUCCEEDED, text="kept body", message="")
+    key = str(uuid.uuid4())
+    submitted = await client.post(
+        "/v1/agent-runs", headers=runs_headers(operation_key=key), json=submit_body()
+    )
+    run = await submitted.json()
+    for _ in range(300):
+        status = await client.get(f"/v1/agent-runs/{run['run_id']}", headers=runs_headers())
+        payload = await status.json()
+        if payload["state"] == "succeeded":
+            break
+        await asyncio.sleep(0.02)
+    assert payload["state"] == "succeeded"
+    assert payload["result_available"] is True
+    store: RunStore = service._store
+    store._conn.execute(
+        "UPDATE runs SET finished_at=?", ((utc_now() - timedelta(days=15)).isoformat(),)
+    )
+    store.cleanup()
+    after = await client.get(f"/v1/agent-runs/{run['run_id']}", headers=runs_headers())
+    cleaned = await after.json()
+    assert cleaned["result_available"] is False
+    result = await client.get(f"/v1/agent-runs/{run['run_id']}/result", headers=runs_headers())
+    assert result.status == 410
+    assert (await result.json())["code"] == "result_cleaned"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
 async def test_lookup_reconciles_without_new_runs(client_factory):
     client, service, fake = await client_factory()
     key = str(uuid.uuid4())

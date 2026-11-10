@@ -47,7 +47,16 @@ _SUBMIT_SCHEMA: dict[str, Any] = {
 
 _GET_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"task_id": {"type": "string"}},
+    "properties": {
+        "task_id": {"type": "string"},
+        "include_result": {
+            "type": "boolean",
+            "description": (
+                "Also fetch the terminal result body through the coordinator's "
+                "public result route (no bot credentials involved)."
+            ),
+        },
+    },
     "required": ["task_id"],
     "additionalProperties": False,
 }
@@ -120,6 +129,9 @@ class CoordinatorClient:
     async def get_task(self, task_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/v1/teams/tasks/{task_id}")
 
+    async def get_task_result(self, task_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v1/teams/tasks/{task_id}/result")
+
     async def list_tasks(self, params: dict[str, Any]) -> dict[str, Any]:
         return await self._request("GET", "/v1/teams/tasks", params=params)
 
@@ -169,7 +181,10 @@ def build_async_server(client: CoordinatorClient) -> Server:
             ),
             types.Tool(
                 name="get_async_task",
-                description="Fetch one async task by id: run, cancel, and delivery states.",
+                description=(
+                    "Fetch one async task by id: run, cancel, and delivery states. "
+                    "Pass include_result=true to also read the terminal result body."
+                ),
                 inputSchema=_GET_SCHEMA,
                 annotations=read_only,
             ),
@@ -265,7 +280,24 @@ def build_async_server(client: CoordinatorClient) -> Server:
                 task = await client.submit_task(body)
                 return _text(task)
             if name == "get_async_task":
-                return _text(await client.get_task(str(arguments.get("task_id", ""))))
+                task_id = str(arguments.get("task_id", ""))
+                payload = await client.get_task(task_id)
+                if arguments.get("include_result"):
+                    # Public result route through the coordinator; the model
+                    # never touches bot service credentials.
+                    try:
+                        result = await client.get_task_result(task_id)
+                    except CoordinatorHttpError as exc:
+                        if exc.code == "result_fetch_pending":
+                            payload["result_pending"] = True
+                        else:
+                            raise
+                    else:
+                        payload["result_text"] = result.get("result_text", "")
+                        payload["result_truncated"] = result.get(
+                            "result_truncated", False
+                        )
+                return _text(payload)
             if name == "list_async_tasks":
                 params = {
                     k: arguments[k]

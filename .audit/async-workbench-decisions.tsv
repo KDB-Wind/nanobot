@@ -24,3 +24,6 @@ ts	phase	decision	why	evidence	result
 2026-11-09T10:10Z	Q2	修复#1: executor hooks 被 ephemeral 门丢弃,真实运行全标 execution_error	live 双 bot 链发现;run_extra_hooks_for_ephemeral 未开	live_chain 13/13;executor 5;parent 99	已修,提交 86dd94089
 2026-11-09T11:00Z	Q2	live gateway 冒烟发现的进程解释器误区:venv launcher 显示 base python 路径属正常;40236 即工作树进程	避免误杀健康实例;以 capability/bootstrap 判定代码版本	bootstrap teams cap True	澄清
 2026-11-09T11:00Z	Q2	撤销钩子经 SessionState writer 异步执行;session_key 用 msg.session_key 兜底	loop 线程同步拿写锁会 BUSY 且被吞;dispatch 不传 key	test_a18_revoke.py 真实 _dispatch_one 路径 passed	采纳
+2026-11-10T17:40Z	R3	结果读取改两态: result_available=远端广告, result_fetched=正文落库才结算; worker _fetch_missing_results 轮询直到持久化; auto_resume 排除未取回正文	审核 F07/S08; 一次 503 曾永久丢结果	lost_result 探针 fetch=2/body 落库; test_result_pipeline 7 tests	采纳
+2026-11-10T17:40Z	R3	公开结果路由 /v1/teams/tasks/{id}/result + MCP include_result + UI Result 列; 正文 32KiB 有界+截断标记; 浏览器零 Bot 凭据	审核 F08/S08; 操作者看不到产物	missing_result 探针路由 200; test_result_pipeline; workbench 8 tests	采纳
+2026-11-10T17:40Z	R3	工作台提交 key 绑定业务草稿: pending 禁用, 失败复用原 key, 换草稿才换 key; _run_status 可用性同时校验 terminal 与未清理	审核 F09/S10; 双击两 key 绕过幂等; 清理后仍报可用	UI 探针 1/1 与 2/1; cleaned-result 探针 false+410	采纳

@@ -6,9 +6,11 @@ import {
   createTeamsProject,
   createTeamsTask,
   fetchTeamsSnapshot,
+  fetchTeamsTaskResult,
   scaffoldTeamsBot,
   TeamsScaffoldResult,
   TeamsSnapshot,
+  TeamsTaskResult,
 } from "@/lib/teams-api";
 import { useClient } from "@/providers/ClientProvider";
 
@@ -39,6 +41,15 @@ export function TeamsSettings() {
   const [input, setInput] = useState("");
   const [botChoice, setBotChoice] = useState("");
   const [submitState, setSubmitState] = useState<string | null>(null);
+  // F09: the operation key binds to the pending business draft. A lost or
+  // failed response keeps the draft so a retry reuses the same key; only a
+  // consumed submission or an edited draft mints a new one.
+  const [draft, setDraft] = useState<{ input: string; bot: string; key: string } | null>(null);
+  const [submitPending, setSubmitPending] = useState(false);
+  // F08: the result body is fetched through the coordinator's public route,
+  // never with bot service credentials.
+  const [resultView, setResultView] = useState<TeamsTaskResult | null>(null);
+  const [resultError, setResultError] = useState<string | null>(null);
   const [scaffold, setScaffold] = useState<TeamsScaffoldResult | null>(null);
   const [scaffoldId, setScaffoldId] = useState("");
   const [newProject, setNewProject] = useState("");
@@ -84,21 +95,46 @@ export function TeamsSettings() {
     );
   }
 
+  const operationKeyFor = (currentInput: string, currentBot: string): string => {
+    if (draft && draft.input === currentInput && draft.bot === currentBot) {
+      return draft.key;
+    }
+    const key = newOperationKey();
+    setDraft({ input: currentInput, bot: currentBot, key });
+    return key;
+  };
+
+  const showResult = async (taskId: string) => {
+    setResultError(null);
+    try {
+      setResultView(await fetchTeamsTaskResult(getToken(), taskId));
+    } catch (reason) {
+      setResultView(null);
+      setResultError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
   const submitTask = async () => {
-    if (!input.trim() || !botChoice) return;
+    if (!input.trim() || !botChoice || submitPending) return;
+    setSubmitPending(true);
     setSubmitState(tx("settings.teams.submitting", "Submitting..."));
     try {
       const task = await createTeamsTask(client, {
         project: projectFilter || snapshot?.projects[0]?.project_id || "default",
         bot: botChoice,
         input,
-        operation_key: newOperationKey(),
+        operation_key: operationKeyFor(input, botChoice),
       });
+      setDraft(null);
       setSubmitState(tx("settings.teams.submitted", "Submitted: {{id}}", { id: task.task_id }));
       setInput("");
       await refresh();
     } catch (reason) {
+      // The draft (and its key) is kept: a retry resubmits the same business
+      // operation instead of minting a second one.
       setSubmitState(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSubmitPending(false);
     }
   };
 
@@ -226,7 +262,7 @@ export function TeamsSettings() {
           <button
             type="button"
             onClick={() => void submitTask()}
-            disabled={!input.trim() || !botChoice}
+            disabled={!input.trim() || !botChoice || submitPending}
             className="self-start rounded border px-3 py-1 text-sm disabled:opacity-50"
           >
             {tx("settings.teams.submit", "Submit task")}
@@ -245,6 +281,7 @@ export function TeamsSettings() {
               <th>{tx("settings.teams.run", "Run")}</th>
               <th>{tx("settings.teams.cancel", "Cancel")}</th>
               <th>{tx("settings.teams.delivery", "Delivery")}</th>
+              <th>{tx("settings.teams.result", "Result")}</th>
               <th />
             </tr>
           </thead>
@@ -266,6 +303,20 @@ export function TeamsSettings() {
                 </td>
                 <td><StateChip label={task.delivery_state} tone={task.delivery_state === "injected" ? "ok" : "idle"} /></td>
                 <td>
+                  {task.result_available ? (
+                    <button
+                      type="button"
+                      data-result-view={task.task_id}
+                      className="rounded border px-2 py-0.5 text-xs"
+                      onClick={() => void showResult(task.task_id)}
+                    >
+                      {tx("settings.teams.viewResult", "View result")}
+                    </button>
+                  ) : (
+                    <span className="text-zinc-400">—</span>
+                  )}
+                </td>
+                <td>
                   {task.dispatch_state === "pending" || task.dispatch_state === "accepted" ? (
                     task.run_state !== "succeeded" && task.run_state !== "failed" && task.run_state !== "cancelled" && task.run_state !== "interrupted" ? (
                       <button
@@ -284,10 +335,29 @@ export function TeamsSettings() {
               </tr>
             ))}
             {!tasks.length ? (
-              <tr><td colSpan={6} className="py-2 text-zinc-400">{tx("settings.teams.noTasks", "No tasks yet.")}</td></tr>
+              <tr><td colSpan={7} className="py-2 text-zinc-400">{tx("settings.teams.noTasks", "No tasks yet.")}</td></tr>
             ) : null}
           </tbody>
         </table>
+        {resultError ? <p role="alert" className="mt-2 text-xs text-red-500">{resultError}</p> : null}
+        {resultView ? (
+          <div data-task-result className="mt-2 rounded bg-zinc-100 p-2 text-xs dark:bg-zinc-900">
+            <p className="font-medium">
+              {tx("settings.teams.resultFor", "Result of {{id}}", { id: resultView.task_id })}{" "}
+              {resultView.result_truncated ? (
+                <span>({tx("settings.teams.truncated", "truncated")})</span>
+              ) : null}
+            </p>
+            <pre className="mt-1 whitespace-pre-wrap font-mono">{resultView.result_text}</pre>
+            <button
+              type="button"
+              className="mt-1 rounded border px-2 py-0.5 text-xs"
+              onClick={() => setResultView(null)}
+            >
+              {tx("settings.teams.closeResult", "Close")}
+            </button>
+          </div>
+        ) : null}
         {snapshot && Object.keys(snapshot.quarantines).length ? (
           <p role="alert" className="mt-2 text-xs text-amber-500">
             {tx("settings.teams.quarantined", "Some instances are quarantined pending operator review.")}
