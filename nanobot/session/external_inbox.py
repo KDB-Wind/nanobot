@@ -13,7 +13,7 @@ import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, TypeVar, cast
 
 from .state import SessionConflictError, SessionState
 
@@ -698,9 +698,11 @@ class ExternalInbox:
             ).fetchone()
             if session_row is None:
                 return True
-            metadata = json.loads(session_row[0]) if session_row[0] else {}
-            if not isinstance(metadata, dict):
-                metadata = {}
+            metadata: dict[str, Any] = {}
+            if session_row[0]:
+                parsed = json.loads(session_row[0])
+                if isinstance(parsed, dict):
+                    metadata = cast(dict[str, Any], parsed)
             metadata["pending_user_turn"] = True
             conn.execute(
                 "UPDATE sessions SET metadata=?, revision=revision+1 WHERE key=?",
