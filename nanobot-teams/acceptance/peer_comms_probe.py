@@ -163,6 +163,8 @@ class PeerLab:
         self.ws_token = secrets.token_urlsafe(12)
         self.procs: list[subprocess.Popen] = []
         self.logs: list[tuple[subprocess.Popen, object]] = []
+        # Browser labs disable the websocket token; MCP-driven labs keep it.
+        self.ws_requires_token = True
         self.coord_proc: subprocess.Popen | None = None
         self.preset_name, self.preset, self.provider = resolve_preset()
         marker = secrets.token_hex(4).upper()
@@ -244,7 +246,8 @@ class PeerLab:
             "channels": {"websocket": {
                 "enabled": True, "host": "127.0.0.1",
                 "port": self.planner_ws_port, "path": "/",
-                "token": self.ws_token, "websocketRequiresToken": True,
+                "token": self.ws_token,
+                "websocketRequiresToken": self.ws_requires_token,
             }},
             "gateway": {"host": "127.0.0.1", "port": free_port(),
                         "restartMode": "exit", "heartbeat": {"enabled": False}},

@@ -17,7 +17,7 @@ class FakeSession:
 
         class Result:
             content = []
-            isError = False
+            isError = False  # noqa: N815 - mirrors the SDK result field
 
         return Result()
 
