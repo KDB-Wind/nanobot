@@ -1129,6 +1129,7 @@ class AgentLoop:
         provider_state: ProviderConversationState | None = None,
         initial_message: InboundMessage | None = None,
         commit_session: bool = True,
+        turn_owner_id: str | None = None,
     ) -> AgentRunResult:
         self._sync_subagent_runtime_limits()
 
@@ -1283,7 +1284,7 @@ class AgentLoop:
                 if isinstance(followup_id, str) and followup_id:
                     row[PENDING_FOLLOWUP_ID_KEY] = followup_id
                 if wake_delivery_id is not None and not self._consume_wake_obligation(
-                    pending_msg, turn_id=request_ctx.turn_id
+                    pending_msg, turn_id=turn_owner_id or request_ctx.turn_id or ""
                 ):
                     return _DROP_PENDING
                 return row
@@ -1831,10 +1832,9 @@ class AgentLoop:
                             skip_idle = True
                             raise exc
                         restore_runtime_checkpoint(session)
-                        await self.sessions.state.finish_turn(
-                            session,
-                            pending_turn_owner=delivery.route.turn_id,
-                        )
+                        # The marker stays: this turn did not finish the wake it
+                        # accepted, so a restart still offers the continuation.
+                        await self.sessions.state.finish_turn(session)
                         logger.info("Saved cancelled turn for session {}", key)
                     except SessionConflictError:
                         current = await self.sessions.state.read_header(key)
@@ -2462,6 +2462,7 @@ class AgentLoop:
                 initial_message=ctx.msg,
                 events=ctx.events,
                 commit_session=ctx.commit_session,
+                turn_owner_id=ctx.turn_id,
             )
         ctx.final_content = result.final_content
         ctx.all_messages = result.messages

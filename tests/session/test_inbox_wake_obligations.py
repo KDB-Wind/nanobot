@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.turn_delivery import TurnDeliveryFactory
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
@@ -346,6 +348,62 @@ async def test_active_turn_injection_sees_report_body(tmp_path):
             "Automated continuation" in str(message.get("content"))
             for message in current.messages
         ), "the wake body is turn input, not a second history row"
+    finally:
+        provider.release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await agent.aclose()
+
+async def test_active_turn_settles_its_wake_under_a_public_turn_id(tmp_path):
+    """The channel's public turn id never becomes the wake's owner."""
+    manager = SessionManager(tmp_path / "sessions")
+    state = manager.state
+    key = "websocket:wake-chat"
+    session = await _seed(state, key, "research then write")
+    inbox = ExternalInbox(state)
+    bus = MessageBus()
+    provider = _BlockingProvider()
+    agent = _agent(tmp_path, manager, provider, bus)
+    agent.external_inbox = inbox
+    agent.turn_delivery_factory = TurnDeliveryFactory(
+        bus,
+        route_policy=lambda msg, key, route: replace(route, turn_id="public-42"),
+    )
+    task = asyncio.create_task(agent.run())
+    try:
+        await bus.publish_inbound(InboundMessage(
+            channel="websocket", sender_id="user", chat_id="wake-chat",
+            content="research then write", input_role="user",
+        ))
+        await asyncio.wait_for(provider.first_call.wait(), 10)
+        inbox.mint_capability(
+            session_key=key, session_generation=session.generation,
+            workflow_id="wf-root", operation_key="*", bot_id="*", instance_id="*",
+            principal_id="teams-coordinator",
+        )
+        delivery = _delivery(key, session.generation)
+        inbox.receive(delivery)
+        assert await inbox.apply_pending(delivery.delivery_id) == "injected"
+        pump = InboxWakePump(inbox, bus.publish_inbound, _session_exists(state))
+        assert await pump.pump_once() == 1
+        await _wait_until(lambda: bus.inbound_size == 0)
+        provider.release.set()
+        await asyncio.wait_for(provider.second_call.wait(), 10)
+        await _wait_until(lambda: not agent._pending_queues)
+        for _ in range(200):
+            current = await state.read(key)
+            if current is not None and any(
+                message.get("content") == "Reviewed fake response"
+                for message in current.messages
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the active turn did not persist its answer")
+        assert "pending_user_turn" not in current.metadata, (
+            "the accepting turn settles the wake it consumed"
+        )
+        assert "pending_user_turn_owner" not in current.metadata
     finally:
         provider.release.set()
         task.cancel()

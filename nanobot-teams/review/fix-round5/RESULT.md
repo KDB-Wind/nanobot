@@ -25,6 +25,12 @@ Crash-after-consumption still holds: `inbox/probe_consumed_crash.py` leaves
 `pending_user_turn=true` across the kill and restart yields
 `recovery.status=awaiting_user, reason=restart_requires_confirmation, provider_calls=0`.
 
+A strict `basedpyright` pass over the changed `nanobot/` files exposed the
+mid-turn path as a type mismatch (`RequestContext.turn_id` is `str | None`).
+The end-to-end test `test_active_turn_settles_its_wake_under_a_public_turn_id`
+drives a live turn with the channel id `public-42`, injects a wake mid-turn and
+asserts the marker is gone; it fails on the pre-fix code and passes now.
+
 ## Changes
 
 - `nanobot/runs/executor.py`, `nanobot/runs/service.py`: `RunCancelled` carries
@@ -40,6 +46,10 @@ Crash-after-consumption still holds: `inbox/probe_consumed_crash.py` leaves
   records `{delivery_id, generation, turn_id}`. The loop creates the turn id
   before consuming the wake and passes it to `finish_turn`, which clears the
   marker only when the persisted owner matches the completing turn.
+- The mid-turn injection path takes the owner id from `_run_turn`
+  (`turn_owner_id=ctx.turn_id`) instead of `RequestContext.turn_id`, which
+  carries the channel's public id and may differ or be absent. A cancelled
+  turn keeps the marker: it did not finish the wake it accepted.
 
 ## Suites
 
@@ -47,7 +57,7 @@ Crash-after-consumption still holds: `inbox/probe_consumed_crash.py` leaves
 pytest nanobot-teams/tests -q                              280 passed
 pytest tests/runs tests/session \
        tests/tools/test_mcp_teams_meta.py \
-       tests/test_openai_api.py -q                        371 passed, 3 skipped
+       tests/test_openai_api.py -q                        372 passed, 3 skipped
 pytest tests/agent/test_loop_save_turn.py \
        tests/agent/test_auto_compact.py -q                141 passed
 bun run test src/tests/teams-workbench.test.tsx \
