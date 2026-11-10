@@ -108,6 +108,12 @@ class Task:
     finished_at: datetime | None = None
     last_error: str = ""
     reply_capability: str = ""
+    # Peer envelope (I4/I6): which conversation this task belongs to and at
+    # which hop. Plain planner delegations stay kind=user_delegation with an
+    # empty root.
+    kind: str = "user_delegation"
+    conversation_root: str = ""
+    hop: int = 0
 
     @property
     def open(self) -> bool:

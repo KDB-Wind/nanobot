@@ -57,6 +57,12 @@ CREATE TABLE IF NOT EXISTS bots (
     inbox_key_env TEXT,
     coord_secret_env TEXT
 );
+CREATE TABLE IF NOT EXISTS peer_edges (
+    from_bot_id TEXT NOT NULL,
+    to_bot_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (from_bot_id, to_bot_id)
+);
 CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -87,7 +93,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     finished_at TEXT,
     last_error TEXT NOT NULL DEFAULT '',
     reply_capability TEXT NOT NULL DEFAULT '',
-    migrated_usage INTEGER NOT NULL DEFAULT 0
+    migrated_usage INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT 'user_delegation',
+    conversation_root TEXT NOT NULL DEFAULT '',
+    hop INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_operation_key
     ON tasks(caller_principal, operation_key);
@@ -174,7 +183,7 @@ TASK_COLUMNS = (
     "remote_instance_id, remote_revision, run_state, stop_confirmed, effects_uncertain, "
     "outcome_code, outcome_message, result_text, result_truncated, result_available, "
     "result_fetched, cancel_state, delivery_state, created_at, finished_at, last_error, "
-    "reply_capability, migrated_usage"
+    "reply_capability, migrated_usage, kind, conversation_root, hop"
 )
 
 
@@ -262,6 +271,13 @@ DEFAULT_QUOTAS = {
     "workflow_result_bytes": 640 * 1024,
 }
 
+# Peer-comms budgets (I6). Fanout rides principal_open (sender's open tasks)
+# and recipient concurrency rides bot_queue; these bound the conversation
+# graph itself.
+PEER_MAX_HOPS = 4
+PEER_PAIR_WINDOW_MESSAGES = 20
+PEER_PAIR_WINDOW_SECONDS = 3600.0
+
 # Every admitted-but-unsettled task reserves the run protocol's result cap; a
 # task that has not returned its body yet still owns that quota headroom.
 RESULT_RESERVATION_BYTES = 32 * 1024
@@ -337,6 +353,22 @@ class CoordinatorStore:
             ):
                 if column not in bots_columns:
                     self._conn.execute(f"ALTER TABLE bots ADD COLUMN {column} TEXT")
+            task_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(tasks)")
+            }
+            if "kind" not in task_columns:
+                self._conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL "
+                    "DEFAULT 'user_delegation'"
+                )
+            if "conversation_root" not in task_columns:
+                self._conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN conversation_root TEXT NOT NULL DEFAULT ''"
+                )
+            if "hop" not in task_columns:
+                self._conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN hop INTEGER NOT NULL DEFAULT 0"
+                )
             # Older databases recorded a legacy unknown only as a quarantine
             # key; dispatch identity checks read the guard table. Derive the
             # missing rows before any worker can run.
@@ -783,6 +815,10 @@ class CoordinatorStore:
         bot: Bot,
         quotas: dict[str, int] | None = None,
         reply_capability: str = "",
+        kind: str = "user_delegation",
+        conversation_root: str = "",
+        hop: int = 0,
+        sender_bot_id: str | None = None,
     ) -> tuple[Task, bool]:
         """Validate, reserve, and persist one task plus its dispatch outbox entry.
 
@@ -893,6 +929,13 @@ class CoordinatorStore:
                 bot_id=bot_id,
                 quotas=limits,
             )
+            if kind == "peer":
+                self._admit_peer_guards(
+                    sender_bot_id=sender_bot_id or "",
+                    recipient_bot_id=bot_id,
+                    conversation_root=conversation_root,
+                    hop=hop,
+                )
             if snapshot["workflow_tasks"] >= limits["workflow_tasks"]:
                 raise AdmissionError(
                     "workflow_task_limit",
@@ -925,6 +968,7 @@ class CoordinatorStore:
                     DispatchState.PENDING.value, None, None, 0, "unobserved", 0, 0, None, "",
                     "", 0, 0, 0, CancelState.NONE.value, DeliveryState.NOT_READY.value,
                     iso(now), None, "", reply_capability, 0,
+                    kind, conversation_root, hop,
                 ),
             )
             self._conn.execute(
@@ -933,9 +977,128 @@ class CoordinatorStore:
                 (task_id, iso(now)),
             )
             self._emit(
-                "task_created", task_id, {"bot": bot_id, "workflow": workflow_id}
+                "task_created", task_id,
+                {"bot": bot_id, "workflow": workflow_id, "kind": kind,
+                 "sender": sender_bot_id, "recipient": bot_id if kind == "peer" else None,
+                 "conversation_root": conversation_root or None, "hop": hop},
             )
             return self._load_task(task_id), True
+
+    def _admit_peer_guards(
+        self,
+        *,
+        sender_bot_id: str,
+        recipient_bot_id: str,
+        conversation_root: str,
+        hop: int,
+    ) -> None:
+        """Peer authorization edges and conversation budgets (I3/I6).
+
+        Runs inside the admission transaction; fanout rides principal_open and
+        recipient concurrency rides bot_queue in the shared quota snapshot.
+        """
+        assert self._conn is not None
+        if not conversation_root:
+            raise AdmissionError(
+                "invalid_envelope", "Peer tasks require a conversation root."
+            )
+        if not sender_bot_id or sender_bot_id == recipient_bot_id:
+            raise AdmissionError(
+                "invalid_envelope", "A peer send needs distinct sender and recipient bots."
+            )
+        if not self._conn.execute(
+            "SELECT 1 FROM peer_edges WHERE from_bot_id=? AND to_bot_id=?",
+            (sender_bot_id, recipient_bot_id),
+        ).fetchone():
+            raise AdmissionError(
+                "unauthorized_edge",
+                "No explicit peer edge authorizes this sender to dispatch to that bot.",
+            )
+        if hop < 0 or hop >= PEER_MAX_HOPS:
+            raise AdmissionError(
+                "hop_limit_exceeded",
+                f"The conversation reached its {PEER_MAX_HOPS}-hop limit.",
+            )
+        # Recipient re-entry is the cycle shape (A->B->A): a bot that already
+        # received work in this conversation — including the planner's root
+        # delegation — cannot be targeted again. Relay chains (A->B, B->C)
+        # stay legal because only recipients are marked.
+        if self._conn.execute(
+            "SELECT 1 FROM tasks WHERE conversation_root=? AND bot_id=? LIMIT 1",
+            (conversation_root, recipient_bot_id),
+        ).fetchone():
+            raise AdmissionError(
+                "conversation_cycle",
+                "That bot already received work in this conversation.",
+            )
+        window_start = iso(utc_now() - timedelta(seconds=PEER_PAIR_WINDOW_SECONDS))
+        pair_count = int(self._conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE kind='peer' AND caller_principal=? "
+            "AND bot_id=? AND created_at>=?",
+            (f"bot:{sender_bot_id}", recipient_bot_id, window_start),
+        ).fetchone()[0])
+        if pair_count >= PEER_PAIR_WINDOW_MESSAGES:
+            raise AdmissionError(
+                "pair_rate_limited",
+                f"This sender already dispatched {PEER_PAIR_WINDOW_MESSAGES} peer "
+                f"tasks to that bot in the last hour.",
+            )
+
+    # ---- peer edges ----
+
+    def upsert_peer_edge(self, from_bot_id: str, to_bot_id: str) -> None:
+        with self._transaction():
+            assert self._conn is not None
+            for bot_id in (from_bot_id, to_bot_id):
+                if self._conn.execute(
+                    "SELECT 1 FROM bots WHERE bot_id=? AND archived_at IS NULL",
+                    (bot_id,),
+                ).fetchone() is None:
+                    raise AdmissionError(
+                        "bot_not_found", f"No active bot with id {bot_id}."
+                    )
+            if from_bot_id == to_bot_id:
+                raise AdmissionError(
+                    "invalid_edge", "A bot cannot be authorized to send to itself."
+                )
+            self._conn.execute(
+                "INSERT INTO peer_edges(from_bot_id, to_bot_id, created_at) "
+                "VALUES (?,?,?) ON CONFLICT(from_bot_id, to_bot_id) DO NOTHING",
+                (from_bot_id, to_bot_id, iso(utc_now())),
+            )
+            self._emit(
+                "peer_edge_upserted", None,
+                {"from": from_bot_id, "to": to_bot_id},
+            )
+
+    def delete_peer_edge(self, from_bot_id: str, to_bot_id: str) -> bool:
+        with self._transaction():
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                "DELETE FROM peer_edges WHERE from_bot_id=? AND to_bot_id=?",
+                (from_bot_id, to_bot_id),
+            )
+            removed = cursor.rowcount > 0
+            if removed:
+                self._emit(
+                    "peer_edge_deleted", None,
+                    {"from": from_bot_id, "to": to_bot_id},
+                )
+            return removed
+
+    def list_peer_edges(self) -> list[tuple[str, str]]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT from_bot_id, to_bot_id FROM peer_edges ORDER BY from_bot_id, to_bot_id"
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def has_peer_edge(self, from_bot_id: str, to_bot_id: str) -> bool:
+        assert self._conn is not None
+        return self._conn.execute(
+            "SELECT 1 FROM peer_edges WHERE from_bot_id=? AND to_bot_id=?",
+            (from_bot_id, to_bot_id),
+        ).fetchone() is not None
 
     # ---- task lifecycle ----
 
@@ -1508,4 +1671,7 @@ def _row_to_task(values: dict) -> Task:
         else datetime.fromisoformat(values["finished_at"]),
         last_error=values["last_error"] or "",
         reply_capability=values.get("reply_capability") or "",
+        kind=values.get("kind") or "user_delegation",
+        conversation_root=values.get("conversation_root") or "",
+        hop=int(values.get("hop") or 0),
     )
