@@ -327,7 +327,6 @@ async def test_events_stream_and_floor(tmp_path, make):
     assert events[-1].seq > events[0].seq
     fresh = await service.events(events[-1].seq)
     assert fresh == []
-    # Backdate events past retention and run cleanup on the same store.
     service._store._conn.execute(
         "UPDATE run_events SET at = ?", ((utc_now() - timedelta(days=31)).isoformat(),)
     )

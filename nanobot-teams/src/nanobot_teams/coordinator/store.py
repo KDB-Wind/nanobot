@@ -14,6 +14,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from ..file_lock import FileLock
 from .models import (
@@ -213,6 +214,30 @@ def task_digest(
         separators=(",", ":"),
     )
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def normalize_endpoint(endpoint: str) -> str:
+    """Canonical form for matching the same endpoint across registrations."""
+    raw = endpoint.strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    parts = urlsplit(raw)
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    path = parts.path.rstrip("/")
+    return f"{host}:{port}{path}" if port else f"{host}{path}"
+
+
+def endpoint_guard_key(endpoint: str) -> str:
+    """Quarantine key for an endpoint whose bot has no bound instance yet.
+
+    A bot registered over HTTP carries no instance identity until its first
+    dispatch preflight. The migration import isolates the endpoint itself, so
+    admission and dispatch must look under the same key.
+    """
+    return f"legacy:{normalize_endpoint(endpoint)}"
 
 
 DEFAULT_QUOTAS = {
@@ -471,15 +496,36 @@ class CoordinatorStore:
 
     # ---- quarantine ----
 
+    def _quarantine_locked(self, instance_id: str, reason: str) -> None:
+        """Reopen an instance as a new incident; caller holds the transaction.
+
+        A resolved row is not a permanent licence: each incident needs its own
+        acknowledgement. Clearing the current resolution fields makes the
+        instance active again, while the previous actor, note and reason stay
+        in the event log as the historical audit.
+        """
+        assert self._conn is not None
+        prior = self._conn.execute(
+            "SELECT reason, resolved_at FROM instance_quarantine WHERE instance_id=?",
+            (instance_id,),
+        ).fetchone()
+        self._conn.execute(
+            "INSERT INTO instance_quarantine(instance_id, reason, created_at) VALUES (?,?,?) "
+            "ON CONFLICT(instance_id) DO UPDATE SET reason=excluded.reason, "
+            "created_at=excluded.created_at, resolved_at=NULL, resolved_by='', "
+            "resolution_note=''",
+            (instance_id, reason, iso(utc_now())),
+        )
+        data = {"instance": instance_id, "reason": reason}
+        if prior is not None:
+            data["prior_reason"] = prior[0]
+            if prior[1] is not None:
+                data["prior_resolved_at"] = prior[1]
+        self._emit("instance_quarantined", None, data)
+
     def quarantine_instance(self, instance_id: str, reason: str) -> None:
         with self._transaction():
-            assert self._conn is not None
-            self._conn.execute(
-                "INSERT INTO instance_quarantine(instance_id, reason, created_at) VALUES (?,?,?) "
-                "ON CONFLICT(instance_id) DO UPDATE SET reason=excluded.reason",
-                (instance_id, reason, iso(utc_now())),
-            )
-            self._emit("instance_quarantined", None, {"instance": instance_id, "reason": reason})
+            self._quarantine_locked(instance_id, reason)
 
     def resolve_quarantine(self, instance_id: str, actor: str, note: str) -> None:
         with self._transaction():
@@ -489,7 +535,13 @@ class CoordinatorStore:
                 "WHERE instance_id=? AND resolved_at IS NULL",
                 (iso(utc_now()), actor, note, instance_id),
             )
-            self._emit("quarantine_resolved", None, {"instance": instance_id, "actor": actor})
+            # The row's resolution fields are cleared by the next incident, so
+            # the audit of who cleared this one lives in the event log.
+            self._emit(
+                "quarantine_resolved",
+                None,
+                {"instance": instance_id, "actor": actor, "note": note},
+            )
 
     def active_quarantines(self) -> dict[str, Quarantine]:
         assert self._conn is not None
@@ -523,19 +575,22 @@ class CoordinatorStore:
                 "SELECT COUNT(*) FROM tasks WHERE workflow_id=?", (workflow_id,)
             ).fetchone()[0]
         )
-        unknown_open = (
-            f"dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND run_state NOT IN "
-            f"{_TERMINAL_RUN_STATES_SQL}"
+        # An execution state alone does not settle a task: a terminal run whose
+        # stop is unconfirmed, or whose effects stayed uncertain, still owns the
+        # same open-slot and result reservation as a running one.
+        unsettled = (
+            f"dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND (run_state NOT IN "
+            f"{_TERMINAL_RUN_STATES_SQL} OR stop_confirmed=0 OR effects_uncertain=1)"
         )
         principal_open = int(
             self._conn.execute(
-                f"SELECT COUNT(*) FROM tasks WHERE caller_principal=? AND {unknown_open}",
+                f"SELECT COUNT(*) FROM tasks WHERE caller_principal=? AND {unsettled}",
                 (caller_principal,),
             ).fetchone()[0]
         )
         global_open = int(
             self._conn.execute(
-                f"SELECT COUNT(*) FROM tasks WHERE {unknown_open}"
+                f"SELECT COUNT(*) FROM tasks WHERE {unsettled}"
             ).fetchone()[0]
         )
         # Queue quotas attach to the instance identity, not the bot row: alias
@@ -548,17 +603,18 @@ class CoordinatorStore:
             self._conn.execute(
                 "SELECT COUNT(*) FROM tasks JOIN bots ON bots.bot_id=tasks.bot_id "
                 "WHERE COALESCE(bots.instance_id, bots.bot_id)=? AND "
-                f"tasks.dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND tasks.run_state "
-                f"NOT IN {_TERMINAL_RUN_STATES_SQL}",
+                f"tasks.dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND (tasks.run_state "
+                f"NOT IN {_TERMINAL_RUN_STATES_SQL} OR tasks.stop_confirmed=0 OR "
+                "tasks.effects_uncertain=1)",
                 (queue_key,),
             ).fetchone()[0]
         )
         # Admission reserves the protocol result cap per unsettled task; only a
-        # terminal task's actual stored body replaces its reservation.
+        # settled terminal task's actual stored body replaces its reservation.
         workflow_result_bytes = int(
             self._conn.execute(
-                "SELECT COALESCE(SUM(CASE WHEN dispatch_state IN "
-                f"{_UNKNOWN_DISPATCH_STATES} AND run_state NOT IN {_TERMINAL_RUN_STATES_SQL} "
+                "SELECT COALESCE(SUM(CASE WHEN "
+                f"{unsettled} "
                 "THEN ? ELSE LENGTH(CAST(result_text AS BLOB)) END),0) FROM tasks "
                 "WHERE workflow_id=?",
                 (RESULT_RESERVATION_BYTES, workflow_id),
@@ -630,15 +686,25 @@ class CoordinatorStore:
             if live_bot is None or not live_bot.enabled:
                 raise AdmissionError("bot_unavailable", "Bot is missing or disabled.")
             quarantines = self.active_quarantines()
-            if bot.instance_id and bot.instance_id in quarantines:
+            # A bot registered without an instance has no instance identity to
+            # guard yet; the migration import isolated exactly this endpoint, so
+            # admission must look under the endpoint guard key too. The endpoint
+            # key also stays relevant after a bind: it names the topology the
+            # legacy unknown was recorded against.
+            guard_keys = [endpoint_guard_key(live_bot.endpoint)]
+            if live_bot.instance_id:
+                guard_keys.insert(0, live_bot.instance_id)
+            blocked = next((key for key in guard_keys if key in quarantines), None)
+            if blocked is not None:
                 raise AdmissionError(
                     "bot_quarantined",
-                    f"The bot instance is quarantined: {quarantines[bot.instance_id].reason}",
+                    f"The bot is quarantined: {quarantines[blocked].reason}",
                 )
             # Imported 0.4 usage is a real guard: a migrated caller cannot admit
             # new work until an operator confirms fresh quota for it.
             quota_row = self._conn.execute(
-                "SELECT delegations_used, delegations_limit, imported_at, confirmed "
+                "SELECT delegations_used, delegations_limit, imported_at, confirmed, "
+                "result_bytes_used, result_bytes_limit "
                 "FROM caller_quotas WHERE caller_principal=?",
                 (caller_principal,),
             ).fetchone()
@@ -659,6 +725,29 @@ class CoordinatorStore:
                     raise AdmissionError(
                         "migrated_quota_exhausted",
                         "The confirmed delegation budget for this caller is exhausted.",
+                    )
+                # The imported byte usage is a real budget too: reservations and
+                # settled bodies of tasks admitted since the import count
+                # against it, so a migrated caller cannot outspend its confirmed
+                # result quota by ignoring the count.
+                admitted_bytes = int(
+                    self._conn.execute(
+                        "SELECT COALESCE(SUM(CASE WHEN "
+                        f"dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND (run_state "
+                        f"NOT IN {_TERMINAL_RUN_STATES_SQL} OR stop_confirmed=0 OR "
+                        "effects_uncertain=1) THEN ? ELSE "
+                        "LENGTH(CAST(result_text AS BLOB)) END),0) FROM tasks "
+                        "WHERE caller_principal=? AND created_at>=?",
+                        (RESULT_RESERVATION_BYTES, caller_principal, quota_row[2]),
+                    ).fetchone()[0]
+                )
+                if (
+                    int(quota_row[4]) + admitted_bytes + RESULT_RESERVATION_BYTES
+                    >= int(quota_row[5])
+                ):
+                    raise AdmissionError(
+                        "migrated_quota_exhausted",
+                        "The confirmed result-byte budget for this caller is exhausted.",
                     )
             snapshot = self.quota_snapshot(
                 workflow_id=workflow_id,
@@ -916,22 +1005,34 @@ class CoordinatorStore:
         with self._transaction():
             assert self._conn is not None
             row = self._conn.execute(
-                "SELECT dispatch_state, cancel_state, run_state FROM tasks WHERE task_id=?",
+                "SELECT dispatch_state, cancel_state, run_state, stop_confirmed, "
+                "effects_uncertain FROM tasks WHERE task_id=?",
                 (task_id,),
             ).fetchone()
             if row is None:
                 return None
-            dispatch, cancel, run_state = row
+            dispatch, cancel, run_state, stop_confirmed, effects_uncertain = row
             if cancel != CancelState.NONE.value:
                 return self._load_task(task_id)
             if run_state in TERMINAL_RUN_STATES:
-                # Terminal observation already settles the cancel; only the
-                # state name is unified here.
+                # An execution terminal state is not stop evidence. Only a
+                # confirmed stop without uncertain effects settles the cancel;
+                # otherwise the worker keeps driving a remote stop.
+                settled = bool(stop_confirmed) and not bool(effects_uncertain)
                 self._conn.execute(
                     "UPDATE tasks SET cancel_state=? WHERE task_id=?",
-                    (CancelState.CONFIRMED.value, task_id),
+                    (
+                        CancelState.CONFIRMED.value
+                        if settled
+                        else CancelState.UNCONFIRMED.value,
+                        task_id,
+                    ),
                 )
-                self._emit("task_cancel_requested", task_id, {})
+                self._emit(
+                    "task_cancel_requested",
+                    task_id,
+                    {"stop_confirmed": "true" if settled else "false"},
+                )
                 return self._load_task(task_id)
             if dispatch == DispatchState.ACCEPTED.value:
                 new_cancel = CancelState.REQUESTED.value
@@ -1060,16 +1161,7 @@ class CoordinatorStore:
                 (reason, task_id),
             )
             if quarantine_instance:
-                self._conn.execute(
-                    "INSERT INTO instance_quarantine(instance_id, reason, created_at) "
-                    "VALUES (?,?,?) ON CONFLICT(instance_id) DO UPDATE SET "
-                    "reason=excluded.reason",
-                    (quarantine_instance, reason, iso(utc_now())),
-                )
-                self._emit(
-                    "instance_quarantined", None,
-                    {"instance": quarantine_instance, "reason": reason},
-                )
+                self._quarantine_locked(quarantine_instance, reason)
             self._emit("task_indeterminate", task_id, {"reason": reason})
             return self._load_task(task_id)
 
@@ -1148,6 +1240,21 @@ class CoordinatorStore:
         rows = self._conn.execute(
             "SELECT task_id FROM tasks WHERE dispatch_state='accepted' AND run_state NOT IN "
             "('succeeded','failed','cancelled','interrupted') ORDER BY created_at LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._load_task(r[0]) for r in rows]
+
+    def tasks_with_pending_cancel(self, limit: int = 20) -> list[Task]:
+        """Accepted tasks whose cancel is not backed by a confirmed stop.
+
+        A terminal run is not stop evidence: these are driven until the remote
+        reports a confirmed stop, even though they no longer need observation.
+        """
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT task_id FROM tasks WHERE dispatch_state='accepted' AND "
+            "cancel_state IN ('requested','unconfirmed') AND (run_state NOT IN "
+            f"{_TERMINAL_RUN_STATES_SQL} OR stop_confirmed=0) ORDER BY created_at LIMIT ?",
             (limit,),
         ).fetchall()
         return [self._load_task(r[0]) for r in rows]

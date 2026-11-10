@@ -452,3 +452,30 @@ async def test_terminal_unconfirmed_stop_still_drives_remote_cancel(store):
         assert bot_app.cancel_calls == ["run_stop_unconfirmed"]
     finally:
         await server.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_pump_drives_cancel_for_terminal_unconfirmed_run(store):
+    """N08: observation stops at terminal; the cancel pump must keep driving."""
+    store.create_project("proj", "Main")
+    bot_app = FakeBotApp()
+    server = await make_bot_server(bot_app)
+    try:
+        register_bot(
+            store, str(server.make_url("")).rstrip("/"), instance="inst_bot_a"
+        )
+        task, _ = admit(store)
+        store.update_after_submit(
+            task.task_id, remote_run_id="run_terminal", remote_instance_id="inst_bot_a"
+        )
+        store.request_cancel(task.task_id)
+        store.record_observation(
+            task.task_id, revision=2, run_state="interrupted", stop_confirmed=False
+        )
+        worker = DispatchWorker(store, factory())
+        await worker.pump_once()
+        assert bot_app.cancel_calls == ["run_terminal"], (
+            "a terminal unconfirmed run still needs a remote stop"
+        )
+    finally:
+        await server.close()

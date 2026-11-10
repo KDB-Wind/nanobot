@@ -39,8 +39,9 @@ async def uncertainty():
 def migration_bytes():
     store,path=newstore('migration-bytes');bot=Bot('a','A','r','http://127.0.0.1:9','KEY',instance_id='inst_a');store.upsert_bot(bot)
     store.record_caller_usage('planner',delegations_used=1,result_bytes_used=32768);store.confirm_caller_quota('planner',delegations_limit=100,result_bytes_limit=32768,actor='operator')
-    task=admit(store,bot)
-    emit('migration_bytes',imported_result_used=store.caller_quota('planner')['result_bytes_used'],confirmed_result_limit=store.caller_quota('planner')['result_bytes_limit'],new_task_admitted=bool(task));store.close()
+    try:task=admit(store,bot);admitted=bool(task)
+    except AdmissionError:admitted=False
+    emit('migration_bytes',imported_result_used=store.caller_quota('planner')['result_bytes_used'],confirmed_result_limit=store.caller_quota('planner')['result_bytes_limit'],new_task_admitted=admitted);store.close()
 async def mcp_bounds():
     async def get(req):return web.Response(body=gzip.compress(json.dumps({'bots':[{'payload':'x'*1048576}]}).encode()),headers={'Content-Encoding':'gzip'})
     app=web.Application();app.router.add_get('/v1/teams/bots',get)

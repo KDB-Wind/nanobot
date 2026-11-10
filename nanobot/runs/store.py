@@ -653,14 +653,23 @@ class RunStore:
                 )
                 counts["result_bodies"] += 1
             event_cutoff = rfc3339(moment - timedelta(days=EVENT_RETENTION_DAYS))
+            meta_cutoff = rfc3339(moment - timedelta(days=METADATA_RETENTION_DAYS))
             last_seq_row = self._conn.execute("SELECT MAX(seq) FROM run_events").fetchone()
             last_seq = 0 if last_seq_row[0] is None else int(last_seq_row[0])
+            # Events go only with the run row they belong to. An unconfirmed
+            # run keeps its row, body and investigation events together no
+            # matter how old they are, so age alone must never delete them.
             cursor = self._conn.execute(
-                "DELETE FROM run_events WHERE at < ?", (event_cutoff,)
+                "DELETE FROM run_events WHERE at < ? AND run_id NOT IN ("
+                "SELECT run_id FROM runs WHERE finished_at IS NULL OR "
+                f"NOT ({self._UNCONFIRMED_GUARD}))",
+                (event_cutoff,),
             )
             deleted_events = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
             counts["events"] = deleted_events
             if deleted_events:
+                # The delete may leave holes, so the floor is the smallest seq
+                # still retained, or the next seq when nothing remains.
                 floor_row = self._conn.execute("SELECT MIN(seq) FROM run_events").fetchone()
                 floor = (
                     last_seq + 1 if floor_row[0] is None else int(floor_row[0])
@@ -670,7 +679,6 @@ class RunStore:
                     "ON CONFLICT(key) DO UPDATE SET value=MAX(value, excluded.value)",
                     (str(floor),),
                 )
-            meta_cutoff = rfc3339(moment - timedelta(days=METADATA_RETENTION_DAYS))
             stale = self._conn.execute(
                 "SELECT run_id, state FROM runs WHERE finished_at IS NOT NULL AND finished_at < ? "
                 f"AND {self._UNCONFIRMED_GUARD}",

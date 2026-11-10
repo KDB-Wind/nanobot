@@ -149,6 +149,8 @@ async def test_retention_keeps_unconfirmed_stops(tmp_path):
     assert kept is not None, "an unconfirmed run must survive retention cleanup"
     assert counts["runs"] == 0
     assert counts["result_bodies"] == 0
+    assert counts["events"] == 0, "the investigation log leaves only with its row"
+    assert store.events_after(0) != [], "an unconfirmed run keeps its events"
     await service.aclose()
     store.close()
 

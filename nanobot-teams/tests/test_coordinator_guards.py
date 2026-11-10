@@ -52,6 +52,7 @@ class ScriptedBot:
         self.lookup_status: int | None = None  # None -> normal behavior
         self.lookup_payload: dict = {}
         self.get_run_status: int | None = None
+        self.capability_status = 200
 
     def app(self) -> web.Application:
         application = web.Application()
@@ -63,6 +64,10 @@ class ScriptedBot:
         return application
 
     async def capabilities(self, request: web.Request) -> web.Response:
+        if self.capability_status != 200:
+            return web.json_response(
+                {"code": "unavailable"}, status=self.capability_status
+            )
         return web.json_response(
             {"protocol": 1, "instance_id": self.instance_id, "execution": True}
         )
@@ -451,3 +456,203 @@ def test_migration_import_quarantines_mapped_instance(tmp_path, store):
     )
     assert bot.instance_id in store.active_quarantines()
     assert store.caller_quota("planner")["confirmed"] is False
+
+
+def test_repeat_quarantine_is_a_new_incident(store):
+    """N07: resolving one incident must not license the next one."""
+    store.quarantine_instance("inst_x", "first failure")
+    store.resolve_quarantine("inst_x", "operator", "investigated")
+    assert "inst_x" not in store.active_quarantines()
+    store.quarantine_instance("inst_x", "second failure")
+    active = store.active_quarantines()
+    assert active["inst_x"].reason == "second failure", "the new incident is active"
+    assert active["inst_x"].resolution_note == "", (
+        "the prior resolution must not silence the new incident"
+    )
+    events = [
+        event.data for event in store.events_after(0)
+        if event.type == "instance_quarantined"
+    ]
+    assert events[-1]["prior_reason"] == "first failure", (
+        "the historical resolution stays visible in the event log"
+    )
+    resolved = [
+        event.data for event in store.events_after(0)
+        if event.type == "quarantine_resolved"
+    ]
+    assert resolved[-1]["note"] == "investigated", (
+        "the cleared resolution stays auditable in the log"
+    )
+
+
+def test_terminal_unconfirmed_stop_keeps_quota_and_cancel(store):
+    """N08: a terminal run without a confirmed stop is still unsettled."""
+    bot = _register(store, "http://127.0.0.1:9005")
+    task = _admit(store, bot)
+    store.update_after_submit(
+        task.task_id, remote_run_id="run_unconfirmed", remote_instance_id=bot.instance_id
+    )
+    observed = store.record_observation(
+        task.task_id, revision=2, run_state="interrupted", stop_confirmed=False,
+        effects_uncertain=True,
+    )
+    assert observed is not None and observed.effects_uncertain is True
+    snapshot = store.quota_snapshot(
+        workflow_id="wf", caller_principal="planner", bot_id="research"
+    )
+    assert snapshot["principal_open"] == 1, (
+        "an unconfirmed terminal run must keep its open slot"
+    )
+    assert snapshot["workflow_result_bytes"] == RESULT_RESERVATION_BYTES, (
+        "an unconfirmed terminal run must keep its result reservation"
+    )
+    cancelled = store.request_cancel(task.task_id)
+    assert cancelled is not None
+    assert cancelled.cancel_state.value == "unconfirmed", (
+        "a terminal run is not stop evidence"
+    )
+    assert store.tasks_with_pending_cancel() != [], (
+        "the unconfirmed cancel keeps driving until the stop is confirmed"
+    )
+
+
+def test_terminal_confirmed_stop_settles_quota_and_cancel(store):
+    """N08: a confirmed terminal stop releases the slot and settles the body."""
+    bot = _register(store, "http://127.0.0.1:9006")
+    task = _admit(store, bot)
+    store.update_after_submit(
+        task.task_id, remote_run_id="run_confirmed", remote_instance_id=bot.instance_id
+    )
+    store.record_observation(
+        task.task_id, revision=2, run_state="succeeded", stop_confirmed=True,
+        result_text="done",
+    )
+    snapshot = store.quota_snapshot(
+        workflow_id="wf", caller_principal="planner", bot_id="research"
+    )
+    assert snapshot["principal_open"] == 0
+    assert snapshot["workflow_result_bytes"] == len("done"), (
+        "a settled task counts its stored body, not a reservation"
+    )
+    cancelled = store.request_cancel(task.task_id)
+    assert cancelled is not None and cancelled.cancel_state.value == "confirmed"
+    assert store.tasks_with_pending_cancel() == []
+
+
+def test_unbound_bot_endpoint_guard_blocks_admission(store):
+    """N09: a migrated unknown guards the endpoint a fresh registration uses."""
+    from nanobot_teams.coordinator.store import endpoint_guard_key
+
+    bot = Bot(
+        bot_id="research", display_name="Research", role="research",
+        endpoint="http://127.0.0.1:9007", secret_env="GUARD_BOT_KEY",
+        instance_id=None,
+    )
+    store.upsert_bot(bot)
+    store.quarantine_instance(endpoint_guard_key(bot.endpoint), "0.4 unknown outcome")
+    with pytest.raises(AdmissionError) as exc:
+        _admit(store, bot)
+    assert exc.value.code == "bot_quarantined"
+
+
+def test_bound_bot_still_respects_its_endpoint_guard(store):
+    """N09: the legacy endpoint key names the topology, not just a registration."""
+    from nanobot_teams.coordinator.store import endpoint_guard_key
+
+    bot = _register(store, "http://127.0.0.1:9009")
+    store.quarantine_instance(endpoint_guard_key(bot.endpoint), "0.4 unknown outcome")
+    with pytest.raises(AdmissionError) as exc:
+        _admit(store, bot)
+    assert exc.value.code == "bot_quarantined"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_unbound_bot_binds_instance_before_submit(store):
+    """N09: an HTTP-registered bot is identified before its first submit."""
+    bot_app = ScriptedBot()
+    server = await _bot_server(bot_app)
+    try:
+        bot = Bot(
+            bot_id="research", display_name="Research", role="research",
+            endpoint=str(server.make_url("")).rstrip("/"), secret_env="GUARD_BOT_KEY",
+            instance_id=None,
+        )
+        store.upsert_bot(bot)
+        task = _admit(store, bot)
+        worker = DispatchWorker(store, ClientFactory({"GUARD_BOT_KEY": SECRET}))
+        assert await _pump_until(
+            worker,
+            lambda: store.get_task(task.task_id).dispatch_state.value == "accepted",
+        )
+        bound = store.get_bot("research")
+        assert bound is not None and bound.instance_id == bot_app.instance_id
+        assert bot_app.submits == 1
+    finally:
+        await server.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_fresh_bind_defers_when_the_instance_is_quarantined(store):
+    """N09: the bind is followed by a quarantine re-check before any submit."""
+    bot_app = ScriptedBot()
+    server = await _bot_server(bot_app)
+    try:
+        bot = Bot(
+            bot_id="research", display_name="Research", role="research",
+            endpoint=str(server.make_url("")).rstrip("/"), secret_env="GUARD_BOT_KEY",
+            instance_id=None,
+        )
+        store.upsert_bot(bot)
+        # The instance already carries an incident; the bot does not know its
+        # identity until the preflight reports it.
+        store.quarantine_instance(bot_app.instance_id, "prior incident")
+        task = _admit(store, bot)
+        worker = DispatchWorker(store, ClientFactory({"GUARD_BOT_KEY": SECRET}))
+        await worker.pump_once()
+        current = store.get_task(task.task_id)
+        assert current.dispatch_state.value == "pending"
+        assert bot_app.submits == 0, "the bind must not open the submit path"
+        bound = store.get_bot("research")
+        assert bound is not None and bound.instance_id == bot_app.instance_id
+        entry = store.dispatch_entry_for_task(task.task_id)
+        assert entry is not None and "quarantined" in entry.last_error
+    finally:
+        await server.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_capability_failure_before_submit_is_retryable_defer(store):
+    """N09: a pre-submit probe failure proves nothing ran; retry, don't isolate."""
+    bot_app = ScriptedBot()
+    bot_app.capability_status = 503
+    server = await _bot_server(bot_app)
+    try:
+        bot = _register(store, str(server.make_url("")).rstrip("/"), instance=None)
+        task = _admit(store, bot)
+        worker = DispatchWorker(store, ClientFactory({"GUARD_BOT_KEY": SECRET}))
+        await worker.pump_once()
+        current = store.get_task(task.task_id)
+        assert current.dispatch_state.value == "pending"
+        assert current.run_state == "unobserved"
+        assert bot_app.submits == 0
+        entry = store.dispatch_entry_for_task(task.task_id)
+        assert entry is not None and entry.state == "pending"
+        assert entry.next_attempt_at > utc_now()
+        assert "capabilities" in entry.last_error
+        assert store.active_quarantines() == {}, (
+            "a failed preflight is not evidence of an unknown delivery"
+        )
+    finally:
+        await server.close()
+
+
+def test_imported_result_bytes_limit_is_enforced(store):
+    """M03: the confirmed byte budget is enforced, not just stored."""
+    store.record_caller_usage("planner", delegations_used=1, result_bytes_used=32768)
+    store.confirm_caller_quota(
+        "planner", delegations_limit=100, result_bytes_limit=32768, actor="operator"
+    )
+    bot = _register(store, "http://127.0.0.1:9008")
+    with pytest.raises(AdmissionError) as exc:
+        _admit(store, bot)
+    assert exc.value.code == "migrated_quota_exhausted"

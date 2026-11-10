@@ -286,7 +286,10 @@ def build_app(
         except IdempotencyConflictError as exc:
             return api_error(409, exc.code, exc.detail)
         except AdmissionError as exc:
-            return api_error(422, exc.code, exc.detail)
+            # A quarantined bot is a state conflict, not a malformed request:
+            # the same body becomes admissible once the operator resolves it.
+            status = 409 if exc.code == "bot_quarantined" else 422
+            return api_error(status, exc.code, exc.detail)
         return _json_response(task_public_json(task), status=201 if created else 200)
 
     async def list_tasks(request: web.Request) -> web.Response:
