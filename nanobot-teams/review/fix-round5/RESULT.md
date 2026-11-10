@@ -1,7 +1,8 @@
 # Round-5 repair result
 
-Fixed head: this commit series (`7f4f668e4`, `376e63c08`, `054319701`) on
-`feat/nanobot-teams-mvp`.
+Fixed head: `fix/teams-round3-handoffs` on the fork. The fix commits are
+`7f4f668e4` (runs), `376e63c08` (coordinator), and `054319701`, `dd2f77df6`
+(session).
 Review baseline: `e56d24cbf`.
 
 Every finding was reproduced on the baseline before any product change. The
