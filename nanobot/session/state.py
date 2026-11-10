@@ -28,8 +28,11 @@ from nanobot.utils.cancellation import shield_and_drain
 
 _T = TypeVar("_T")
 _PENDING_KEY = "pending_user_turn"
+_PENDING_OWNER_KEY = "pending_user_turn_owner"
 _CHECKPOINT_KEY = "runtime_checkpoint"
-_RESERVED_KEYS = frozenset({_PENDING_KEY, _CHECKPOINT_KEY, "pending_user_followups"})
+_RESERVED_KEYS = frozenset({
+    _PENDING_KEY, _PENDING_OWNER_KEY, _CHECKPOINT_KEY, "pending_user_followups",
+})
 _DEFAULT_CAPACITY = 64
 _DEFAULT_WORKERS = 4
 
@@ -524,7 +527,9 @@ class SessionState:
         for item in fields(Session):
             setattr(draft, item.name, getattr(fresh, item.name))
 
-    def _apply_turn(self, draft: Session) -> tuple[Session, int]:
+    def _apply_turn(
+        self, draft: Session, *, pending_turn_owner: str | None = None
+    ) -> tuple[Session, int]:
         from nanobot.session.recovery import PENDING_FOLLOWUPS_KEY, acknowledge_pending_followups
 
         baseline = draft._baseline  # pyright: ignore[reportPrivateUsage]
@@ -539,6 +544,18 @@ class SessionState:
             current.generation != baseline.generation
         ):
             raise SessionConflictError("session was reset")
+        if pending_turn_owner is not None:
+            owner = current.metadata.get(_PENDING_OWNER_KEY)
+            if (
+                current.metadata.get(_PENDING_KEY)
+                and isinstance(owner, dict)
+                and cast(dict[str, object], owner).get("turn_id") == pending_turn_owner
+                and cast(dict[str, object], owner).get("generation") == current.generation
+            ):
+                # This turn accepted the wake that wrote the marker; settle the
+                # obligation. A marker from a newer turn keeps its owner.
+                current.metadata.pop(_PENDING_KEY, None)
+                current.metadata.pop(_PENDING_OWNER_KEY, None)
         for key in baseline.metadata.keys() | draft.metadata.keys():
             if key == PENDING_FOLLOWUPS_KEY:
                 # queue_followup owns this journal; a draft may predate its inputs.
@@ -577,11 +594,15 @@ class SessionState:
         current.updated_at = max(current.updated_at, draft.updated_at)
         return current, self._changed_start(before_messages, current.messages)
 
-    async def _submit_draft(self, draft: Session) -> None:
+    async def _submit_draft(
+        self, draft: Session, *, pending_turn_owner: str | None = None
+    ) -> None:
         def commit() -> Session:
             # The caller owns this draft and awaits settlement before using it again.
             def write() -> Session:
-                current, message_start = self._apply_turn(draft)
+                current, message_start = self._apply_turn(
+                    draft, pending_turn_owner=pending_turn_owner
+                )
                 self._commit(current, message_start=message_start)
                 return current
 
@@ -674,11 +695,13 @@ class SessionState:
         """Commit the prepared input and recovery baseline before external execution."""
         await self._submit_draft(session)
 
-    async def finish_turn(self, session: Session) -> None:
-        """Commit the assembled transcript and clear its recovery checkpoint."""
+    async def finish_turn(
+        self, session: Session, *, pending_turn_owner: str | None = None
+    ) -> None:
+        """Commit the transcript and settle the wake this turn accepted."""
         session.metadata.pop(_PENDING_KEY, None)
         session.metadata.pop(_CHECKPOINT_KEY, None)
-        await self._submit_draft(session)
+        await self._submit_draft(session, pending_turn_owner=pending_turn_owner)
 
     async def restore_interruption(self, session: Session) -> None:
         """Commit a recovery decision against the version it classified."""

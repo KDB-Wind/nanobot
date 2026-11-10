@@ -671,12 +671,13 @@ class ExternalInbox:
 
         return self._read(query)
 
-    def mark_wake_consumed(self, delivery_id: str) -> bool:
+    def mark_wake_consumed(self, delivery_id: str, *, turn_id: str = "") -> bool:
         """Accept the wake and hand the turn to the session owner.
 
         Clearing wake_due and marking the session's pending turn commit in one
-        transaction. A crash after this point leaves the pending marker for
-        RecoveryCoordinator.scan; a completed turn clears it in _save_turn.
+        transaction. The marker carries the accepting turn's identity so the
+        completion transaction can settle this obligation without erasing a
+        newer turn's marker.
         """
 
         def update(conn: sqlite3.Connection) -> bool:
@@ -687,12 +688,14 @@ class ExternalInbox:
             if cursor.rowcount != 1:
                 return False
             row = conn.execute(
-                "SELECT session_key FROM external_inbox WHERE delivery_id=?",
+                "SELECT session_key, session_generation FROM external_inbox "
+                "WHERE delivery_id=?",
                 (delivery_id,),
             ).fetchone()
             if row is None:
                 return True
             session_key = str(row[0])
+            generation = str(row[1] or "")
             session_row = conn.execute(
                 "SELECT metadata FROM sessions WHERE key=?", (session_key,)
             ).fetchone()
@@ -704,6 +707,11 @@ class ExternalInbox:
                 if isinstance(parsed, dict):
                     metadata = cast(dict[str, Any], parsed)
             metadata["pending_user_turn"] = True
+            metadata["pending_user_turn_owner"] = {
+                "delivery_id": delivery_id,
+                "generation": generation,
+                "turn_id": turn_id,
+            }
             conn.execute(
                 "UPDATE sessions SET metadata=?, revision=revision+1 WHERE key=?",
                 (

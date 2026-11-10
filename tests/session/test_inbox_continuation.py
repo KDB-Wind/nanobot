@@ -134,6 +134,41 @@ async def test_wake_pump_keeps_obligation_until_consumed(harness):
     assert await pump.pump_once() == 0
 
 
+async def test_completion_settles_only_the_accepting_turns_marker(harness):
+    """A completed wake releases its marker; another turn cannot release it."""
+    inbox, state, key, generation = harness
+    delivery = make_delivery(key, generation)
+    inbox.receive(delivery)
+    assert await _apply(inbox, delivery.delivery_id) == "injected"
+
+    # Turn drafts are read before the accepting turn writes the marker, as in
+    # the loop: the inbox write is the only place the marker enters storage.
+    wrong_turn = await state.read(key)
+    owning_turn = await state.read(key)
+    assert inbox.mark_wake_consumed(
+        delivery.delivery_id, turn_id="turn-1"
+    ) is True
+
+    persisted = await state.read(key)
+    assert persisted.metadata["pending_user_turn"] is True
+    assert persisted.metadata["pending_user_turn_owner"] == {
+        "delivery_id": delivery.delivery_id,
+        "generation": generation,
+        "turn_id": "turn-1",
+    }
+
+    await state.finish_turn(wrong_turn, pending_turn_owner="turn-2")
+    still = await state.read(key)
+    assert still.metadata["pending_user_turn"] is True, (
+        "a different turn must not erase the wake obligation"
+    )
+
+    await state.finish_turn(owning_turn, pending_turn_owner="turn-1")
+    settled = await state.read(key)
+    assert "pending_user_turn" not in settled.metadata
+    assert "pending_user_turn_owner" not in settled.metadata
+
+
 async def test_wake_pump_orphans_when_session_is_gone(harness):
     """F02: a dead origin session must not produce a phantom turn."""
     inbox, state, key, generation = harness

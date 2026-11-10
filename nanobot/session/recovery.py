@@ -14,6 +14,7 @@ from nanobot.session.manager import Session
 
 RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
 PENDING_USER_TURN_KEY = "pending_user_turn"
+PENDING_USER_TURN_OWNER_KEY = "pending_user_turn_owner"
 REQUEST_ORIGIN_METADATA_KEY = "request_origin"
 RECOVERY_METADATA_KEY = "webui_recovery"
 RECOVERY_INBOUND_METADATA_KEY = "_webui_recovery_id"
@@ -422,6 +423,7 @@ def restore_runtime_checkpoint(session: Session) -> bool:
         session.provider_state = None
 
     session.metadata.pop(PENDING_USER_TURN_KEY, None)
+    session.metadata.pop(PENDING_USER_TURN_OWNER_KEY, None)
     session.metadata.pop(RUNTIME_CHECKPOINT_KEY, None)
     session.updated_at = datetime.now()
     return True
@@ -458,6 +460,7 @@ def restore_pending_interruption(session: Session, *, superseded: bool = False) 
         session.provider_state = None
         session.updated_at = datetime.now()
     session.metadata.pop(PENDING_USER_TURN_KEY, None)
+    session.metadata.pop(PENDING_USER_TURN_OWNER_KEY, None)
     return True
 
 

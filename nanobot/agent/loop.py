@@ -959,12 +959,13 @@ class AgentLoop:
         except Exception:
             logger.debug("external inbox wake orphan skipped for {}", delivery_id)
 
-    def _consume_wake_obligation(self, msg: InboundMessage) -> bool:
+    def _consume_wake_obligation(self, msg: InboundMessage, *, turn_id: str) -> bool:
         """Clear a wake only when the turn accepts it under the live grant.
 
         The pump keeps ``wake_due`` set after publishing; this is the
-        acceptance boundary. A revoked workflow ends the obligation without
-        giving the message a model turn.
+        acceptance boundary. The accepting turn's identity is recorded with the
+        obligation so only that turn's completion can settle it. A revoked
+        workflow ends the obligation without giving the message a model turn.
         """
         inbox = getattr(self, "external_inbox", None)
         delivery_id = self._wake_delivery_id(msg)
@@ -981,7 +982,7 @@ class AgentLoop:
                 "workflow revoked auto-continue before wake consumption",
             )
             return False
-        if not inbox.mark_wake_consumed(delivery_id):
+        if not inbox.mark_wake_consumed(delivery_id, turn_id=turn_id):
             # Another accepted turn (or an orphan/drop) already ended this
             # obligation; a republished duplicate must not repeat the report.
             return False
@@ -1282,7 +1283,7 @@ class AgentLoop:
                 if isinstance(followup_id, str) and followup_id:
                     row[PENDING_FOLLOWUP_ID_KEY] = followup_id
                 if wake_delivery_id is not None and not self._consume_wake_obligation(
-                    pending_msg
+                    pending_msg, turn_id=request_ctx.turn_id
                 ):
                     return _DROP_PENDING
                 return row
@@ -1830,7 +1831,10 @@ class AgentLoop:
                             skip_idle = True
                             raise exc
                         restore_runtime_checkpoint(session)
-                        await self.sessions.state.finish_turn(session)
+                        await self.sessions.state.finish_turn(
+                            session,
+                            pending_turn_owner=delivery.route.turn_id,
+                        )
                         logger.info("Saved cancelled turn for session {}", key)
                     except SessionConflictError:
                         current = await self.sessions.state.read_header(key)
@@ -2021,7 +2025,8 @@ class AgentLoop:
             # Revocation happens only after admission and generation validation:
             # a stale user input must not revoke the current generation's grant.
             await self._arevoke_external_workflows(key)
-        if not self._consume_wake_obligation(msg):
+        turn_id = f"{key}:{time.time_ns()}"
+        if not self._consume_wake_obligation(msg, turn_id=turn_id):
             return None
         if delivery is None:
             delivery = self.turn_delivery_factory.create(msg, key)
@@ -2032,7 +2037,7 @@ class AgentLoop:
             msg=msg,
             session=session,
             session_key=key,
-            turn_id=f"{key}:{time.time_ns()}",
+            turn_id=turn_id,
             runtime=runtime,
             kind=kind,
             delivery=delivery,
@@ -2519,7 +2524,9 @@ class AgentLoop:
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
         if ctx.commit_session:
-            await self.sessions.state.finish_turn(session)
+            await self.sessions.state.finish_turn(
+                session, pending_turn_owner=ctx.turn_id
+            )
         if not ctx.ephemeral:
             await self.runtime_event_publisher.session_turn_persisted(
                 ctx.msg,
