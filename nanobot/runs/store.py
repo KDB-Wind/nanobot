@@ -377,6 +377,7 @@ class RunStore:
         cancel_reason: str | None = None,
         event_type: str | None = None,
         event_data: dict[str, str] | None = None,
+        isolation_reason: str | None = None,
         now: datetime | None = None,
     ) -> Run:
         assert self._conn is not None
@@ -453,6 +454,19 @@ class RunStore:
                 rfc3339(moment),
                 event_data or {},
             )
+            if isolation_reason is not None:
+                # The terminal row and the quarantine commit together: a
+                # storage fault cannot leave a released slot with no guard.
+                self._write_meta_locked(
+                    "isolation",
+                    json.dumps(
+                        {
+                            "isolated": True,
+                            "reason": isolation_reason,
+                            "at": rfc3339(moment),
+                        }
+                    ),
+                )
             return self._load_run(run_id)
 
     def record_phase(self, run_id: str, phase: str) -> Run:

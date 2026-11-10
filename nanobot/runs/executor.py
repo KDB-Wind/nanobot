@@ -77,8 +77,12 @@ class AgentLoopRunExecutor:
         except asyncio.CancelledError:
             # Cancel the loop-owned work for this run's session before letting
             # the cancellation surface: stop confirmation needs the background
-            # tools and exec sessions gone, not just this coroutine.
-            self._cancel_unverified = not await self._reap_session_work(session_key)
+            # tools and exec sessions gone, not just this coroutine. Set the
+            # conservative fact before the await: a second cancel can end this
+            # task here, and the flag must already say the cleanup is unproven.
+            self._cancel_unverified = True
+            if await self._reap_session_work(session_key):
+                self._cancel_unverified = False
             raise
         except Exception as exc:
             # The loop may have started tools or subprocesses before failing;

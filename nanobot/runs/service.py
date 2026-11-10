@@ -202,6 +202,7 @@ class RunService:
             return run
         # A worker pump may move the run between our read and the transition;
         # re-read on conflict so a cancel request is never silently dropped.
+        inject_cancel = False
         for _ in range(3):
             run = await self.get(run_id)
             if run.terminal:
@@ -222,6 +223,10 @@ class RunService:
                     return await self.get(run_id)
                 except StateTransitionError:
                     continue
+            if run.state is RunState.CANCELLING:
+                # A repeated cancel is idempotent: the first request already
+                # owns the cancellation and its reap.
+                break
             if run.state is RunState.RUNNING:
                 try:
                     self._store.transition(
@@ -234,11 +239,13 @@ class RunService:
                     )
                 except StateTransitionError:
                     continue
+                inject_cancel = True
                 break
             break
         task = self._tasks.get(run_id)
-        if task is not None and not task.done():
+        if inject_cancel and task is not None and not task.done():
             task.cancel()
+        if task is not None and not task.done():
             await asyncio.wait({task}, timeout=self._cancel_wait_s)
         return await self.get(run_id)
 
@@ -321,12 +328,12 @@ class RunService:
                         message="Executor exited before confirming the stop; "
                         "background effects are unverified.",
                     ),
-                    stop_confirmed=True,
+                    stop_confirmed=False,
                     effects_uncertain=True,
                     event_type="run_cancelled_unverified",
-                )
-                self._store.set_isolation(
-                    f"Run {run.run_id} stopped without confirmed effect cleanup."
+                    isolation_reason=(
+                        f"Run {run.run_id} stopped without confirmed effect cleanup."
+                    ),
                 )
                 acted = True
             except StateTransitionError:
@@ -352,6 +359,7 @@ class RunService:
                 continue
             if run.deadline_at > now or run.cancel_reason == "deadline_exceeded":
                 continue
+            was_running = run.state is RunState.RUNNING
             try:
                 self._store.transition(
                     run.run_id,
@@ -364,7 +372,7 @@ class RunService:
             except StateTransitionError:
                 continue
             task = self._tasks.get(run.run_id)
-            if task is not None and not task.done():
+            if was_running and task is not None and not task.done():
                 task.cancel()
             acted = True
         return acted
@@ -452,11 +460,12 @@ class RunService:
                 # proved nothing is still live.
                 stop_confirmed=not unverified,
                 effects_uncertain=True if unverified else None,
-            )
-            if unverified:
-                self._store.set_isolation(
+                isolation_reason=(
                     f"Run {run_id} cancelled before its background work confirmed cleanup."
-                )
+                    if unverified
+                    else None
+                ),
+            )
         except StateTransitionError:
             pass
 
@@ -464,14 +473,15 @@ class RunService:
         current = self._store.get(run_id)
         if current is None or current.terminal:
             return
+        isolation_reason = None
         if result.effects_uncertain:
-            self._store.set_isolation(
+            isolation_reason = (
                 f"Run {run_id} stopped with unconfirmed background effects."
             )
         elif not result.stop_confirmed:
             # The executor could not prove the run's background work stopped;
             # the slot must not be treated as clean until an operator checks.
-            self._store.set_isolation(
+            isolation_reason = (
                 f"Run {run_id} finished without a confirmed stop of its "
                 "background work."
             )
@@ -519,6 +529,7 @@ class RunService:
                 outcome=outcome,
                 stop_confirmed=result.stop_confirmed,
                 effects_uncertain=result.effects_uncertain or None,
+                isolation_reason=isolation_reason,
             )
         except StateTransitionError:
             pass
