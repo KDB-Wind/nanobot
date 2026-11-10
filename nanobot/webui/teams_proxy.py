@@ -48,7 +48,9 @@ class TeamsProxy:
             )
         target = self.coordinator_url + path.replace("/api/teams", "/v1/teams", 1)
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(
+                timeout=10.0, follow_redirects=False, trust_env=False
+            ) as client:
                 response = await client.request(
                     method,
                     target,

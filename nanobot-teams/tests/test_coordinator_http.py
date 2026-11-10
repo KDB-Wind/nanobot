@@ -266,10 +266,26 @@ async def test_events_stream_emits_task_lifecycle(client):
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
 async def test_scaffold_creates_home_and_returns_manual_command(tmp_path, store):
+    """F12/F13: the scaffold contract on the shared HTTP surface — loadable
+    JSON config, env-ref credentials, and no raw service key in the response."""
     from nanobot_teams.coordinator.config import CoordinatorConfig
 
+    user_config = tmp_path / "user-config.json"
+    user_config.write_text(
+        json.dumps(
+            {
+                "modelPresets": {
+                    "http-preset": {"model": "m", "provider": "p", "apiKey": "sk-live"}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     config = CoordinatorConfig(
-        control_dir=tmp_path / "control", bot_homes_root=tmp_path / "homes"
+        control_dir=tmp_path / "control",
+        bot_homes_root=tmp_path / "homes",
+        scaffold_model_preset="http-preset",
+        scaffold_user_config=user_config,
     )
     app = build_app(store, config, {"operator": ADMIN, "planner": PLANNER})
     server = TestServer(app)
@@ -284,12 +300,15 @@ async def test_scaffold_creates_home_and_returns_manual_command(tmp_path, store)
         assert created.status == 201, await created.text()
         payload = await created.json()
         assert payload["started"] is False
-        assert payload["start_command"].startswith("nanobot serve --config")
-        assert payload["api_key"]
+        assert payload["start_command"].startswith('nanobot serve --config "')
+        assert "api_key" not in payload, "the raw key never reaches the browser"
         home = tmp_path / "homes" / "writer"
-        assert (home / "nanobot.toml").exists()
+        config_text = (home / "config.json").read_text(encoding="utf-8")
+        assert '"runs"' in config_text
         assert (home / "workspace").is_dir()
         assert store.get_bot("writer") is not None
+        assert (home / "service-key.env").exists()
+        assert "sk-live" not in config_text, "preset credentials stay env-referenced"
         # The same home is never overwritten.
         repeat = await test_client.post(
             "/v1/teams/bots/scaffold",

@@ -340,7 +340,9 @@ class DispatchWorker:
             return
         try:
             if client is None:
-                async with httpx.AsyncClient(timeout=10.0) as owned:
+                async with httpx.AsyncClient(
+                    timeout=10.0, follow_redirects=False, trust_env=False
+                ) as owned:
                     receipt = await owned.get(
                         planner.inbox_url.rstrip("/") + f"/v1/agent-inbox/{delivery_id}",
                         headers={"Authorization": f"Bearer {inbox_key}"},
@@ -408,7 +410,9 @@ class DispatchWorker:
             "result_truncated": task.result_truncated,
         }
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(
+                timeout=10.0, follow_redirects=False, trust_env=False
+            ) as client:
                 response = await client.post(
                     planner.inbox_url.rstrip("/") + "/v1/agent-inbox",
                     headers={"Authorization": f"Bearer {inbox_key}"},

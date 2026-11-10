@@ -60,7 +60,10 @@ export interface TeamsScaffoldResult {
   home: string;
   endpoint: string;
   secret_env: string;
-  api_key: string;
+  /** Operator-local file holding the one-time generated service key. */
+  key_file: string;
+  /** Environment names that must be set before the bot can load. */
+  required_env: string[];
   start_command: string;
   started: boolean;
 }

@@ -228,8 +228,15 @@ export function TeamsSettings() {
             <p>{tx("settings.teams.scaffoldHint", "Start the bot manually with:")}</p>
             <code className="block whitespace-pre-wrap">{scaffold.start_command}</code>
             <p className="mt-1">
-              {tx("settings.teams.scaffoldSecret", "Service key (shown once):")}{" "}
-              <code data-scaffold-key>{scaffold.secret_env}={scaffold.api_key}</code>
+              {tx(
+                "settings.teams.scaffoldKeyFile",
+                "Service key (operator-local, never shown here):",
+              )}{" "}
+              <code data-scaffold-key-file>{scaffold.key_file}</code>
+            </p>
+            <p className="mt-1">
+              {tx("settings.teams.scaffoldRequiredEnv", "Set these environment variables on both the bot and the coordinator:")}{" "}
+              <code data-scaffold-required-env>{scaffold.required_env.join(", ")}</code>
             </p>
             <p className="text-zinc-400">
               {tx("settings.teams.notStarted", "The bot is not started yet.")}

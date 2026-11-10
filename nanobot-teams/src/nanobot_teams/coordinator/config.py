@@ -29,7 +29,6 @@ class PlannerBinding:
     instance_id: str
     principal_id: str
     inbox_key_env: str = "TEAMS_PLANNER_INBOX_KEY"
-    inbox_key_env: str = "TEAMS_PLANNER_INBOX_KEY"
 
 
 @dataclass(frozen=True)
@@ -41,6 +40,12 @@ class CoordinatorConfig:
     planner_token_env: str = "TEAMS_COORDINATOR_PLANNER_TOKEN"
     planner: PlannerBinding | None = None
     bot_homes_root: Path | None = None
+    # Model preset copied into scaffolded bot homes (from the operator's user
+    # config); empty disables scaffolding until the operator names one.
+    scaffold_model_preset: str = ""
+    # Where the operator's model presets live; defaults to lifecycle's
+    # user_config_path() when None.
+    scaffold_user_config: Path | None = None
     source_path: Path | None = field(default=None, compare=False)
 
     def resolve_tokens(self, env: dict[str, str] | None = None) -> dict[str, str]:

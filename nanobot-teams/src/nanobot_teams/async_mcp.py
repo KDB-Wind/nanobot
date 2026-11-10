@@ -100,6 +100,9 @@ class CoordinatorClient:
             base_url=base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout_s,
+            follow_redirects=False,
+            # F14: the planner token never traverses an environment proxy.
+            trust_env=False,
         )
 
     async def aclose(self) -> None:

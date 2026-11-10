@@ -66,6 +66,91 @@ def user_config_path() -> Path:
     return Path.home() / ".nanobot" / "config.json"
 
 
+def managed_bot_config(
+    *,
+    bot_id: str,
+    home: Path,
+    port: int,
+    preset: str,
+    runs_api_key_env: str,
+    user_config: Path | None = None,
+) -> tuple[dict, set[str]]:
+    """Build a loadable JSON config for a managed async-workbench bot.
+
+    The model preset is copied from the operator's user config with every
+    credential-carrying string externalized to ``${ENV}`` references (the same
+    convention as ``bot_init``), so the generated file never carries a raw
+    service key and the browser-facing scaffold never sees one (F13). The
+    runs API key comes from ``runs_api_key_env``. Returns the config dict and
+    the set of environment names that must be set before the bot can load.
+    """
+    source = user_config or user_config_path()
+    user = _load_json(source)
+    preset_block: dict | None = None
+    provider_block: dict = {}
+    required_env: set[str] = set()
+    model = ""
+    preset_env_prefix = "TEAMS_" + bot_id.upper().replace("-", "_").replace(".", "_") + "_PRESET"
+    if isinstance(user, dict):
+        presets = user.get("modelPresets") or {}
+        if preset in presets:
+            preset_block, preset_env = _connection_for_scaffold(presets[preset], preset_env_prefix, preset=True)
+            required_env.update(preset_env)
+            if isinstance(preset_block, dict):
+                model = preset_block.get("model", "")
+                provider_name = preset_block.get("provider")
+                providers = user.get("providers") or {}
+                if provider_name in providers:
+                    block, provider_env = _connection_for_scaffold(providers[provider_name], provider_name)
+                    required_env.update(provider_env)
+                    provider_block = {provider_name: block}
+    if not isinstance(preset_block, dict) or not isinstance(preset_block.get("model"), str) or not preset_block["model"]:
+        raise ConfigError(
+            f"model preset {preset!r} was not found with a usable model block in "
+            f"{source}; register it before scaffolding a managed bot"
+        )
+    if not runs_api_key_env.isidentifier():
+        raise ConfigError("runs_api_key_env must be a valid environment variable name")
+    workspace = (home / "workspace").resolve()
+    config = {
+        "agents": {
+            "defaults": {
+                "workspace": str(workspace),
+                "modelPreset": preset,
+                "model": model,
+                "provider": "auto",
+                "maxTokens": 8192,
+                "contextWindowTokens": 200000,
+                "temperature": 0.1,
+                "maxToolIterations": 30,
+                "maxConcurrentSubagents": 1,
+                "maxToolResultChars": 16000,
+                "timezone": "Asia/Shanghai",
+                "unifiedSession": False,
+                "dream": {"enabled": False},
+            }
+        },
+        "modelPresets": {preset: preset_block},
+        "providers": provider_block,
+        "api": {
+            "host": "127.0.0.1",
+            "port": port,
+            "timeout": 120,
+            "runs": {
+                "enabled": True,
+                "apiKey": "${" + runs_api_key_env + "}",
+                "principalId": "teams-coordinator",
+                "executionEnabled": True,
+                "exclusiveExecution": True,
+            },
+        },
+        "tools": {"restrictToWorkspace": True, "exec": {"enable": False}, "mcpServers": {}},
+        "channels": {},
+    }
+    required_env.add(runs_api_key_env)
+    return config, required_env
+
+
 def bot_init(
     bot_id: str,
     *,

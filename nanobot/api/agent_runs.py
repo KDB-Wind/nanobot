@@ -109,7 +109,9 @@ async def parse_protocol_json(request: web.Request) -> dict[str, Any]:
             object_pairs_hook=_pairs,
             parse_constant=_constant,
         )
-    except protocol_error:
+    except web.HTTPException:
+        # protocol_error() builds HTTPException responses (S05): re-raise them
+        # so callers get the structured 4xx, never a catching-class 500.
         raise
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise protocol_error(400, "invalid_json", "Body is not valid JSON.")
@@ -329,6 +331,17 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
         after = _parse_seq(after_raw)
     else:
         after = 0
+    # S09: an expired cursor is a protocol 410 BEFORE the stream prepares, so
+    # clients can branch on the status and recover from an authoritative
+    # snapshot; a cursor expiring mid-stream still emits the in-stream event.
+    try:
+        first_batch = await service.events(after)
+    except EventCursorExpiredError:
+        raise protocol_error(
+            410,
+            "event_cursor_expired",
+            "The cursor predates event retention; reconnect from a snapshot.",
+        )
     resp = web.StreamResponse(headers={
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -336,10 +349,12 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
     })
     await resp.prepare(request)
     heartbeat_at = asyncio.get_event_loop().time() + SSE_HEARTBEAT_SECONDS
+    events = first_batch
     try:
         while True:
             try:
-                events = await service.events(after)
+                if events is None:
+                    events = await service.events(after)
             except EventCursorExpiredError:
                 await resp.write(
                     b"event: cursor_expired\ndata: {\"code\":\"event_cursor_expired\"}\n\n"
@@ -368,6 +383,7 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
                     f"id: {event.seq}\nevent: {event.type}\ndata: {payload.decode('utf-8')}\n\n".encode()
                 )
                 after = event.seq
+            events = None
             now = asyncio.get_event_loop().time()
             if now >= heartbeat_at:
                 await resp.write(b": heartbeat\n\n")

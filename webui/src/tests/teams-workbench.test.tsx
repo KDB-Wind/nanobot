@@ -79,8 +79,10 @@ const requestMutation = vi.fn(async (action: string) => {
   if (action === "teams.scaffold_bot") {
     return {
       bot_id: "writer", home: "/homes/writer", endpoint: "http://127.0.0.1:8999",
-      secret_env: "TEAMS_BOT_WRITER_KEY", api_key: "once-only",
-      start_command: "nanobot serve --config /homes/writer/nanobot.toml", started: false,
+      secret_env: "TEAMS_BOT_WRITER_KEY",
+      key_file: "/homes/writer/service-key.env",
+      required_env: ["TEAMS_BOT_WRITER_KEY"],
+      start_command: 'nanobot serve --config "/homes/writer/config.json"', started: false,
     };
   }
   return snapshot.tasks[0];
@@ -203,14 +205,17 @@ describe("TeamsSettings", () => {
     );
   });
 
-  it("shows scaffold result with manual start command and one-time key", async () => {
+  it("shows the scaffold key file location and never the raw service key", async () => {
     renderTeams();
     await screen.findAllByText("Research");
     fireEvent.change(screen.getByLabelText(/new bot id/i), { target: { value: "writer" } });
     fireEvent.click(screen.getByRole("button", { name: /generate bot home/i }));
-    const key = await screen.findByText(/TEAMS_BOT_WRITER_KEY=once-only/);
-    expect(key).toBeInTheDocument();
+    const keyFile = await screen.findByText(/service-key\.env/);
+    expect(keyFile).toBeInTheDocument();
+    expect(screen.getByText(/TEAMS_BOT_WRITER_KEY/)).toBeInTheDocument();
     expect(screen.getByText(/nanobot serve --config/)).toBeInTheDocument();
     expect(screen.getByText(/not started yet/i)).toBeInTheDocument();
+    // F13: the browser never receives or renders the raw key value.
+    expect(screen.queryByText(/once-only/)).not.toBeInTheDocument();
   });
 });

@@ -178,6 +178,54 @@ async def test_submit_rejects_bad_protocol_bodies(client_factory):
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_malformed_bodies_answer_structured_4xx(client_factory):
+    """S05: parser faults surface as protocol 400s, never a catching-class 500."""
+    client, _, _ = await client_factory()
+    malformed = await client.post(
+        "/v1/agent-runs", data="{", headers=runs_headers(operation_key=str(uuid.uuid4()))
+    )
+    assert malformed.status == 400
+    body = await malformed.json()
+    assert body["code"] == "invalid_json"
+    assert malformed.content_type == "application/json"
+    duplicate = await client.post(
+        "/v1/agent-runs",
+        data='{"protocol":1,"protocol":1}',
+        headers=runs_headers(operation_key=str(uuid.uuid4())),
+    )
+    assert duplicate.status == 400
+    assert (await duplicate.json())["code"] == "duplicate_key"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_expired_cursor_answers_410_before_streaming(client_factory):
+    """S09: an expired cursor is a protocol 410 before the stream prepares."""
+    client, service, fake = await client_factory()
+    fake.result = ExecutionResult(code=OutcomeCode.SUCCEEDED, text="done", message="")
+    key = str(uuid.uuid4())
+    submitted = await client.post(
+        "/v1/agent-runs", headers=runs_headers(operation_key=key), json=submit_body()
+    )
+    run = await submitted.json()
+    for _ in range(300):
+        status = await client.get(f"/v1/agent-runs/{run['run_id']}", headers=runs_headers())
+        payload = await status.json()
+        if payload["state"] == "succeeded":
+            break
+        await asyncio.sleep(0.02)
+    store: RunStore = service._store
+    store._conn.execute(
+        "UPDATE run_events SET at=?", ((utc_now() - timedelta(days=31)).isoformat(),)
+    )
+    store.cleanup()
+    expired = await client.get("/v1/agent-runs/events?after=0", headers=runs_headers())
+    assert expired.status == 410
+    body = await expired.json()
+    assert body["code"] == "event_cursor_expired"
+    assert expired.content_type == "application/json"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
 async def test_result_endpoint_lifecycle(client_factory):
     client, _, fake = await client_factory()
     fake.result = ExecutionResult(code=OutcomeCode.PROVIDER_ERROR, text="partial", message="502")
