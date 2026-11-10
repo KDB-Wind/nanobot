@@ -409,6 +409,28 @@ class CoordinatorStore:
             (iso(utc_now()), event_type, task_id, json.dumps(data, ensure_ascii=False)),
         )
 
+    def record_peer_rejection(
+        self,
+        *,
+        sender_bot_id: str,
+        recipient_bot_id: str,
+        code: str,
+        conversation_root: str,
+        hop: int,
+    ) -> None:
+        """Audit a typed peer rejection (I10): no bodies, full routing facts."""
+        with self._transaction():
+            self._emit(
+                "peer_send_rejected", None,
+                {
+                    "sender": sender_bot_id,
+                    "recipient": recipient_bot_id,
+                    "code": code,
+                    "conversation_root": conversation_root,
+                    "hop": hop,
+                },
+            )
+
     def events_after(self, after_seq: int, limit: int = 100) -> list[Event]:
         assert self._conn is not None
         rows = self._conn.execute(

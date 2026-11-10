@@ -769,6 +769,10 @@ def task_public_json(task) -> dict:
         "created_at": task.created_at.isoformat(),
         "finished_at": None if task.finished_at is None else task.finished_at.isoformat(),
         "last_error": task.last_error,
+        "kind": task.kind,
+        "conversation_root": task.conversation_root,
+        "hop": task.hop,
+        "caller_principal": task.caller_principal,
     }
 
 

@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -398,6 +399,167 @@ def build_app(
         if task is None:
             return api_error(404, "task_not_found", "No task for that key.")
         return _json_response(task_public_json(task))
+
+    async def peer_send(request: web.Request) -> web.Response:
+        """Bot-principal task dispatch along an explicit peer edge (I3-I6)."""
+        role = request[_ROLE_KEY]
+        if role is None or not role.startswith("bot:"):
+            return api_error(
+                403, "peer_forbidden", "Peer sends require a bot principal."
+            )
+        sender_id = role[len("bot:"):]
+        try:
+            body = await request.json()
+        except Exception:
+            return api_error(400, "invalid_json", "Body must be JSON.")
+        if not isinstance(body, dict):
+            return api_error(400, "invalid_json", "Body must be an object.")
+        required = {"recipient", "input", "operation_key"}
+        missing = required - set(body)
+        if missing:
+            return api_error(400, "invalid_field", f"Missing fields: {sorted(missing)}")
+        input_text = str(body["input"])
+        if len(input_text.encode("utf-8")) > 16 * 1024:
+            return api_error(
+                400, "input_too_large", "Peer input exceeds the 16 KiB protocol cap."
+            )
+        try:
+            hop = int(body.get("hop", 0))
+        except (TypeError, ValueError):
+            return api_error(400, "invalid_field", "hop must be an integer.")
+        conversation_root = str(body.get("conversation_root", "")).strip()             or str(uuid.uuid4())
+        deadline_raw = body.get("deadline_at")
+        deadline = None
+        if deadline_raw is not None:
+            from datetime import datetime
+
+            try:
+                deadline = datetime.fromisoformat(str(deadline_raw))
+            except ValueError:
+                return api_error(400, "invalid_field", "deadline_at must be RFC 3339.")
+            if deadline.tzinfo is None:
+                return api_error(
+                    400, "invalid_field", "deadline_at must carry a UTC timezone."
+                )
+        sender = store.get_bot(sender_id)
+        if sender is None or not sender.enabled:
+            return api_error(
+                403, "unknown_sender", "The sending bot is not registered or enabled."
+            )
+        recipient = store.get_bot(str(body["recipient"]))
+        if recipient is None or not recipient.enabled:
+            return api_error(400, "bot_unavailable", "No registered bot with that id.")
+        project_id = str(body.get("project", "peer")).strip() or "peer"
+        try:
+            store.create_project(project_id, "Peer comms")
+        except AdmissionError:
+            pass  # already present on every send but the first
+        # Idempotent reconciliation wins over fresh budget checks, exactly
+        # like planner submissions.
+        principal = principal_for(request)
+        existing = store.lookup_task(principal, str(body["operation_key"]))
+        if existing is not None:
+            # A replay that omits the envelope keeps the original semantics:
+            # the caller did not change what the operation key means.
+            replay_root = (
+                existing.conversation_root
+                if not str(body.get("conversation_root", "")).strip()
+                else conversation_root
+            )
+            digest = task_digest(
+                caller_principal=principal,
+                project_id=project_id,
+                bot_id=recipient.bot_id,
+                input_text=input_text,
+                deadline_at=deadline,
+                delivery_mode=DeliveryMode.WORKBENCH_ONLY.value,
+                workflow_id=replay_root,
+            )
+            if existing.request_digest == digest:
+                return _json_response(task_public_json(existing), status=200)
+            return api_error(
+                409, "operation_key_conflict",
+                "This operation key was used with different semantics.",
+            )
+        try:
+            task, created = store.admit_task(
+                caller_principal=principal,
+                project_id=project_id,
+                workflow_id=conversation_root,
+                bot_id=recipient.bot_id,
+                operation_key=str(body["operation_key"]),
+                input_text=input_text,
+                deadline_at=deadline,
+                delivery_mode=DeliveryMode.WORKBENCH_ONLY,
+                bot=recipient,
+                kind="peer",
+                conversation_root=conversation_root,
+                hop=hop,
+                sender_bot_id=sender_id,
+            )
+        except IdempotencyConflictError as exc:
+            return api_error(409, exc.code, exc.detail)
+        except AdmissionError as exc:
+            status = {
+                "unauthorized_edge": 403,
+                "conversation_cycle": 403,
+                "hop_limit_exceeded": 422,
+                "pair_rate_limited": 429,
+                "bot_quarantined": 409,
+            }.get(exc.code, 422)
+            store.record_peer_rejection(
+                sender_bot_id=sender_id,
+                recipient_bot_id=recipient.bot_id,
+                code=exc.code,
+                conversation_root=conversation_root,
+                hop=hop,
+            )
+            return api_error(status, exc.code, exc.detail)
+        return _json_response(task_public_json(task), status=201 if created else 200)
+
+    async def upsert_peer_edge(request: web.Request) -> web.Response:
+        denied = require_role(request, ("operator",))
+        if denied is not None:
+            return denied
+        try:
+            body = await request.json()
+        except Exception:
+            return api_error(400, "invalid_json", "Body must be JSON.")
+        from_bot = str(body.get("from_bot_id", "")).strip()
+        to_bot = str(body.get("to_bot_id", "")).strip()
+        if not from_bot or not to_bot:
+            return api_error(
+                400, "invalid_field", "from_bot_id and to_bot_id are required."
+            )
+        try:
+            store.upsert_peer_edge(from_bot, to_bot)
+        except AdmissionError as exc:
+            return api_error(409, exc.code, exc.detail)
+        return _json_response(
+            {"edge": {"from_bot_id": from_bot, "to_bot_id": to_bot}}, status=201
+        )
+
+    async def list_peer_edges(request: web.Request) -> web.Response:
+        denied = require_role(request, ("planner", "operator"))
+        if denied is not None:
+            return denied
+        return _json_response(
+            {"edges": [
+                {"from_bot_id": f, "to_bot_id": t}
+                for f, t in store.list_peer_edges()
+            ]}
+        )
+
+    async def delete_peer_edge(request: web.Request) -> web.Response:
+        denied = require_role(request, ("operator",))
+        if denied is not None:
+            return denied
+        removed = store.delete_peer_edge(
+            request.match_info["from_bot_id"], request.match_info["to_bot_id"]
+        )
+        if not removed:
+            return api_error(404, "edge_not_found", "No such peer edge.")
+        return _json_response({"removed": True})
 
     async def get_task(request: web.Request) -> web.Response:
         denied = require_role(request, ("planner", "operator"))
@@ -843,6 +1005,12 @@ def build_app(
 
     app.router.add_get("/v1/teams/capabilities", capabilities)
     app.router.add_post("/v1/teams/tasks", create_task)
+    app.router.add_post("/v1/teams/peer/send", peer_send)
+    app.router.add_post("/v1/teams/peer-edges", upsert_peer_edge)
+    app.router.add_get("/v1/teams/peer-edges", list_peer_edges)
+    app.router.add_delete(
+        "/v1/teams/peer-edges/{from_bot_id}/{to_bot_id}", delete_peer_edge
+    )
     app.router.add_get("/v1/teams/tasks", list_tasks)
     app.router.add_get("/v1/teams/tasks/lookup", lookup_task)
     app.router.add_get("/v1/teams/tasks/{task_id}", get_task)
