@@ -131,6 +131,15 @@ _SUBAGENT_PROVIDER_TASK_META = "subagent_provider_task_id"
 _SUBAGENT_TERMINAL_WAIT_SECONDS = 300.0
 
 
+class _DropPendingMessage:
+    """Injected message consumed without becoming model input (stale or revoked)."""
+
+    __slots__ = ()
+
+
+_DROP_PENDING = _DropPendingMessage()
+
+
 def _prompt_scope_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     key = WORKSPACE_SCOPE_METADATA_KEY
     return {key: deepcopy(metadata[key])} if key in metadata else {}
@@ -936,6 +945,48 @@ class AgentLoop:
         except Exception:
             logger.debug("external inbox revocation skipped for {}", session_key)
 
+    @staticmethod
+    def _wake_delivery_id(msg: InboundMessage) -> str | None:
+        value = msg.metadata.get("wake_delivery_id")
+        return value if isinstance(value, str) and value else None
+
+    def _orphan_wake(self, delivery_id: str, reason: str) -> None:
+        inbox = getattr(self, "external_inbox", None)
+        if inbox is None:
+            return
+        try:
+            inbox.mark_wake_orphaned(delivery_id, reason)
+        except Exception:
+            logger.debug("external inbox wake orphan skipped for {}", delivery_id)
+
+    def _consume_wake_obligation(self, msg: InboundMessage) -> bool:
+        """Clear a wake only when the turn accepts it under the live grant.
+
+        The pump keeps ``wake_due`` set after publishing; this is the
+        acceptance boundary. A revoked workflow ends the obligation without
+        giving the message a model turn.
+        """
+        inbox = getattr(self, "external_inbox", None)
+        delivery_id = self._wake_delivery_id(msg)
+        if inbox is None or delivery_id is None:
+            return True
+        workflow_id = msg.metadata.get("source_workflow")
+        if (
+            isinstance(workflow_id, str)
+            and workflow_id
+            and not inbox.workflow_allows_auto_continue(workflow_id)
+        ):
+            inbox.drop_wake(
+                delivery_id,
+                "workflow revoked auto-continue before wake consumption",
+            )
+            return False
+        if not inbox.mark_wake_consumed(delivery_id):
+            # Another accepted turn (or an orphan/drop) already ended this
+            # obligation; a republished duplicate must not repeat the report.
+            return False
+        return True
+
     async def stop_session_work(self, session_key: str) -> SessionStopReport:
         """Stop one session's tasks, subagents, and exec sessions.
 
@@ -1131,7 +1182,25 @@ class AgentLoop:
                 except asyncio.QueueEmpty:
                     break
 
-            async def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any] | None:
+            async def _to_user_message(
+                pending_msg: InboundMessage,
+            ) -> dict[str, Any] | None | _DropPendingMessage:
+                wake_delivery_id = self._wake_delivery_id(pending_msg)
+                if pending_msg.session_generation is not None and (
+                    session is None
+                    or session.generation != pending_msg.session_generation
+                ):
+                    # The same admission rule as a new turn: a replaced
+                    # generation never enters the active transcript.
+                    if wake_delivery_id is not None:
+                        self._orphan_wake(
+                            wake_delivery_id,
+                            "session generation replaced before injected wake consumption",
+                        )
+                    return _DROP_PENDING
+                if pending_msg.is_user_input:
+                    # An injected genuine user input revokes like a new turn.
+                    await self._arevoke_external_workflows(active_session_key)
                 content = pending_msg.content
                 image_paths = pending_msg.media if pending_msg.media else None
                 if image_paths:
@@ -1148,6 +1217,10 @@ class AgentLoop:
                     "role": "user", "content": user_content,
                     "_meta": self._input_history_extra(pending_msg),
                 }
+                if wake_delivery_id is not None:
+                    # The report already sits in durable history; the wake body
+                    # is model input for this turn only.
+                    row["_meta"][turn_continuation.SKIP_USER_PERSIST_META] = True
                 if HIDDEN_HISTORY_META in pending_msg.metadata:
                     row[HIDDEN_HISTORY_META] = pending_msg.metadata[HIDDEN_HISTORY_META]
                 metadata_value = cast(object, pending_msg.metadata)
@@ -1208,18 +1281,28 @@ class AgentLoop:
                 followup_id = metadata.get(PENDING_FOLLOWUP_ID_KEY)
                 if isinstance(followup_id, str) and followup_id:
                     row[PENDING_FOLLOWUP_ID_KEY] = followup_id
+                if wake_delivery_id is not None and not self._consume_wake_obligation(
+                    pending_msg
+                ):
+                    return _DROP_PENDING
                 return row
 
             consumed = 0
             try:
                 converted: list[dict[str, Any]] = []
                 consumed_inputs: list[InboundMessage] = []
+                dropped = 0
                 for pending_msg in pending_messages:
                     # Independent turns are FIFO barriers. Their worker path
                     # owns completion, command dispatch, and control metadata.
                     if not self._can_inject_message(pending_msg):
                         break
                     row = await _to_user_message(pending_msg)
+                    if isinstance(row, _DropPendingMessage):
+                        # Consumed without model input: never requeue a stale or
+                        # revoked wake ahead of later arrivals.
+                        dropped += 1
+                        continue
                     if row is None:
                         break
                     converted.append(row)
@@ -1229,7 +1312,9 @@ class AgentLoop:
                         execution_scope.consume_inputs(consumed_inputs)
                     except Exception as exc:
                         raise ExecutionControlError("could not accept consumed inputs") from exc
-                consumed = len(converted)
+                # Commit the whole snapshot only after every conversion
+                # succeeded; a later failure rolls all arrivals back.
+                consumed = len(converted) + dropped
                 return converted
             finally:
                 # Commit only a successfully converted prefix. On failure or
@@ -1914,16 +1999,32 @@ class AgentLoop:
             session = (await self.sessions.state.read(key)
                        if msg.require_existing_session or msg.session_generation is not None
                        else await self.sessions.state.get(key))
+        wake_delivery_id = self._wake_delivery_id(msg)
         if msg.require_existing_session and session is None:
+            if wake_delivery_id is not None:
+                self._orphan_wake(
+                    wake_delivery_id, "origin session is gone before wake consumption"
+                )
+                return None
             raise RuntimeError("required session is not active")
         if msg.session_generation is not None and (
             session is None or session.generation != msg.session_generation
         ):
+            if wake_delivery_id is not None:
+                # A wake published before a replacement never reaches the new
+                # generation; its receipt keeps the report as orphaned.
+                self._orphan_wake(
+                    wake_delivery_id,
+                    "session generation replaced before wake consumption",
+                )
+                return None
             raise RuntimeError("required session generation was replaced")
         if kind is TurnKind.USER:
             # Revocation happens only after admission and generation validation:
             # a stale user input must not revoke the current generation's grant.
             await self._arevoke_external_workflows(key)
+        if not self._consume_wake_obligation(msg):
+            return None
         if delivery is None:
             delivery = self.turn_delivery_factory.create(msg, key)
         elif delivery.session_key != key:
@@ -2562,6 +2663,10 @@ class AgentLoop:
                 if isinstance(internal_meta, dict)
                 else None
             )
+            skip_user_persist = (
+                isinstance(internal_meta, dict)
+                and internal_meta.get(turn_continuation.SKIP_USER_PERSIST_META) is True
+            )
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
@@ -2593,6 +2698,8 @@ class AgentLoop:
                         ]
                     entry["content"] = filtered
             elif role == "user":
+                if skip_user_persist:
+                    continue
                 if isinstance(content, list):
                     filtered = self._sanitize_persisted_blocks(
                         cast(list[object], content),
