@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import uuid
 from datetime import timedelta
 
@@ -417,3 +418,39 @@ async def test_compressed_and_duplicate_key_bodies_rejected(client_factory):
     )
     assert compressed.status == 400
     assert (await compressed.json())["code"] == "compressed_body_rejected"
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_storage_fault_is_retryable_503_while_missing_run_stays_404(client_factory):
+    """M01: a storage failure is a structured retryable 503, never 404."""
+    client, service, _ = await client_factory()
+    submitted = await client.post(
+        "/v1/agent-runs",
+        headers=runs_headers(operation_key=str(uuid.uuid4())),
+        json=submit_body(),
+    )
+    run = await submitted.json()
+    store: RunStore = service._store
+    store._conn.set_authorizer(
+        lambda action, *args: sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_SELECT
+        else sqlite3.SQLITE_OK
+    )
+    try:
+        routes = (
+            ("get", f"/v1/agent-runs/{run['run_id']}"),
+            ("get", f"/v1/agent-runs/{run['run_id']}/result"),
+            ("post", f"/v1/agent-runs/{run['run_id']}/cancel"),
+        )
+        for method, path in routes:
+            call = client.get if method == "get" else client.post
+            response = await call(path, headers=runs_headers())
+            assert response.status == 503, (path, response.status, await response.text())
+            assert response.content_type == "application/json"
+            body = await response.json()
+            assert body["code"] == "storage_unavailable"
+            assert body["retryable"] is True
+    finally:
+        store._conn.set_authorizer(None)
+    missing = await client.get("/v1/agent-runs/run_absent", headers=runs_headers())
+    assert missing.status == 404
+    assert (await missing.json())["code"] == "run_not_found"

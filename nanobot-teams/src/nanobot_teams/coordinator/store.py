@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS dispatch_outbox (
     state TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT NOT NULL,
-    last_error TEXT NOT NULL DEFAULT ''
+    last_error TEXT NOT NULL DEFAULT '',
+    submit_started_at TEXT
 );
 CREATE INDEX IF NOT EXISTS dispatch_due ON dispatch_outbox(state, next_attempt_at);
 CREATE TABLE IF NOT EXISTS delivery_outbox (
@@ -264,6 +265,22 @@ class CoordinatorStore:
             if "result_fetched" not in columns:
                 self._conn.execute(
                     "ALTER TABLE tasks ADD COLUMN result_fetched INTEGER NOT NULL DEFAULT 0"
+                )
+            outbox_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(dispatch_outbox)")
+            }
+            if "submit_started_at" not in outbox_columns:
+                self._conn.execute(
+                    "ALTER TABLE dispatch_outbox ADD COLUMN submit_started_at TEXT"
+                )
+                # Rows written by older versions counted attempts only after a
+                # failed delivery; attempts>0 was their "may have been sent"
+                # signal. Keep that safety on upgrade instead of confirming a
+                # cancel for a submit this version never observed.
+                self._conn.execute(
+                    "UPDATE dispatch_outbox SET submit_started_at=? "
+                    "WHERE attempts>0 AND submit_started_at IS NULL",
+                    (iso(utc_now()),),
                 )
         except (OSError, sqlite3.Error, StoreError) as exc:
             self.close()
@@ -765,6 +782,21 @@ class CoordinatorStore:
             self._emit("task_accepted", task_id, {"run": remote_run_id})
             return self._load_task(task_id)
 
+    def mark_submit_started(self, entry_id: int) -> None:
+        """Persist that this entry may reach the remote before the first byte.
+
+        Written in its own transaction so a cancel that races the worker sees
+        the fact; never cleared, because a later cancel cannot prove the
+        request did not leave the process.
+        """
+        with self._transaction():
+            assert self._conn is not None
+            self._conn.execute(
+                "UPDATE dispatch_outbox SET submit_started_at=COALESCE(submit_started_at, ?) "
+                "WHERE entry_id=?",
+                (iso(utc_now()), entry_id),
+            )
+
     def mark_dispatch_failure(
         self, task_id: str, *, error: str, retry_at: datetime | None = None, attempts: int = 0
     ) -> None:
@@ -867,8 +899,9 @@ class CoordinatorStore:
     def dispatch_entry_for_task(self, task_id: str) -> DispatchEntry | None:
         assert self._conn is not None
         row = self._conn.execute(
-            "SELECT entry_id, task_id, state, attempts, next_attempt_at, last_error FROM "
-            "dispatch_outbox WHERE task_id=? ORDER BY entry_id DESC LIMIT 1",
+            "SELECT entry_id, task_id, state, attempts, next_attempt_at, last_error, "
+            "submit_started_at FROM dispatch_outbox WHERE task_id=? "
+            "ORDER BY entry_id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         if row is None:
@@ -876,6 +909,7 @@ class CoordinatorStore:
         return DispatchEntry(
             entry_id=int(row[0]), task_id=row[1], state=row[2], attempts=int(row[3]),
             next_attempt_at=datetime.fromisoformat(row[4]), last_error=row[5],
+            submit_started_at=None if row[6] is None else datetime.fromisoformat(row[6]),
         )
 
     def request_cancel(self, task_id: str) -> Task | None:
@@ -915,13 +949,14 @@ class CoordinatorStore:
                 new_cancel = CancelState.UNCONFIRMED.value
             else:
                 entry = self._conn.execute(
-                    "SELECT attempts FROM dispatch_outbox WHERE task_id=? AND "
+                    "SELECT submit_started_at FROM dispatch_outbox WHERE task_id=? AND "
                     "state='pending' ORDER BY entry_id DESC LIMIT 1",
                     (task_id,),
                 ).fetchone()
-                if entry is not None and int(entry[0]) == 0:
-                    # Definitely never sent: close the task and its outbox in
-                    # this same transaction instead of confirming a phantom.
+                if entry is not None and entry[0] is None:
+                    # No submit was ever started for this entry (persisted
+                    # fact): close the task and its outbox in this same
+                    # transaction instead of confirming a phantom.
                     self._conn.execute(
                         "UPDATE tasks SET cancel_state=?, run_state='cancelled', "
                         "outcome_code='cancelled', outcome_message='Cancelled before "
@@ -939,8 +974,9 @@ class CoordinatorStore:
                     )
                     self._emit("task_cancelled_before_dispatch", task_id, {})
                     return self._load_task(task_id)
-                # Attempts > 0: the submit may have reached the remote; keep the
-                # unknown until the dispatch worker reconciles by the key.
+                # A submit was started: it may have reached the remote, so
+                # the cancel stays unconfirmed until the dispatch worker
+                # reconciles by the original key.
                 new_cancel = CancelState.UNCONFIRMED.value
             self._conn.execute(
                 "UPDATE tasks SET cancel_state=? WHERE task_id=?", (new_cancel, task_id)
@@ -1084,15 +1120,16 @@ class CoordinatorStore:
     def pending_dispatch(self, now: datetime, limit: int = 10) -> list[DispatchEntry]:
         assert self._conn is not None
         rows = self._conn.execute(
-            "SELECT entry_id, task_id, state, attempts, next_attempt_at, last_error FROM "
-            "dispatch_outbox WHERE state='pending' AND next_attempt_at<=? ORDER BY entry_id "
-            "LIMIT ?",
+            "SELECT entry_id, task_id, state, attempts, next_attempt_at, last_error, "
+            "submit_started_at FROM dispatch_outbox WHERE state='pending' AND "
+            "next_attempt_at<=? ORDER BY entry_id LIMIT ?",
             (iso(now), limit),
         ).fetchall()
         return [
             DispatchEntry(
                 entry_id=int(r[0]), task_id=r[1], state=r[2], attempts=int(r[3]),
                 next_attempt_at=datetime.fromisoformat(r[4]), last_error=r[5],
+                submit_started_at=None if r[6] is None else datetime.fromisoformat(r[6]),
             )
             for r in rows
         ]

@@ -7,7 +7,10 @@ import i18n from "@/i18n";
 import { ClientProvider } from "@/providers/ClientProvider";
 
 const snapshot: TeamsSnapshot = {
-  projects: [{ project_id: "proj", display_name: "Main", created_at: "2026-11-09T00:00:00Z" }],
+  projects: [
+    { project_id: "proj", display_name: "Main", created_at: "2026-11-09T00:00:00Z" },
+    { project_id: "second", display_name: "Second", created_at: "2026-11-09T00:00:00Z" },
+  ],
   bots: [
     {
       bot_id: "research",
@@ -185,6 +188,33 @@ describe("TeamsSettings", () => {
     >;
     const keys = calls.map((call) => call[1].operation_key);
     expect(keys[1], "a network retry must not create another business operation").toBe(keys[0]);
+  });
+
+  it("binds the draft identity to the project as well as input and bot", async () => {
+    // M07: the same text under another project is a different business draft.
+    requestMutation.mockRejectedValueOnce(new Error("accepted remotely, response lost"));
+    requestMutation.mockRejectedValueOnce(new Error("accepted remotely, response lost"));
+    renderTeams();
+    await screen.findAllByText("Research");
+    fireEvent.change(screen.getByLabelText("Bot"), { target: { value: "research" } });
+    fireEvent.change(screen.getByLabelText(/task input/i), {
+      target: { value: "one business task" },
+    });
+    const button = screen.getByRole("button", { name: /submit task/i });
+    fireEvent.click(button);
+    await screen.findByText("accepted remotely, response lost");
+    fireEvent.change(screen.getByLabelText("Project"), { target: { value: "second" } });
+    fireEvent.click(button);
+    await waitFor(() => expect(requestMutation).toHaveBeenCalledTimes(2));
+    const calls = requestMutation.mock.calls as unknown as Array<
+      [string, { project: string; operation_key: string }]
+    >;
+    expect(calls[0][1].project).toBe("proj");
+    expect(calls[1][1].project).toBe("second");
+    expect(
+      calls[1][1].operation_key,
+      "different project is a different business draft",
+    ).not.toBe(calls[0][1].operation_key);
   });
 
   it("shows the terminal result body through the public result route", async () => {

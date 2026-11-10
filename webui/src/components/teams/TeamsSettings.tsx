@@ -44,7 +44,12 @@ export function TeamsSettings() {
   // F09: the operation key binds to the pending business draft. A lost or
   // failed response keeps the draft so a retry reuses the same key; only a
   // consumed submission or an edited draft mints a new one.
-  const [draft, setDraft] = useState<{ input: string; bot: string; key: string } | null>(null);
+  const [draft, setDraft] = useState<{
+    project: string;
+    input: string;
+    bot: string;
+    key: string;
+  } | null>(null);
   const [submitPending, setSubmitPending] = useState(false);
   // F08: the result body is fetched through the coordinator's public route,
   // never with bot service credentials.
@@ -95,12 +100,21 @@ export function TeamsSettings() {
     );
   }
 
-  const operationKeyFor = (currentInput: string, currentBot: string): string => {
-    if (draft && draft.input === currentInput && draft.bot === currentBot) {
+  const operationKeyFor = (
+    currentProject: string,
+    currentInput: string,
+    currentBot: string,
+  ): string => {
+    if (
+      draft &&
+      draft.project === currentProject &&
+      draft.input === currentInput &&
+      draft.bot === currentBot
+    ) {
       return draft.key;
     }
     const key = newOperationKey();
-    setDraft({ input: currentInput, bot: currentBot, key });
+    setDraft({ project: currentProject, input: currentInput, bot: currentBot, key });
     return key;
   };
 
@@ -118,12 +132,13 @@ export function TeamsSettings() {
     if (!input.trim() || !botChoice || submitPending) return;
     setSubmitPending(true);
     setSubmitState(tx("settings.teams.submitting", "Submitting..."));
+    const project = projectFilter || snapshot?.projects[0]?.project_id || "default";
     try {
       const task = await createTeamsTask(client, {
-        project: projectFilter || snapshot?.projects[0]?.project_id || "default",
+        project,
         bot: botChoice,
         input,
-        operation_key: operationKeyFor(input, botChoice),
+        operation_key: operationKeyFor(project, input, botChoice),
       });
       setDraft(null);
       setSubmitState(tx("settings.teams.submitted", "Submitted: {{id}}", { id: task.task_id }));

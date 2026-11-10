@@ -20,7 +20,11 @@ from pathlib import Path
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from nanobot_teams.coordinator.config import CoordinatorConfig
+from nanobot_teams.coordinator.config import (
+    ConfigError,
+    CoordinatorConfig,
+    load_coordinator_config,
+)
 from nanobot_teams.coordinator.http_api import build_app
 from nanobot_teams.coordinator.store import CoordinatorStore
 
@@ -250,3 +254,83 @@ async def _sleep() -> None:
     import asyncio
 
     await asyncio.sleep(0.5)
+
+def _write_coordinator_config(tmp_path: Path, **extra: object) -> Path:
+    body: dict[str, object] = {
+        "control_dir": str(tmp_path / "control"),
+        "bot_homes_root": str(tmp_path / "homes"),
+        "admin_token_env": "TEST_COORDINATOR_OP",
+        "planner_token_env": "TEST_COORDINATOR_PLANNER",
+    }
+    body.update(extra)
+    path = tmp_path / "coordinator.json"
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return path
+
+
+def test_loader_accepts_and_passes_the_scaffold_fields(tmp_path, monkeypatch):
+    """M05: the real loader carries the scaffold preset and user config."""
+    monkeypatch.setenv("TEST_COORDINATOR_OP", "op-token")
+    monkeypatch.setenv("TEST_COORDINATOR_PLANNER", "plan-token")
+    user_config = _user_config(tmp_path)
+    config = load_coordinator_config(
+        _write_coordinator_config(
+            tmp_path,
+            scaffold_model_preset=PRESET,
+            scaffold_user_config=str(user_config),
+        )
+    )
+    assert config.scaffold_model_preset == PRESET
+    assert config.scaffold_user_config == user_config.resolve()
+
+
+@pytest.mark.parametrize("preset", [5, "", "   ", None])
+def test_loader_validates_the_scaffold_preset(tmp_path, monkeypatch, preset):
+    """M05: a malformed preset is a startup ConfigError, not a silent default."""
+    monkeypatch.setenv("TEST_COORDINATOR_OP", "op-token")
+    monkeypatch.setenv("TEST_COORDINATOR_PLANNER", "plan-token")
+    if preset is None:
+        path = _write_coordinator_config(tmp_path)
+    else:
+        path = _write_coordinator_config(tmp_path, scaffold_model_preset=preset)
+    if preset is None:
+        assert load_coordinator_config(path).scaffold_model_preset == ""
+    else:
+        with pytest.raises(ConfigError, match="scaffold_model_preset"):
+            load_coordinator_config(path)
+
+
+@pytest.mark.parametrize("value", [5, "", "   ", ["path"]])
+def test_loader_validates_the_scaffold_user_config(tmp_path, value):
+    """M05: the user config must be a non-empty path string."""
+    path = _write_coordinator_config(tmp_path, scaffold_user_config=value)
+    with pytest.raises(ConfigError, match="scaffold_user_config"):
+        load_coordinator_config(path)
+
+
+async def test_loaded_config_reaches_the_scaffold_route(tmp_path, monkeypatch):
+    """M05: coordinator.json -> loader -> POST scaffold is not 422 preset_required."""
+    monkeypatch.setenv("TEST_COORDINATOR_OP", "op-token")
+    monkeypatch.setenv("TEST_COORDINATOR_PLANNER", "plan-token")
+    config = load_coordinator_config(
+        _write_coordinator_config(
+            tmp_path,
+            scaffold_model_preset=PRESET,
+            scaffold_user_config=str(_user_config(tmp_path)),
+        )
+    )
+    store = CoordinatorStore(tmp_path / "loaded.sqlite3")
+    store.open()
+    try:
+        app = build_app(store, config, config.resolve_tokens())
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/v1/teams/bots/scaffold",
+                headers={"Authorization": "Bearer op-token"},
+                json={"bot_id": "loaded-bot"},
+            )
+            assert response.status == 201, await response.text()
+            body = await response.json()
+            assert body["bot_id"] == "loaded-bot"
+    finally:
+        store.close()

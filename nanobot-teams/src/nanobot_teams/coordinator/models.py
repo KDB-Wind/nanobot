@@ -117,6 +117,9 @@ class DispatchEntry:
     attempts: int
     next_attempt_at: datetime
     last_error: str = ""
+    # Persisted before the first submit byte; never cleared. It is the only
+    # proof that a cancel can no longer claim "never sent".
+    submit_started_at: datetime | None = None
 
 
 @dataclass(frozen=True)

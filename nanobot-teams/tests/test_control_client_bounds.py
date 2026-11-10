@@ -16,6 +16,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
+from nanobot_teams.async_mcp import CoordinatorClient, CoordinatorHttpError
 from nanobot_teams.coordinator.client import MAX_RESPONSE_BYTES, BotRunClient
 
 pytest_plugins = ("pytest_asyncio",)
@@ -140,3 +141,83 @@ def _app_with(handler) -> web.Application:
     app = web.Application()
     app.router.add_get("/v1/agent-capabilities", handler)
     return app
+
+async def test_mcp_control_client_rejects_compressed_replies():
+    """M04: the coordinator control client must not decode a gzip reply."""
+    big = {"bots": [{"payload": "x" * (1024 * 1024)}]}
+
+    async def bots(request: web.Request) -> web.Response:
+        return web.Response(
+            body=gzip.compress(json.dumps(big).encode()),
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        )
+
+    app = web.Application()
+    app.router.add_get("/v1/teams/bots", bots)
+    server = TestServer(app)
+    await server.start_server()
+    client = CoordinatorClient(str(server.make_url("")).rstrip("/"), "synthetic-planner-token")
+    try:
+        with pytest.raises(CoordinatorHttpError) as caught:
+            await client.list_bots()
+        assert caught.value.code == "response_compressed"
+    finally:
+        await client.aclose()
+        await server.close()
+
+
+async def test_mcp_control_client_caps_the_streamed_body():
+    """M04: an over-bound streamed reply is refused even without compression."""
+    async def bots(request: web.Request) -> web.Response:
+        return web.Response(
+            body=b"x" * (MAX_RESPONSE_BYTES + 1), content_type="application/json"
+        )
+
+    app = web.Application()
+    app.router.add_get("/v1/teams/bots", bots)
+    server = TestServer(app)
+    await server.start_server()
+    client = CoordinatorClient(str(server.make_url("")).rstrip("/"), "synthetic-planner-token")
+    try:
+        with pytest.raises(CoordinatorHttpError) as caught:
+            await client.list_bots()
+        assert caught.value.code == "response_too_large"
+    finally:
+        await client.aclose()
+        await server.close()
+
+
+async def test_mcp_control_client_rejects_non_json():
+    """M04: non-JSON keeps the typed error instead of a bare ValueError."""
+    async def bots(request: web.Request) -> web.Response:
+        return web.Response(body="not json", content_type="text/plain")
+
+    app = web.Application()
+    app.router.add_get("/v1/teams/bots", bots)
+    server = TestServer(app)
+    await server.start_server()
+    client = CoordinatorClient(str(server.make_url("")).rstrip("/"), "synthetic-planner-token")
+    try:
+        with pytest.raises(CoordinatorHttpError) as caught:
+            await client.list_bots()
+        assert caught.value.code == "invalid_response"
+    finally:
+        await client.aclose()
+        await server.close()
+
+
+async def test_mcp_control_client_accepts_a_normal_reply():
+    """M04: the bounded reader still returns ordinary coordinator payloads."""
+    async def bots(request: web.Request) -> web.Response:
+        return web.json_response({"bots": [{"bot_id": "research"}]})
+
+    app = web.Application()
+    app.router.add_get("/v1/teams/bots", bots)
+    server = TestServer(app)
+    await server.start_server()
+    client = CoordinatorClient(str(server.make_url("")).rstrip("/"), "synthetic-planner-token")
+    try:
+        assert await client.list_bots() == [{"bot_id": "research"}]
+    finally:
+        await client.aclose()
+        await server.close()

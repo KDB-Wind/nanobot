@@ -129,12 +129,8 @@ class DispatchWorker:
             return True
         # Isolation is re-checked at dispatch time, not only at admission: a
         # task admitted before a quarantine must not create remote work now.
-        if bot.instance_id and bot.instance_id in self._store.active_quarantines():
-            self._store.defer_dispatch(
-                entry.entry_id,
-                utc_now() + timedelta(seconds=QUARANTINE_RECHECK_S),
-                "bot instance quarantined; dispatch deferred",
-            )
+        if self._bot_quarantined(bot):
+            self._defer_for_quarantine(entry)
             return True
         # An unconfirmed cancel on a never-accepted task means a submit may
         # have been lost in flight: reconcile by the original key first, and
@@ -179,6 +175,22 @@ class DispatchWorker:
             if seen_instance and seen_instance != bot.instance_id:
                 await self._indeterminate_identity(task, bot.instance_id, seen_instance)
                 return True
+        # Every awaited preflight is done. Record the send fact before the
+        # first submit byte, then re-read the task so a cancel or quarantine
+        # that landed during those awaits stops the submit.
+        self._store.mark_submit_started(entry.entry_id)
+        fresh = self._store.get_task(task.task_id)
+        if fresh is None:
+            return True
+        if self._bot_quarantined(bot):
+            self._defer_for_quarantine(entry)
+            return True
+        if fresh.cancel_state.value != "none":
+            # A cancel that beat the send needs the same key lookup a lost
+            # submit would: it either finds the run to stop or proves none.
+            if fresh.dispatch_state.value == "pending" and fresh.remote_run_id is None:
+                await self._reconcile_cancelled_pending(client, fresh, entry)
+            return True
         try:
             response = await client.submit(operation_key=task.operation_key, protocol_body=body)
         except BotUnreachableError as exc:
@@ -199,9 +211,17 @@ class DispatchWorker:
                 return True
             if instance:
                 self._store.bind_instance(bot.bot_id, instance)
-            self._store.update_after_submit(
+            accepted = self._store.update_after_submit(
                 task.task_id, remote_run_id=run_id, remote_instance_id=instance
             )
+            if accepted.cancel_state.value != "none":
+                # The cancel arrived while the request was in flight: the run
+                # exists, so keep its accepted id and ask the remote to stop it
+                # in this same pump instead of confirming a phantom cancel.
+                try:
+                    await client.cancel(run_id)
+                except BotUnreachableError:
+                    pass  # the unconfirmed cancel keeps driving on later pumps
             return True
         if response.status == 409 and (response.payload or {}).get("code") in (
             "idempotency_conflict",
@@ -241,6 +261,16 @@ class DispatchWorker:
             "credentials or protocol.",
         )
         return True
+
+    def _bot_quarantined(self, bot) -> bool:
+        return bool(bot.instance_id) and bot.instance_id in self._store.active_quarantines()
+
+    def _defer_for_quarantine(self, entry) -> None:
+        self._store.defer_dispatch(
+            entry.entry_id,
+            utc_now() + timedelta(seconds=QUARANTINE_RECHECK_S),
+            "bot instance quarantined; dispatch deferred",
+        )
 
     async def _reconcile_unknown(
         self, client: BotRunClient, task, entry, reason: str
@@ -558,13 +588,21 @@ class DispatchWorker:
         return progressed
 
     async def _drive_cancel(self, task, client: BotRunClient) -> bool:
+        """Drive a remote stop for both requested and unconfirmed cancels.
+
+        An unconfirmed cancel is exactly the case where a run may exist without
+        a local stop observation; it must keep driving. A terminal run is only
+        exempt when its stop is actually confirmed: a terminal state is not
+        stop evidence.
+        """
         current = self._store.get_task(task.task_id)
         if (
             current is None
-            or current.cancel_state.value != "requested"
+            or current.cancel_state.value not in ("requested", "unconfirmed")
             or current.remote_run_id is None
-            or current.run_state in TERMINAL_RUN_STATES
         ):
+            return False
+        if current.run_state in TERMINAL_RUN_STATES and current.stop_confirmed:
             return False
         try:
             response = await client.cancel(current.remote_run_id)

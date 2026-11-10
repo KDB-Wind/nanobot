@@ -37,6 +37,7 @@ from .types import (
     RunState,
     RunSubmit,
     SubmitAcceptance,
+    UnknownRunError,
     parse_rfc3339,
     utc_now,
 )
@@ -91,6 +92,9 @@ class RunService:
         self._poll_interval_s = poll_interval_s
         self._instance_id = store.instance_id()
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        # Results whose store commit failed: the exact observation is kept so
+        # the pump can retry it without re-running the executor.
+        self._pending_results: dict[str, ExecutionResult] = {}
         self._worker: asyncio.Task[None] | None = None
         self._wakeup = asyncio.Event()
         self._closing = False
@@ -179,7 +183,7 @@ class RunService:
     async def get(self, run_id: str) -> Run:
         run = self._store.get(run_id)
         if run is None:
-            raise RunsError("No run with that id.")
+            raise UnknownRunError("No run with that id.")
         return run
 
     async def lookup(self, principal_id: str, operation_key: str) -> Run | None:
@@ -258,10 +262,28 @@ class RunService:
                     pass
 
     async def _pump_once(self) -> bool:
-        progressed = self._sweep_deadlines()
+        # A finished run with a held result owns a real outcome; committing it
+        # comes before any sweep that could classify the row as an orphan or
+        # rewrite it as cancelled.
+        progressed = await self._retry_pending_results()
+        progressed = self._sweep_deadlines() or progressed
         progressed = self._reap_orphan_cancelling() or progressed
         progressed = self._start_queued() or progressed
         return progressed
+
+    async def _retry_pending_results(self) -> bool:
+        """Commit held results in place; never re-run the executor for them."""
+        if not self._pending_results:
+            return False
+        acted = False
+        for run_id, result in list(self._pending_results.items()):
+            try:
+                await self._apply_result(run_id, result)
+            except StoreUnavailableError:
+                continue
+            self._pending_results.pop(run_id, None)
+            acted = True
+        return acted
 
     def _reap_orphan_cancelling(self) -> bool:
         """Finalize cancelling runs whose executor task is gone.
@@ -276,6 +298,10 @@ class RunService:
             RunState.RUNNING, limit=100
         )
         for run in orphans:
+            if run.run_id in self._pending_results:
+                # The executor finished and its result is held; this is not an
+                # orphan and must never be rewritten to cancelled.
+                continue
             task = self._tasks.get(run.run_id)
             if task is not None and not task.done():
                 continue
@@ -313,6 +339,11 @@ class RunService:
         for run in self._store.list_state(RunState.RUNNING, limit=100) + self._store.list_state(
             RunState.CANCELLING, limit=100
         ):
+            if run.run_id in self._pending_results:
+                # A completed result waiting for its commit must not be
+                # cancelled just because its deadline passed while the store
+                # was unavailable.
+                continue
             if run.deadline_at > now or run.cancel_reason == "deadline_exceeded":
                 continue
             try:
@@ -365,30 +396,30 @@ class RunService:
 
     async def _execute_run(self, run: Run) -> None:
         try:
-            result = await self._executor.execute(run)
-        except asyncio.CancelledError:
-            unverified = bool(
-                getattr(self._executor, "consume_cancel_unverified", lambda: False)()
-            )
-            await self._finalize_cancelled(run.run_id, unverified=unverified)
-            raise
-        except Exception as exc:
-            await self._apply_result(
-                run.run_id,
-                ExecutionResult(
+            try:
+                result = await self._executor.execute(run)
+            except asyncio.CancelledError:
+                unverified = bool(
+                    getattr(self._executor, "consume_cancel_unverified", lambda: False)()
+                )
+                await self._finalize_cancelled(run.run_id, unverified=unverified)
+                raise
+            except Exception as exc:
+                result = ExecutionResult(
                     code=OutcomeCode.EXECUTION_ERROR,
                     message=f"{type(exc).__name__}: {exc}"[:512],
                     stop_confirmed=True,
-                ),
-            )
-        else:
+                )
             try:
                 await self._apply_result(run.run_id, result)
             except StoreUnavailableError:
-                # The observation could not persist; the run stays non-terminal
-                # and the cancelling sweep reaps the slot conservatively.
+                # Keep the exact observation: the pump retries this same result
+                # once the store recovers. The run stays non-terminal until it
+                # lands, and a process exit leaves recovery to mark it
+                # interrupted rather than cancelled.
+                self._pending_results[run.run_id] = result
                 log.warning(
-                    "run %s result could not be persisted; kept non-terminal",
+                    "run %s result could not be persisted; retry pending",
                     run.run_id,
                 )
         finally:
@@ -411,7 +442,9 @@ class RunService:
                 current.state,
                 RunState.CANCELLED,
                 outcome=RunOutcome(code=code, message=f"Executor exited after {reason}."),
-                stop_confirmed=True,
+                # The stop is only confirmed when the executor's typed report
+                # proved nothing is still live.
+                stop_confirmed=not unverified,
                 effects_uncertain=True if unverified else None,
             )
             if unverified:

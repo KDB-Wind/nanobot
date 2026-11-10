@@ -370,3 +370,41 @@ async def test_session_reset_routes_delivery_orphaned(chain):
     session = await state.read(chain["session_key"])
     assert session is not None
     assert not any(m.get("injected_event") == "external_delivery" for m in session.messages)
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_inbox_rejects_non_integer_terminal_revision(chain):
+    """M06: a malformed revision is a structured 400, not a text/plain 500."""
+    inbox = chain["inbox"]
+    capability = inbox.mint_capability(
+        session_key=chain["session_key"],
+        session_generation=chain["generation"],
+        workflow_id="wf_rev",
+        operation_key="op_rev",
+        bot_id="research",
+        instance_id="inst_research",
+        principal_id="teams-coordinator",
+    )
+    payload = {
+        "delivery_id": "del_bad_revision",
+        "reply_capability": capability.token,
+        "operation_key": "op_rev",
+        "workflow_id": "wf_rev",
+        "bot_id": "research",
+        "instance_id": "inst_research",
+        "task_id": "task_rev",
+        "run_id": "run_rev",
+        "terminal_revision": "bad",
+        "outcome": {"code": "succeeded"},
+        "result_text": "REPORT",
+        "result_truncated": False,
+    }
+    response = await chain["inbox_client"].post(
+        "/v1/agent-inbox",
+        headers={"Authorization": f"Bearer {RUNS_KEY}"},
+        json=payload,
+    )
+    assert response.status == 400, await response.text()
+    assert response.content_type == "application/json"
+    body = await response.json()
+    assert body["code"] == "invalid_field"
+    assert "terminal_revision" in body["message"]

@@ -27,6 +27,7 @@ from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
+from nanobot.agent.stop_report import SessionStopReport
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.exec_session import ExecSessionManager
@@ -935,15 +936,29 @@ class AgentLoop:
         except Exception:
             logger.debug("external inbox revocation skipped for {}", session_key)
 
-    async def cancel_session_work(self, session_key: str) -> int:
-        """Cancel one session's tasks, subagents, and exec sessions.
+    async def stop_session_work(self, session_key: str) -> SessionStopReport:
+        """Stop one session's tasks, subagents, and exec sessions.
 
         Public stop path for adapters that drive ``process_direct`` in their own
-        tasks (for example the agent-runs executor); returns the number of
-        cancelled work items. Awaiting this is what makes executor stop
-        confirmation real rather than assumed.
+        tasks (for example the agent-runs executor). The report is read after
+        the cancellation pass: a bounded wait that times out still leaves the
+        work alive, and only this observation can prove otherwise.
         """
-        return await self._cancel_active_tasks(session_key)
+        cancelled = await self._cancel_active_tasks(session_key)
+        exec_sessions = await self._exec_session_manager.list(
+            owner_session_key=session_key
+        )
+        return SessionStopReport(
+            cancelled=cancelled,
+            live_subagents=self.subagents.get_running_count_by_session(session_key),
+            live_exec_sessions=tuple(
+                info.session_id for info in exec_sessions if info.returncode is None
+            ),
+        )
+
+    async def cancel_session_work(self, session_key: str) -> int:
+        """Stop the session's work and return the count for legacy callers."""
+        return (await self.stop_session_work(session_key)).cancelled
 
     async def _cancel_active_tasks(self, key: str) -> int:
         pending = self._pending_queues.get(key)

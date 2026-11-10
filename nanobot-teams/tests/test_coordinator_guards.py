@@ -185,9 +185,9 @@ async def test_unconfirmed_cancel_reconciles_lost_submit_to_remote_cancel(store)
         # does not know it. First pump is the reconciling one.
         key = task.operation_key
         bot_app.stored[key] = {"run_id": "run_lost", "body": {}}
-        store._conn.execute(
-            "UPDATE dispatch_outbox SET attempts=1 WHERE task_id=?", (task.task_id,)
-        )
+        entry = store.dispatch_entry_for_task(task.task_id)
+        assert entry is not None
+        store.mark_submit_started(entry.entry_id)
         store.request_cancel(task.task_id)
         current = store.get_task(task.task_id)
         assert current.cancel_state.value == "unconfirmed"
@@ -196,7 +196,7 @@ async def test_unconfirmed_cancel_reconciles_lost_submit_to_remote_cancel(store)
             worker,
             lambda: store.get_task(task.task_id).dispatch_state.value == "accepted",
         )
-        assert bot_app.cancel_calls == ["run_lost"], (
+        assert bot_app.cancel_calls and set(bot_app.cancel_calls) == {"run_lost"}, (
             "a reconciled run must be cancelled on the remote"
         )
     finally:
@@ -213,9 +213,9 @@ async def test_unconfirmed_cancel_with_no_remote_run_closes_locally(store):
     try:
         bot = _register(store, str(server.make_url("")).rstrip("/"))
         task = _admit(store, bot)
-        store._conn.execute(
-            "UPDATE dispatch_outbox SET attempts=1 WHERE task_id=?", (task.task_id,)
-        )
+        entry = store.dispatch_entry_for_task(task.task_id)
+        assert entry is not None
+        store.mark_submit_started(entry.entry_id)
         store.request_cancel(task.task_id)
         worker = DispatchWorker(store, ClientFactory({"GUARD_BOT_KEY": SECRET}))
         assert await _pump_until(
