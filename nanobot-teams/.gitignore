@@ -1,5 +1,6 @@
 .venv/
 .e2e/
+.teams-state/
 __pycache__/
 .pytest_cache/
 *.egg-info/
