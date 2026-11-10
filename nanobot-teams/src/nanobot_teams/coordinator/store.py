@@ -325,6 +325,10 @@ class CoordinatorStore:
                     "WHERE attempts>0 AND submit_started_at IS NULL",
                     (iso(utc_now()),),
                 )
+            # Older databases recorded a legacy unknown only as a quarantine
+            # key; dispatch identity checks read the guard table. Derive the
+            # missing rows before any worker can run.
+            self._backfill_legacy_guards()
         except (OSError, sqlite3.Error, StoreError) as exc:
             self.close()
             raise StoreError("Cannot open the coordinator store (another writer?)") from exc
@@ -580,6 +584,55 @@ class CoordinatorStore:
             )
             for r in rows
         }
+
+    def _backfill_legacy_guards(self) -> None:
+        """Give active endpoint quarantines the identity rows dispatch reads.
+
+        Older databases recorded a 0.4 unknown only under a legacy:<endpoint>
+        key. Recover the endpoint and credential from the registered bot that
+        matches it; without a match the guard stays unresolved and keeps
+        dispatch closed until an operator resolves it. Re-running is a no-op.
+        """
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT instance_id, created_at FROM instance_quarantine "
+            "WHERE resolved_at IS NULL AND instance_id LIKE 'legacy:%'"
+        ).fetchall()
+        if not rows:
+            return
+        bots = self._conn.execute(
+            "SELECT endpoint, secret_env FROM bots ORDER BY created_at"
+        ).fetchall()
+        by_endpoint: dict[str, tuple[str, str]] = {}
+        for endpoint, secret_env in bots:
+            by_endpoint.setdefault(
+                normalize_endpoint(str(endpoint)), (str(endpoint), str(secret_env))
+            )
+        with self._transaction():
+            for guard_key, created_at in rows:
+                normalized = str(guard_key)[len("legacy:"):]
+                endpoint, secret_env = by_endpoint.get(
+                    normalized, (f"http://{normalized}", "")
+                )
+                cursor = self._conn.execute(
+                    "INSERT INTO legacy_endpoint_guards(guard_key, endpoint, secret_env, "
+                    "created_at) VALUES (?,?,?,?) ON CONFLICT(guard_key) DO NOTHING",
+                    (guard_key, endpoint, secret_env, created_at),
+                )
+                self._conn.execute(
+                    "UPDATE legacy_endpoint_guards SET resolved_at=NULL WHERE guard_key=?",
+                    (guard_key,),
+                )
+                if cursor.rowcount == 1:
+                    self._emit(
+                        "legacy_guard_backfilled",
+                        None,
+                        {
+                            "guard": str(guard_key),
+                            "endpoint": endpoint,
+                            "credential": "recovered" if secret_env else "missing",
+                        },
+                    )
 
     def quarantine_legacy_endpoint(
         self, endpoint: str, reason: str, *, secret_env: str = ""

@@ -153,6 +153,53 @@ def test_quarantined_instance_rejects_new_tasks_and_resolution_restores(store):
     assert created
 
 
+def test_open_backfills_an_active_legacy_quarantine(tmp_path):
+    path = tmp_path / "coord.sqlite3"
+    bot = make_bot("legacy")
+    store = CoordinatorStore(path)
+    store.open()
+    store.upsert_bot(bot)
+    guard_key = "legacy:127.0.0.1:8921"
+    store.quarantine_instance(guard_key, "0.4 unknown outcome")
+    assert store.active_legacy_guards() == []
+    store.close()
+
+    upgraded = CoordinatorStore(path)
+    upgraded.open()
+    try:
+        guards = upgraded.active_legacy_guards()
+        assert [guard.guard_key for guard in guards] == [guard_key]
+        assert guards[0].endpoint == bot.endpoint
+        assert guards[0].secret_env == bot.secret_env
+    finally:
+        upgraded.close()
+
+    reopened = CoordinatorStore(path)
+    reopened.open()
+    try:
+        assert len(reopened.active_legacy_guards()) == 1
+    finally:
+        reopened.close()
+
+
+def test_open_keeps_an_unmapped_legacy_guard_unresolved(tmp_path):
+    path = tmp_path / "coord.sqlite3"
+    store = CoordinatorStore(path)
+    store.open()
+    guard_key = "legacy:127.0.0.1:9"
+    store.quarantine_instance(guard_key, "0.4 unknown outcome")
+    store.close()
+
+    upgraded = CoordinatorStore(path)
+    upgraded.open()
+    try:
+        guards = upgraded.active_legacy_guards()
+        assert [guard.endpoint for guard in guards] == ["http://127.0.0.1:9"]
+        assert guards[0].secret_env == ""
+    finally:
+        upgraded.close()
+
+
 def test_alias_shares_isolation_through_instance_identity(store):
     store.create_project("proj-1", "Main")
     bot = make_bot()
