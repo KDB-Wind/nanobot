@@ -1946,7 +1946,26 @@
       "cancelAction": "Request cancel",
       "stopWorkflow": "Stop workflow",
       "noTasks": "No tasks yet.",
-      "quarantined": "Some instances are quarantined pending operator review."
+      "quarantined": "Some instances are quarantined pending operator review.",
+      "route": "Route",
+      "routePlanner": "planner",
+      "usage": "Per-bot usage",
+      "usageWindow": "Window",
+      "usageAll": "All time",
+      "usageDenominator": "Hit rate = cache-read tokens / input tokens of calls that reported cache fields; coverage shows how much input that covers.",
+      "usageDenominatorShort": "Denominator: cache-reported input",
+      "usageBot": "Bot",
+      "usageRequests": "Requests",
+      "usageInput": "Input tokens",
+      "usageCacheRead": "Cache read",
+      "usageHitRate": "Hit rate",
+      "usageCoverage": "Coverage",
+      "usageUnreported": "Not reported",
+      "usageUnavailable": "Unavailable",
+      "usageUnavailableReason": "Unavailable: {{reason}}",
+      "usageEmpty": "No usage data yet.",
+      "peerGraph": "Bot graph",
+      "noEdges": "No explicit peer edges yet; planner delegations stay implicit."
     }
   },
   "chat": {

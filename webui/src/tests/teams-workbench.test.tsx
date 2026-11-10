@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TeamsSettings } from "@/components/teams/TeamsSettings";
-import { TeamsSnapshot } from "@/lib/teams-api";
+import { TeamsSnapshot, TeamsUsageResponse } from "@/lib/teams-api";
 import i18n from "@/i18n";
 import { ClientProvider } from "@/providers/ClientProvider";
 
@@ -21,6 +21,9 @@ const snapshot: TeamsSnapshot = {
       instance_id: "inst_aaa",
       capabilities: [],
       has_open_tasks: false,
+      inbox_url: "http://127.0.0.1:8921",
+      inbox_principal_id: "teams-coordinator",
+      inbox_bound: true,
     },
   ],
   tasks: [
@@ -30,6 +33,11 @@ const snapshot: TeamsSnapshot = {
       workflow_id: "wf-1",
       bot_id: "research",
       dispatch_state: "accepted",
+      delivery_mode: "workbench_only",
+      kind: "user_delegation",
+      conversation_root: "",
+      hop: 0,
+      caller_principal: "planner",
       run_state: "running",
       remote_run_id: "run_1",
       stop_confirmed: false,
@@ -47,8 +55,13 @@ const snapshot: TeamsSnapshot = {
       task_id: "task_2",
       project_id: "proj",
       workflow_id: "wf-1",
-      bot_id: "research",
+      bot_id: "writer",
       dispatch_state: "accepted",
+      delivery_mode: "auto_resume",
+      kind: "peer",
+      conversation_root: "conv-1",
+      hop: 1,
+      caller_principal: "bot:research",
       run_state: "succeeded",
       remote_run_id: "run_2",
       stop_confirmed: true,
@@ -69,6 +82,34 @@ const snapshot: TeamsSnapshot = {
   protocol: 1,
 };
 
+const usageResponse: TeamsUsageResponse = {
+  window: "30d",
+  bots: [
+    {
+      bot_id: "research",
+      display_name: "Research",
+      window: "30d",
+      available: true,
+      totals: {
+        provider: "", model: "(all)", requests: 2, input_tokens: 150,
+        output_tokens: 20, cache_read_tokens: 60, cache_write_tokens: 0,
+        observed_input_tokens: 100, cache_read_rate: 0.6, coverage: 100 / 150,
+      },
+      models: [],
+    },
+    {
+      bot_id: "writer",
+      display_name: "Writer",
+      window: "30d",
+      available: false,
+      reason: "usage database missing",
+    },
+  ],
+};
+const fetchUsage = vi.fn(async () => usageResponse);
+const fetchEdges = vi.fn(async () => ({
+  edges: [{ from_bot_id: "research", to_bot_id: "writer" }],
+}));
 const fetchSnapshot = vi.fn(async () => snapshot);
 const fetchTaskResult = vi.fn(async () => ({
   task_id: "task_2",
@@ -97,6 +138,8 @@ vi.mock("@/lib/teams-api", async (importOriginal) => {
     ...original,
     fetchTeamsSnapshot: (...args: unknown[]) => fetchSnapshot(...(args as [])),
     fetchTeamsTaskResult: (...args: unknown[]) => fetchTaskResult(...(args as [])),
+    fetchTeamsUsage: (...args: unknown[]) => fetchUsage(...(args as [])),
+    fetchTeamsPeerEdges: (...args: unknown[]) => fetchEdges(...(args as [])),
   };
 });
 
@@ -112,6 +155,10 @@ function renderTeams(capabilities: string[] = ["teams.async.v1"]) {
 beforeEach(async () => {
   fetchSnapshot.mockClear();
   fetchTaskResult.mockClear();
+  fetchUsage.mockClear();
+  fetchEdges.mockClear();
+  fetchUsage.mockResolvedValue(usageResponse);
+  fetchEdges.mockResolvedValue({ edges: [{ from_bot_id: "research", to_bot_id: "writer" }] });
   requestMutation.mockClear();
   await i18n.changeLanguage("en");
 });
@@ -254,6 +301,89 @@ describe("TeamsSettings", () => {
     fireEvent.click(stop);
     await waitFor(() => expect(requestMutation).toHaveBeenCalledTimes(1));
     expect(stop).toBeDisabled();
+  });
+
+  it("renders per-bot usage with exact hit rate, coverage, and unavailable reasons", async () => {
+    renderTeams();
+    await screen.findByText("Teams workbench");
+    const researchRow = await waitFor(() => {
+      const row = document.querySelector('[data-usage-bot="research"]');
+      expect(row).not.toBeNull();
+      return row;
+    });
+    expect(researchRow!.textContent).toContain("60%");
+    expect(researchRow!.textContent).toContain("67%");
+    const writerRow = document.querySelector('[data-usage-bot="writer"]');
+    expect(writerRow?.textContent).toContain("usage database missing");
+  });
+
+  it("shows Not reported instead of 0% when no cache fields arrive", async () => {
+    fetchUsage.mockResolvedValueOnce({
+      window: "30d",
+      bots: [
+        {
+          bot_id: "research", display_name: "Research", window: "30d",
+          available: true,
+          totals: {
+            provider: "", model: "(all)", requests: 3, input_tokens: 30,
+            output_tokens: 5, cache_read_tokens: 0, cache_write_tokens: 0,
+            observed_input_tokens: 0, cache_read_rate: null, coverage: 0,
+          },
+          models: [],
+        },
+      ],
+    });
+    renderTeams();
+    const researchRow = await waitFor(() => {
+      const row = document.querySelector('[data-usage-bot="research"]');
+      expect(row).not.toBeNull();
+      return row;
+    });
+    const rateCell = researchRow?.querySelector("[data-usage-rate]");
+    expect(rateCell?.textContent).toContain("Not reported");
+    // The rate cell never falls back to a fake 0% hit rate; honest 0%
+    // coverage stays visible in its own column.
+    expect(rateCell?.textContent).not.toContain("%");
+  });
+
+  it("shows the bot graph edges and the empty state", async () => {
+    renderTeams();
+    expect(
+      await screen.findByText("research", { selector: "[data-peer-edge] *" }),
+    ).toBeInTheDocument();
+    const edge = document.querySelector('[data-peer-edge="research->writer"]');
+    expect(edge).not.toBeNull();
+    fetchEdges.mockResolvedValueOnce({ edges: [] });
+    fireEvent.click(screen.getByRole("button", { name: /refresh/i }));
+    await screen.findByText(/No explicit peer edges yet/i);
+  });
+
+  it("marks peer tasks with sender, recipient, and hop in the route column", async () => {
+    renderTeams();
+    const row = await screen.findByRole("row", { name: /task_2/ });
+    const route = row.querySelector("[data-task-route]");
+    expect(route).not.toBeNull();
+    expect(route?.textContent).toContain("research");
+    expect(route?.textContent).toContain("writer");
+    expect(route?.textContent).toContain("hop 1");
+  });
+
+  it("surfaces usage fetch failures without breaking the workbench", async () => {
+    fetchUsage.mockRejectedValueOnce(new Error("coordinator unreachable"));
+    renderTeams();
+    expect(await screen.findByText("coordinator unreachable")).toBeInTheDocument();
+    expect(await screen.findAllByText("Research")).toBeTruthy();
+  });
+
+  it("renders the usage panel in Chinese with the denominator note", async () => {
+    await i18n.changeLanguage("zh-CN");
+    renderTeams();
+    expect(await screen.findByText("每 Bot 用量")).toBeInTheDocument();
+    expect(screen.getByText("分母:报告缓存的输入")).toBeInTheDocument();
+    const researchRow = document.querySelector('[data-usage-bot="research"]');
+    expect(researchRow).not.toBeNull();
+    expect(screen.getByText("命中率")).toBeInTheDocument();
+    await i18n.changeLanguage("en");
   });
 
   it("shows the scaffold key file location and never the raw service key", async () => {

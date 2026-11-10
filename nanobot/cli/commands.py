@@ -461,6 +461,14 @@ def serve(
 
     async def on_startup(_app: Any) -> None:
         await mcp_provider.connect()
+        # Record per-bot usage exactly like the gateway does, so worker homes
+        # carry their own llm_usage.sqlite3 for the coordinator's reader.
+        from nanobot.llm_usage import record_llm_call
+
+        try:
+            agent_loop.provider.set_llm_call_observer(record_llm_call)
+        except Exception:
+            logger.warning("could not attach the llm usage observer", exc_info=True)
         if runs_service is not None:
             interrupted = await runs_service.start()
             if interrupted:

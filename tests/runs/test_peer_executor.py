@@ -8,7 +8,7 @@ that survive the run and can wake the conversation later.
 
 from __future__ import annotations
 
-from nanobot.agent.tools.context import current_request_context
+from nanobot.agent.tools.context import current_peer_conversation
 from nanobot.runs.executor import AgentLoopRunExecutor
 from nanobot.runs.types import Run, RunState
 from nanobot.session.manager import Session
@@ -46,7 +46,7 @@ class _Loop:
 
     async def process_direct(self, **kwargs):
         self.calls.append(kwargs)
-        self.seen_contexts.append(current_request_context())
+        self.seen_contexts.append(current_peer_conversation())
         return _Msg()
 
     async def stop_session_work(self, session_key: str) -> _StopReport:
@@ -71,10 +71,11 @@ async def test_durable_context_bound_during_execution():
     result = await executor.execute(make_run("wf-conv"))
     assert result is not None
     assert loop.sessions.state.created == ["peer:wf-conv"]
-    ctx = loop.seen_contexts[0]
-    assert ctx is not None
-    assert ctx.session_key == "peer:wf-conv"
-    assert ctx.source_workflow == "wf-conv"
+    binding = loop.seen_contexts[0]
+    assert binding is not None
+    assert binding.session_key == "peer:wf-conv"
+    assert binding.workflow_id == "wf-conv"
+    assert binding.session_generation
     # The run session itself stays ephemeral.
     assert loop.calls[0]["ephemeral"] is True
 
@@ -91,4 +92,4 @@ async def test_context_reset_after_execution():
     loop = _Loop()
     executor = AgentLoopRunExecutor(loop, durable_peer_sessions=True)
     await executor.execute(make_run())
-    assert current_request_context() is None
+    assert current_peer_conversation() is None

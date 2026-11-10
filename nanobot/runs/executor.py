@@ -48,11 +48,11 @@ class RunCancelled(asyncio.CancelledError):
 class AgentLoopRunExecutor:
     """Execute one run in its own isolated ephemeral session on the bot's loop.
 
-    With ``durable_peer_sessions`` the executor additionally binds a
-    RequestContext for the durable ``peer:<workflow>`` conversation session
-    while the run executes: send_to_bot mints reply capabilities against that
-    durable session (the ephemeral run session could never receive a wake),
-    and the run's own working memory stays isolated exactly as before.
+    With ``durable_peer_sessions`` the executor binds a PeerConversationBinding
+    for the durable ``peer:<workflow>`` session while the run executes:
+    send_to_bot mints reply capabilities against that durable session (the
+    ephemeral run session could never receive a wake), and the run's own
+    working memory stays isolated exactly as before.
     """
 
     def __init__(self, loop: "AgentLoop", *, durable_peer_sessions: bool = False) -> None:
@@ -74,19 +74,20 @@ class AgentLoopRunExecutor:
     async def execute(self, run: Run) -> ExecutionResult:
         capture = _RunOutcomeCaptureHook()
         session_key = f"run:{run.run_id}"
-        context_token = None
+        peer_token = None
         if self._durable_peer_sessions and run.workflow_id:
-            from nanobot.agent.tools.context import RequestContext, bind_request_context
+            from nanobot.agent.tools.context import (
+                PeerConversationBinding,
+                bind_peer_conversation,
+            )
 
             durable_key = f"peer:{run.workflow_id}"
             conversation = await self._loop.sessions.state.get(durable_key)
-            context_token = bind_request_context(
-                RequestContext(
-                    channel="api",
-                    chat_id=run.run_id,
+            peer_token = bind_peer_conversation(
+                PeerConversationBinding(
                     session_key=durable_key,
                     session_generation=conversation.generation,
-                    source_workflow=run.workflow_id,
+                    workflow_id=run.workflow_id,
                 )
             )
         try:
@@ -148,10 +149,10 @@ class AgentLoopRunExecutor:
                 )
             return result
         finally:
-            if context_token is not None:
-                from nanobot.agent.tools.context import reset_request_context
+            if peer_token is not None:
+                from nanobot.agent.tools.context import reset_peer_conversation
 
-                reset_request_context(context_token)
+                reset_peer_conversation(peer_token)
 
 
 def _response_text(value: Any) -> str:

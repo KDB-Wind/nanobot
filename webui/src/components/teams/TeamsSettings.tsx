@@ -5,13 +5,18 @@ import {
   cancelTeamsTask,
   createTeamsProject,
   createTeamsTask,
+  fetchTeamsPeerEdges,
   fetchTeamsSnapshot,
   fetchTeamsTaskResult,
+  fetchTeamsUsage,
   scaffoldTeamsBot,
   stopTeamsWorkflow,
+  TeamsBotUsage,
+  TeamsPeerEdge,
   TeamsScaffoldResult,
   TeamsSnapshot,
   TeamsTaskResult,
+  TeamsUsageResponse,
 } from "@/lib/teams-api";
 import { useClient } from "@/providers/ClientProvider";
 
@@ -37,6 +42,10 @@ export function TeamsSettings() {
   const { client, getToken, webuiCapabilities } = useClient();
   const enabled = webuiCapabilities.includes("teams.async.v1");
   const [snapshot, setSnapshot] = useState<TeamsSnapshot | null>(null);
+  const [usage, setUsage] = useState<TeamsUsageResponse | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+  const [usageWindow, setUsageWindow] = useState<"7d" | "30d" | "all">("30d");
+  const [edges, setEdges] = useState<TeamsPeerEdge[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [projectFilter, setProjectFilter] = useState("");
   const [input, setInput] = useState("");
@@ -78,14 +87,41 @@ export function TeamsSettings() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, [enabled, getToken]);
+    try {
+      const [usageData, edgeData] = await Promise.all([
+        fetchTeamsUsage(getToken(), usageWindow),
+        fetchTeamsPeerEdges(getToken()),
+      ]);
+      setUsage(usageData);
+      setUsageError(null);
+      setEdges(edgeData.edges);
+    } catch (reason) {
+      setUsage(null);
+      setUsageError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, [enabled, getToken, usageWindow]);
 
   useEffect(() => {
     void refresh();
     if (!enabled) return;
-    const timer = window.setInterval(() => void refresh(), 4000);
+    const timer = window.setInterval(() => void refresh(), 8000);
     return () => window.clearInterval(timer);
   }, [enabled, refresh]);
+
+  const usageRows: TeamsBotUsage[] = usage?.bots ?? [];
+  const hitRateLabel = (entry: TeamsBotUsage): string => {
+    if (!entry.available) return tx("settings.teams.usageUnavailable", "Unavailable");
+    if (entry.totals == null || entry.totals.cache_read_rate == null) {
+      return tx("settings.teams.usageUnreported", "Not reported");
+    }
+    return `${Math.round(entry.totals.cache_read_rate * 100)}%`;
+  };
+  const coverageLabel = (entry: TeamsBotUsage): string => {
+    if (!entry.available || entry.totals == null || entry.totals.coverage == null) {
+      return "—";
+    }
+    return `${Math.round(entry.totals.coverage * 100)}%`;
+  };
 
   const tasks = useMemo(() => {
     if (!snapshot) return [];
@@ -277,6 +313,101 @@ export function TeamsSettings() {
         ) : null}
       </section>
 
+      <section
+        aria-label={tx("settings.teams.usage", "Per-bot usage")}
+        className="rounded border p-3 dark:border-zinc-800"
+        data-teams-usage
+      >
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <h3 className="font-medium">{tx("settings.teams.usage", "Per-bot usage")}</h3>
+          <select
+            aria-label={tx("settings.teams.usageWindow", "Window")}
+            value={usageWindow}
+            onChange={(event) => setUsageWindow(event.target.value as "7d" | "30d" | "all")}
+            className="rounded border border-zinc-300 bg-transparent px-2 py-0.5 text-xs dark:border-zinc-700"
+          >
+            <option value="7d">7d</option>
+            <option value="30d">30d</option>
+            <option value="all">{tx("settings.teams.usageAll", "All time")}</option>
+          </select>
+          <span
+            className="text-xs text-zinc-400"
+            title={tx(
+              "settings.teams.usageDenominator",
+              "Hit rate = cache-read tokens / input tokens of calls that reported cache fields; coverage shows how much input that covers.",
+            )}
+          >
+            {tx("settings.teams.usageDenominatorShort", "Denominator: cache-reported input")}
+          </span>
+        </div>
+        {usageError ? (
+          <p role="alert" data-usage-error className="text-sm text-red-500">{usageError}</p>
+        ) : null}
+        <table className="w-full text-left text-sm">
+          <thead className="text-xs uppercase text-zinc-400">
+            <tr>
+              <th className="py-1">{tx("settings.teams.usageBot", "Bot")}</th>
+              <th>{tx("settings.teams.usageRequests", "Requests")}</th>
+              <th>{tx("settings.teams.usageInput", "Input tokens")}</th>
+              <th>{tx("settings.teams.usageCacheRead", "Cache read")}</th>
+              <th>{tx("settings.teams.usageHitRate", "Hit rate")}</th>
+              <th>{tx("settings.teams.usageCoverage", "Coverage")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {usageRows.map((entry) => (
+              <tr key={entry.bot_id} data-usage-bot={entry.bot_id}>
+                <td className="py-1 font-medium">{entry.display_name}</td>
+                {entry.available && entry.totals ? (
+                  <>
+                    <td>{entry.totals.requests}</td>
+                    <td>{entry.totals.input_tokens}</td>
+                    <td>{entry.totals.cache_read_tokens}</td>
+                    <td data-usage-rate>{hitRateLabel(entry)}</td>
+                    <td data-usage-coverage>{coverageLabel(entry)}</td>
+                  </>
+                ) : (
+                  <td colSpan={5} className="py-1 text-zinc-400">
+                    {tx("settings.teams.usageUnavailableReason", "Unavailable: {{reason}}", {
+                      reason: entry.reason ?? "",
+                    })}
+                  </td>
+                )}
+              </tr>
+            ))}
+            {!usageRows.length ? (
+              <tr>
+                <td colSpan={6} className="py-2 text-zinc-400">
+                  {tx("settings.teams.usageEmpty", "No usage data yet.")}
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </section>
+
+      <section
+        aria-label={tx("settings.teams.peerGraph", "Bot graph")}
+        className="rounded border p-3 dark:border-zinc-800"
+        data-teams-edges
+      >
+        <h3 className="mb-2 font-medium">{tx("settings.teams.peerGraph", "Bot graph")}</h3>
+        <ul className="space-y-1 text-sm">
+          {(edges ?? []).map((edge) => (
+            <li key={`${edge.from_bot_id}->${edge.to_bot_id}`} data-peer-edge={`${edge.from_bot_id}->${edge.to_bot_id}`}>
+              <span className="font-medium">{edge.from_bot_id}</span>
+              <span className="mx-1 text-zinc-400">→</span>
+              <span className="font-medium">{edge.to_bot_id}</span>
+            </li>
+          ))}
+          {!edges?.length ? (
+            <li className="text-zinc-400">
+              {tx("settings.teams.noEdges", "No explicit peer edges yet; planner delegations stay implicit.")}
+            </li>
+          ) : null}
+        </ul>
+      </section>
+
       <section aria-label={tx("settings.teams.newTask", "New task")} className="rounded border p-3 dark:border-zinc-800">
         <h3 className="mb-2 font-medium">{tx("settings.teams.newTask", "New task")}</h3>
         <div className="flex flex-col gap-2 sm:flex-row">
@@ -316,6 +447,7 @@ export function TeamsSettings() {
           <thead className="text-xs uppercase text-zinc-400">
             <tr>
               <th className="py-1">{tx("settings.teams.task", "Task")}</th>
+              <th>{tx("settings.teams.route", "Route")}</th>
               <th>{tx("settings.teams.dispatch", "Dispatch")}</th>
               <th>{tx("settings.teams.run", "Run")}</th>
               <th>{tx("settings.teams.cancel", "Cancel")}</th>
@@ -328,6 +460,20 @@ export function TeamsSettings() {
             {tasks.map((task) => (
               <tr key={task.task_id} data-task-id={task.task_id}>
                 <td className="py-1 font-mono text-xs">{task.task_id.slice(0, 16)}…</td>
+                <td data-task-route>
+                  {task.kind === "peer" ? (
+                    <span className="text-xs">
+                      {task.caller_principal.replace(/^bot:/, "")}
+                      <span className="mx-1 text-zinc-400">→</span>
+                      {task.bot_id}
+                      <span className="ml-1 text-zinc-400">hop {task.hop}</span>
+                    </span>
+                  ) : (
+                    <span className="text-xs text-zinc-400">
+                      {tx("settings.teams.routePlanner", "planner")} → {task.bot_id}
+                    </span>
+                  )}
+                </td>
                 <td><StateChip label={task.dispatch_state} tone={task.dispatch_state === "accepted" ? "ok" : task.dispatch_state === "indeterminate" ? "bad" : "idle"} /></td>
                 <td><StateChip label={task.run_state} tone={task.run_state === "succeeded" ? "ok" : task.run_state === "failed" ? "bad" : "idle"} /></td>
                 <td>
@@ -387,7 +533,7 @@ export function TeamsSettings() {
               </tr>
             ))}
             {!tasks.length ? (
-              <tr><td colSpan={7} className="py-2 text-zinc-400">{tx("settings.teams.noTasks", "No tasks yet.")}</td></tr>
+              <tr><td colSpan={8} className="py-2 text-zinc-400">{tx("settings.teams.noTasks", "No tasks yet.")}</td></tr>
             ) : null}
           </tbody>
         </table>

@@ -158,8 +158,29 @@ def mint_teams_meta(inbox: Any, principal_id: str) -> dict[str, str]:
     continuation turns carry their original workflow root; only genuine new
     turns derive a root from their own turn.
     """
-    from nanobot.agent.tools.context import current_request_context
+    from nanobot.agent.tools.context import (
+        current_peer_conversation,
+        current_request_context,
+    )
 
+    peer = current_peer_conversation()
+    if peer is not None:
+        # A peer-capable run: the capability targets the durable conversation
+        # session (the ephemeral run session could never receive a wake).
+        capability = inbox.mint_capability(
+            session_key=peer.session_key,
+            session_generation=peer.session_generation,
+            workflow_id=peer.workflow_id,
+            operation_key="*",
+            bot_id="*",
+            instance_id="*",
+            principal_id=principal_id,
+        )
+        return {
+            "reply_capability": capability.token,
+            "reply_workflow": capability.workflow_id,
+            "coordinator_principal": principal_id,
+        }
     ctx = current_request_context()
     if ctx is None or not ctx.persist_session or not ctx.can_receive_background_results:
         return {}

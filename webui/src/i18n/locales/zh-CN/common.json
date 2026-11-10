@@ -1946,7 +1946,26 @@
       "cancelAction": "请求取消",
       "stopWorkflow": "停止工作流",
       "noTasks": "暂无任务。",
-      "quarantined": "部分实例待操作者核查,已隔离。"
+      "quarantined": "部分实例待操作者核查,已隔离。",
+      "route": "路由",
+      "routePlanner": "秘书长",
+      "usage": "每 Bot 用量",
+      "usageWindow": "时间窗",
+      "usageAll": "全部",
+      "usageDenominator": "命中率 = 缓存读取 token / 报告了缓存字段的调用的输入 token;覆盖率说明该比率覆盖了多少输入。",
+      "usageDenominatorShort": "分母:报告缓存的输入",
+      "usageBot": "Bot",
+      "usageRequests": "请求数",
+      "usageInput": "输入 token",
+      "usageCacheRead": "缓存读取",
+      "usageHitRate": "命中率",
+      "usageCoverage": "覆盖率",
+      "usageUnreported": "未报告",
+      "usageUnavailable": "不可用",
+      "usageUnavailableReason": "不可用:{{reason}}",
+      "usageEmpty": "暂无用量数据。",
+      "peerGraph": "Bot 关系图",
+      "noEdges": "暂无显式 peer 边;秘书长的派发保持隐式授权。"
     }
   },
   "chat": {

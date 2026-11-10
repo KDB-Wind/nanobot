@@ -15,6 +15,9 @@ export interface TeamsBotSummary {
   instance_id: string | null;
   capabilities: string[];
   has_open_tasks: boolean;
+  inbox_url: string | null;
+  inbox_principal_id: string | null;
+  inbox_bound: boolean;
 }
 
 export interface TeamsTaskSummary {
@@ -23,6 +26,7 @@ export interface TeamsTaskSummary {
   workflow_id: string;
   bot_id: string;
   dispatch_state: string;
+  delivery_mode: string;
   run_state: string;
   remote_run_id: string | null;
   stop_confirmed: boolean;
@@ -37,6 +41,10 @@ export interface TeamsTaskSummary {
   created_at: string;
   finished_at: string | null;
   last_error: string;
+  kind: string;
+  conversation_root: string;
+  hop: number;
+  caller_principal: string;
 }
 
 export interface TeamsSnapshot {
@@ -68,8 +76,84 @@ export interface TeamsScaffoldResult {
   started: boolean;
 }
 
+/** Per-model usage slice; the hit-rate denominator is observed input only. */
+export interface TeamsUsageModel {
+  provider: string;
+  model: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  observed_input_tokens: number;
+  cache_read_rate: number | null;
+  coverage: number | null;
+}
+
+export interface TeamsBotUsage {
+  bot_id: string;
+  display_name: string;
+  window: string;
+  available: boolean;
+  reason?: string;
+  totals?: TeamsUsageModel;
+  models?: TeamsUsageModel[];
+}
+
+export interface TeamsUsageResponse {
+  window: string;
+  bots: TeamsBotUsage[];
+}
+
+export interface TeamsPeerEdge {
+  from_bot_id: string;
+  to_bot_id: string;
+}
+
 export function fetchTeamsSnapshot(token: string, base: string = "", signal?: AbortSignal): Promise<TeamsSnapshot> {
   return request<TeamsSnapshot>(`${base}/api/teams/snapshot`, token, { signal }, 20_000);
+}
+
+export function fetchTeamsUsage(
+  token: string,
+  window: "7d" | "30d" | "all" = "30d",
+  base: string = "",
+  signal?: AbortSignal,
+): Promise<TeamsUsageResponse> {
+  return request<TeamsUsageResponse>(
+    `${base}/api/teams/usage?window=${window}`,
+    token,
+    { signal },
+    20_000,
+  );
+}
+
+export function fetchTeamsBotUsage(
+  token: string,
+  botId: string,
+  window: "7d" | "30d" | "all" = "30d",
+  base: string = "",
+  signal?: AbortSignal,
+): Promise<TeamsBotUsage> {
+  return request<TeamsBotUsage>(
+    `${base}/api/teams/bots/${encodeURIComponent(botId)}/usage?window=${window}`,
+    token,
+    { signal },
+    20_000,
+  );
+}
+
+export function fetchTeamsPeerEdges(
+  token: string,
+  base: string = "",
+  signal?: AbortSignal,
+): Promise<{ edges: TeamsPeerEdge[] }> {
+  return request<{ edges: TeamsPeerEdge[] }>(
+    `${base}/api/teams/peer-edges`,
+    token,
+    { signal },
+    20_000,
+  );
 }
 
 export function fetchTeamsTask(
