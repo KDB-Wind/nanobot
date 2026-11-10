@@ -140,6 +140,10 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
             bot_id=str(body.get("bot_id", "")),
             instance_id=str(body.get("instance_id", "")),
             principal_id=config.principal_id,
+            # Delivery admission: revoked workflows still deliver results, as
+            # durable card-only receipts. New-task admission (the validate
+            # route) keeps requiring the live grant.
+            require_auto_continue=False,
         )
     except InboxError as exc:
         status = 410 if exc.code == "stale_origin" else 422
@@ -178,7 +182,7 @@ async def handle_inbox_receive(request: web.Request) -> web.Response:
         ),
     )
     try:
-        receipt = inbox.receive(delivery)
+        receipt = inbox.receive(delivery, capability_digest=capability.digest)
     except InboxError as exc:
         return _error(409, exc.code, exc.detail)
     except ValueError as exc:

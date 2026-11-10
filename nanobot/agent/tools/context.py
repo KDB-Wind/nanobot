@@ -48,6 +48,9 @@ class RequestContext:
     persist_session: bool = True
     # Effective tool scope; injected inputs retain the active run's scope.
     workspace_scope: WorkspaceScope | None = None
+    # Workflow root this turn continues; set by async report continuations so
+    # minted capabilities keep the original workflow instead of deriving one.
+    source_workflow: str | None = None
 
 
 @runtime_checkable

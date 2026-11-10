@@ -44,6 +44,7 @@ from nanobot.config.schema import Config
 from nanobot.gateway.runtime import GatewayHealthIdentity, GatewayInstance, GatewayRuntime
 from nanobot.installation_lock import installation_access
 from nanobot.security.network import is_loopback_host
+from nanobot.session.inbox_wake import InboxWakePump
 from nanobot.session.keys import (
     HEARTBEAT_SESSION_KEY,
     UNIFIED_SESSION_KEY,
@@ -147,6 +148,47 @@ def _http_endpoint_responding(url: str, *, timeout_s: float = 0.25) -> bool:
         return True
     except (OSError, urllib.error.URLError, TimeoutError, ValueError):
         return False
+
+
+def mint_teams_meta(inbox: Any, principal_id: str) -> dict[str, str]:
+    """Host-minted routing meta for the async Teams MCP tool calls.
+
+    An incapable host cannot honor the background promise a minted capability
+    implies, so it returns no meta and tools operate workbench_only. Report
+    continuation turns carry their original workflow root; only genuine new
+    turns derive a root from their own turn.
+    """
+    from nanobot.agent.tools.context import current_request_context
+
+    ctx = current_request_context()
+    if ctx is None or not ctx.persist_session or not ctx.can_receive_background_results:
+        return {}
+    if ctx.session_key is None or ctx.session_generation is None:
+        return {}
+    workflow_id = ctx.source_workflow or f"wf_{ctx.turn_id or ctx.session_generation[:8]}"
+    capability = inbox.mint_capability(
+        session_key=ctx.session_key,
+        session_generation=ctx.session_generation,
+        workflow_id=workflow_id,
+        operation_key="*",
+        bot_id="*",
+        instance_id="*",
+        principal_id=principal_id,
+    )
+    return {
+        "reply_capability": capability.token,
+        "reply_workflow": capability.workflow_id,
+        "coordinator_principal": principal_id,
+    }
+
+
+async def _session_alive(session_manager: Any, session_key: str) -> bool:
+    """Whether the origin session still exists for an inbox wake turn."""
+    try:
+        session = await session_manager.state.read(session_key)
+    except Exception:
+        return False
+    return session is not None
 
 
 async def _watch_webui_dev_server(
@@ -593,27 +635,11 @@ def _run_claimed_gateway(
 
         external_inbox = ExternalInbox(session_manager.state)
         _PENDING_EXTERNAL_INBOX["inbox"] = external_inbox
+
         def _teams_meta_provider(server_name: str):
-            def provider() -> dict[str, str]:
-                from nanobot.agent.tools.context import current_request_context
-
-                ctx = current_request_context()
-                capability = external_inbox.mint_capability(
-                    session_key=ctx.session_key,
-                    session_generation=ctx.session_generation,
-                    workflow_id=f"wf_{ctx.turn_id or ctx.session_generation[:8]}",
-                    operation_key="*",
-                    bot_id="*",
-                    instance_id="*",
-                    principal_id=runs_cfg.principal_id,
-                )
-                return {
-                    "reply_capability": capability.token,
-                    "reply_workflow": capability.workflow_id,
-                    "coordinator_principal": runs_cfg.principal_id,
-                }
-
-            return provider
+            return lambda: mint_teams_meta(
+                external_inbox, runs_cfg.principal_id
+            )
 
         from nanobot.agent.tools.mcp import set_teams_async_meta_hook
 
@@ -1132,6 +1158,22 @@ def _run_claimed_gateway(
                 ),
                 asyncio.create_task(_run_agent(), name="nanobot-agent-loop"),
                 asyncio.create_task(channels.start_all(), name="nanobot-channels"),
+                *(
+                    []
+                    if pending_inbox is None
+                    else [
+                        asyncio.create_task(
+                            InboxWakePump(
+                                pending_inbox,
+                                bus.publish_inbound,
+                                lambda session_key: _session_alive(
+                                    session_manager, session_key
+                                ),
+                            ).run_forever(),
+                            name="nanobot-inbox-wake",
+                        ),
+                    ]
+                ),
                 asyncio.create_task(
                     run_local_trigger_queue(
                         store=trigger_store,

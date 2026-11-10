@@ -197,18 +197,33 @@ def build_async_server(client: CoordinatorClient) -> Server:
         )
 
     def _trusted_meta() -> dict[str, str]:
-        """Read host-minted routing meta; never accepted from model arguments."""
+        """Read host-minted routing meta; never accepted from model arguments.
+
+        The SDK exposes the request's ``_meta`` as ``RequestContext.meta`` (a
+        ``RequestParams.Meta`` model with extra fields allowed). Older SDKs put
+        it on ``request.params.meta``; both shapes are normalized here, and a
+        bare dict meta is tolerated for transport-level callers.
+        """
         try:
             context = server.request_context
         except LookupError:
             return {}
-        params = getattr(context.request, "params", None)
-        meta = getattr(params, "meta", None)
-        if not isinstance(meta, dict):
+        raw: Any = getattr(context, "meta", None)
+        if raw is None:
+            params = getattr(getattr(context, "request", None), "params", None)
+            raw = getattr(params, "meta", None)
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            entries = raw.items()
+        elif hasattr(raw, "model_dump"):
+            dumped = raw.model_dump(exclude_none=True)
+            entries = dumped.items() if isinstance(dumped, dict) else []
+        else:
             return {}
         return {
             str(k): str(v)
-            for k, v in meta.items()
+            for k, v in entries
             if k in ("reply_capability", "reply_workflow", "coordinator_principal")
         }
 

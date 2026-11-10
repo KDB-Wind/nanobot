@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-
-import pytest
-
-from nanobot.cron.service import CronJobSkippedError, CronService
+from nanobot.cron.service import CronService
 from nanobot.cron.teams_jobs import run_teams_cron_job
 from nanobot.cron.types import CronJob, CronPayload, CronSchedule
 

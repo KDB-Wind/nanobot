@@ -166,10 +166,29 @@ def _create_schema_v5(db: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_schema_v5_to_v6(db: sqlite3.Connection) -> None:
+    # First-use task binding on capabilities (rebind rejection) and the durable
+    # continuation obligation that wakes the planner after a report injects.
+    db.execute(
+        "ALTER TABLE reply_capabilities ADD COLUMN bound_task_id TEXT NOT NULL DEFAULT ''"
+    )
+    db.execute(
+        "ALTER TABLE reply_capabilities ADD COLUMN bound_run_id TEXT NOT NULL DEFAULT ''"
+    )
+    db.execute(
+        "ALTER TABLE reply_capabilities ADD COLUMN bound_instance_id TEXT "
+        "NOT NULL DEFAULT ''"
+    )
+    db.execute("ALTER TABLE external_inbox ADD COLUMN wake_due INTEGER NOT NULL DEFAULT 0")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS external_inbox_wake ON external_inbox(wake_due, state)"
+    )
+
+
 # Entries upgrade version N to N+1. Preserve released entries and append upgrades.
 _SCHEMA_MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _create_schema_v1, _create_schema_v2, _create_schema_v3, _create_schema_v4,
-    _create_schema_v5,
+    _create_schema_v5, _migrate_schema_v5_to_v6,
 )
 
 

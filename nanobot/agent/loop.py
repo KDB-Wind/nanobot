@@ -801,6 +801,11 @@ class AgentLoop:
             log_content=ctx.session.policy.log_content and not ctx.ephemeral,
             persist_session=ctx.session.policy.persist and not ctx.ephemeral,
             can_receive_background_results=self._running,
+            source_workflow=(
+                str(ctx.msg.metadata.get("source_workflow"))
+                if ctx.msg.metadata.get("source_workflow")
+                else None
+            ),
         )
 
     async def _resolve_runtime_context_for_turn(
@@ -1880,8 +1885,6 @@ class AgentLoop:
         session: Session | None = None,
     ) -> OutboundMessage | None:
         kind = TurnKind.USER if msg.is_user_input else TurnKind.SYSTEM
-        if kind is TurnKind.USER:
-            await self._arevoke_external_workflows(session_key or msg.session_key)
         if kind is TurnKind.SYSTEM:
             destination = (
                 msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
@@ -1902,6 +1905,10 @@ class AgentLoop:
             session is None or session.generation != msg.session_generation
         ):
             raise RuntimeError("required session generation was replaced")
+        if kind is TurnKind.USER:
+            # Revocation happens only after admission and generation validation:
+            # a stale user input must not revoke the current generation's grant.
+            await self._arevoke_external_workflows(key)
         if delivery is None:
             delivery = self.turn_delivery_factory.create(msg, key)
         elif delivery.session_key != key:

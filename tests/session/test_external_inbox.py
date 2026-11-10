@@ -191,6 +191,8 @@ async def test_q1a_b4_revoked_workflow_stays_revoked_after_new_mint(harness):
         principal_id="coordinator",
     )
     assert inbox.workflow_allows_auto_continue("wf-r") is False
+    # New-task admission keeps requiring the live grant; only result
+    # delivery validates without it (see test_inbox_continuation).
     with pytest.raises(InboxError) as exc:
         inbox.validate_capability(
             token=second.token, workflow_id="wf-r", operation_key="op-2",
