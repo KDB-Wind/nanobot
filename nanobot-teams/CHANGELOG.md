@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.6.0 - 2026-11-10
+
+Bot-to-bot async collaboration (peer comms) and per-bot cache statistics.
+The planner workbench keeps its 0.5 semantics; workers can now dispatch to
+each other along explicit authorization edges, and every bot's usage is
+queryable from the coordinator and visible in the workbench.
+
+### Added
+
+- Per-bot identity and receive bindings on the coordinator: the `bots`
+  table carries `inbox_url`, `inbox_principal_id`, `inbox_key_env`, and
+  `coord_secret_env` (idempotent ALTER on legacy databases). A bearer
+  token matching a bot's coordinator credential identifies that bot as
+  its own principal; every role-checked route denies bot principals by
+  default except reading, looking up, and cancelling their OWN tasks.
+- `POST /v1/teams/peer/send` plus the `send_to_bot` MCP tool: bot
+  principals dispatch tasks along explicit `peer_edges` (default deny,
+  operator-managed). Admission enforces the 4-hop conversation bound,
+  recipient-reentry cycle rejection (A->B->A), a per-pair hourly message
+  window, and the existing quota machinery (fanout rides principal_open,
+  recipient concurrency rides bot_queue) inside one transaction; every
+  typed rejection is audited with sender/recipient/code/hop. Repeated
+  operation keys replay the original task.
+- Peer replies return to the SENDER's inbox (I5): the capability is
+  validated against the sender's own receive binding before admission and
+  delivered there after the recipient finishes; on inbox-enabled hosts the
+  run executor binds the durable `peer:<workflow>` conversation session so
+  capabilities survive the ephemeral run and wakes continue the
+  conversation.
+- `nanobot serve` can host the runs inbox on its own API listener
+  (ADR-001, `api.runs.inboxEnabled`, default off): one process per bot
+  both executes dispatched runs and receives peer results. Generated
+  worker scaffolds are fully peer-wired (inbox + teams-async MCP client
+  with `$\{ENV\}` credentials and a self-contained PYTHONPATH).
+- Per-bot usage and cache hit rates: `GET /v1/teams/usage` and
+  `GET /v1/teams/bots/{id}/usage` read each bot's own
+  `llm_usage.sqlite3` strictly read-only (`mode=ro` + `query_only`). The
+  hit-rate denominator is the input tokens of calls that REPORTED cache
+  fields; missing data stays null (never 0%) with a coverage ratio; the
+  window selector covers 7d/30d/all with per-model splits. `serve`
+  records llm usage like the gateway already did.
+- Workbench: per-bot usage panel (hit rate, coverage, denominator note in
+  the header tooltip), the bot graph of explicit peer edges, and a route
+  column marking peer tasks with sender -> recipient and hop, localized
+  in every supported locale.
+
+### Verified
+
+- The four-bot probe (`acceptance/peer_comms_probe.py`) runs the real
+  chain green with real models: planner -> research -> (send_to_bot) ->
+  writer -> reply delivered to research's inbox (validate 200, deliver
+  202, receipt injected and the conversation woken) -> research's summary
+  carries the writer's marker. Unauthorized edges, the fifth hop, and
+  duplicate keys answer with typed rejections; killing the coordinator
+  mid-flight converges to exactly one completed task after restart.
+- Real usage evidence: research recorded 4 requests with 25,600
+  cache-read tokens (93.7% hit rate, 100% coverage) during the live run.
+
+
 ## 0.5.0 - 2026-11-09
 
 Async multi-bot workbench (one operator, one Planner, many managed bots).

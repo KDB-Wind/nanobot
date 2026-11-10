@@ -198,6 +198,60 @@ unknown outcomes stay quarantined, and re-import is a no-op. Rollback: stop
 admission, let runs settle, back up the new database; 0.5 databases never
 downgrade into 0.4.
 
+## Peer comms and per-bot usage (0.6)
+
+Any two registered, authorized bots can now dispatch async tasks to each other
+and receive the replies. The user still talks only to the planner; workers
+collaborate among themselves and report back.
+
+1. Register each bot with its receive binding and a coordinator credential
+   reference (all loopback, all `$\{ENV\}` references):
+
+   ```json
+   POST /v1/teams/bots
+   {
+     "bot_id": "writer", "display_name": "Writer", "role": "writer",
+     "endpoint": "http://127.0.0.1:9210",
+     "secret_env": "TEAMS_BOT_WRITER_KEY",
+     "coord_secret_env": "TEAMS_BOT_WRITER_COORD_TOKEN",
+     "inbox_url": "http://127.0.0.1:9210",
+     "inbox_principal_id": "teams-coordinator",
+     "inbox_key_env": "TEAMS_BOT_WRITER_KEY"
+   }
+   ```
+
+   Set `TEAMS_BOT_WRITER_KEY` and `TEAMS_BOT_WRITER_COORD_TOKEN` in BOTH the
+   bot's and the coordinator's environment. Bots scaffolded through the
+   workbench are wired this way automatically and print their start command.
+
+2. Authorize the edges you want (default deny): `POST /v1/teams/peer-edges`
+   with `{"from_bot_id": "research", "to_bot_id": "writer"}` as the operator.
+   The planner's own delegations stay implicit as in 0.5.
+
+3. A worker dispatches with the `send_to_bot` tool (or
+   `POST /v1/teams/peer/send` with the bot's coordinator token): recipient,
+   input, operation_key, and optionally the conversation envelope. When the
+   sending host has its runs inbox enabled (`api.runs.inboxEnabled`), the
+   reply capability targets the worker's durable `peer:<workflow>` session,
+   so the reply lands in the sender's own inbox and wakes the conversation.
+
+Conversation budgets: at most 4 hops per conversation root, a bot may not
+receive twice in one conversation (A->B->A is rejected), 20 peer messages per
+bot pair per hour, and the shared quotas still bound fanout (open tasks per
+sender) and recipient concurrency (bot queue). Every typed rejection is
+audited with sender, recipient, code, and hop.
+
+Per-bot usage is queryable at `GET /v1/teams/usage?window=7d|30d|all` and
+`GET /v1/teams/bots/{bot_id}/usage`. Hit rate = cache-read tokens / the input
+tokens of calls that reported cache fields; bots whose provider reports no
+cache fields show "not reported" (null), never 0%, plus a coverage ratio. The
+workbench renders the same data with the denominator spelled out.
+
+Acceptance: `acceptance/peer_comms_probe.py` boots a real four-bot topology
+(planner + research + writer + analyst), drives the full chain with real
+models, kills and restarts the coordinator mid-flight, and checks the typed
+rejections and the usage numbers; it exits 0 only when everything converges.
+
 ## Security and limits
 
 Endpoints are canonical `http://127.0.0.1:<port>/v1/chat/completions` URLs without credentials, query, fragment, or control characters. Redirects and environment proxies are disabled. Only identity encoding is accepted; raw response bytes are bounded before parsing. Invalid Unicode, excessive JSON depth, and compressed responses become unknown outcomes.

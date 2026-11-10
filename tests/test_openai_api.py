@@ -468,6 +468,46 @@ async def test_fixed_session_requests_are_serialized(aiohttp_client) -> None:
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
+async def test_request_deadline_includes_session_queue(aiohttp_client) -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    calls = []
+
+    async def process(content, **kwargs):
+        calls.append(content)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release_cleanup.wait()
+            raise
+
+    agent = _make_mock_agent()
+    agent.process_direct = process
+    client = await aiohttp_client(create_app(agent, request_timeout=0.02))
+
+    async def send(content):
+        return await client.post("/v1/chat/completions", json={
+            "session_id": "queue-deadline",
+            "messages": [{"role": "user", "content": content}],
+        })
+
+    first = asyncio.create_task(send("first"))
+    await asyncio.wait_for(started.wait(), 2)
+    await asyncio.wait_for(cancelled.wait(), 2)
+    try:
+        second = await asyncio.wait_for(send("queued"), 1)
+        assert second.status == 504
+        assert calls == ["first"]
+    finally:
+        release_cleanup.set()
+        await asyncio.wait_for(first, 2)
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
 async def test_models_endpoint(aiohttp_client, app) -> None:
     client = await aiohttp_client(app)
     resp = await client.get("/v1/models", headers=AUTH_HEADERS)

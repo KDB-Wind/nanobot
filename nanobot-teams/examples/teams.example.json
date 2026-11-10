@@ -2,9 +2,11 @@
   "schema_version": 2,
   "team_id": "personal-research",
   "thread_key": "main",
+  "allow_multihop": false,
   "bots": [
     {
       "id": "planner",
+      "can_start_root": true,
       "display_name": "Planner",
       "role": "Planning and synthesis",
       "capabilities": ["plan", "synthesize"],
@@ -12,6 +14,7 @@
     },
     {
       "id": "research",
+      "can_start_root": false,
       "display_name": "Research",
       "role": "Retrieval with evidence and uncertainty",
       "capabilities": ["search"],
@@ -22,6 +25,7 @@
     },
     {
       "id": "writer",
+      "can_start_root": false,
       "display_name": "Writer",
       "role": "Drafting long-form answers",
       "capabilities": ["write"],
