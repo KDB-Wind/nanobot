@@ -359,7 +359,11 @@ class PeerLab:
                 body={"bot_id": bot, "display_name": bot.title(),
                       "role": bot,
                       "endpoint": f"http://127.0.0.1:{port}",
-                      "secret_env": f"PEER_BOT_{bot.upper()}_KEY"},
+                      "secret_env": f"PEER_BOT_{bot.upper()}_KEY",
+                      "coord_secret_env": f"PEER_COORD_TOKEN_{bot.upper()}",
+                      "inbox_url": f"http://127.0.0.1:{port}",
+                      "inbox_principal_id": "teams-coordinator",
+                      "inbox_key_env": f"PEER_BOT_{bot.upper()}_KEY"},
             )
             evidence["steps"].append(
                 {"step": f"register {bot}", "status": status,

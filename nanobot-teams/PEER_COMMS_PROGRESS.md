@@ -14,7 +14,9 @@
 | 阶段 | 状态 | 说明 |
 | --- | --- | --- |
 | P0 基线、审计与恢复点 | verified | 提交 36e099fd1（目标契约入库）+ f44122aff（基线/backlog）；备份与基线测试见 P0 记录 |
-| P1 设计与威胁模型 | verified | 提交（本条）；PEER_COMMS_DESIGN.md：领域对象、三方案对比（选定 A：每 Bot inbox 绑定 + runs 协议）、威胁模型、ADR-001（serve 可选 inbox）；运行时问题已用真实进程探针回答 |
+| P1 设计与威胁模型 | verified | 提交 00f611511；PEER_COMMS_DESIGN.md：领域对象、三方案对比（选定 A）、威胁模型、ADR-001；serve-inbox 探针 RED 实证（404 路由缺失 vs capabilities 宣告 inbox:true） |
+| P2 失败探针（先红） | verified | 提交 0e700deee；acceptance/peer_comms_probe.py 六场景，证据 review/peer-comms/p2-probe-20261110-090521.jsonl：peer_dispatch 首断言 401 unauthorized，crash_restart blocked，全 RED exit 1 |
+| P3 身份、绑定与迁移 | verified | Unit1 ✓ 509047f39（ADR-001：单测 4 绿 + serve_inbox 探针真实进程 GREEN）；Unit2 ✓ d46f13e84（9 测试绿，Teams 289 passed，ruff 绿）；peer 探针进展 401→404（p2-probe-20261110-091946.jsonl：bot 凭据真实进程通过，缺 peer 路由= P4） |
 | P2 失败探针（先红） | pending | |
 | P3 身份、绑定与迁移 | pending | |
 | P4 授权图、派发与环路保护 | pending | |
