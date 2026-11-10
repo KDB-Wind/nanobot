@@ -530,6 +530,14 @@ class PeerLab:
             return ev
         research_task = payload["task_id"]
 
+        # Earlier scenarios leave their own peer tasks behind; only a task
+        # created after this submission belongs to the live chain.
+        status, before = http_json(
+            "GET", self.coord_url("/v1/teams/tasks?limit=100"),
+            token=self.admin_token,
+        )
+        known = {t["task_id"] for t in before.get("tasks", [])} if status == 200 else set()
+
         deadline = time.monotonic() + 480.0
         peer_task_id = None
         while time.monotonic() < deadline:
@@ -539,6 +547,7 @@ class PeerLab:
             )
             peers = [t for t in listing.get("tasks", [])
                      if t.get("kind") == "peer"
+                     and t.get("task_id") not in known
                      and t.get("caller_principal") == "bot:research"
                      and t.get("bot_id") == "writer"] if status == 200 else []
             if peers:
