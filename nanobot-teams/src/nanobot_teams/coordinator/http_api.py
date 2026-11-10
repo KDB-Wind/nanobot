@@ -369,15 +369,18 @@ def build_app(
         return _json_response(task_public_json(task), status=201 if created else 200)
 
     async def list_tasks(request: web.Request) -> web.Response:
-        denied = require_role(request, ("planner", "operator"))
-        if denied is not None:
-            return denied
+        role = request[_ROLE_KEY]
+        if role is None or (role != "planner" and role != "operator"
+                            and not role.startswith("bot:")):
+            return api_error(403, "forbidden", "That role cannot perform this operation.")
         limit_raw = request.query.get("limit", "50")
         try:
             limit = max(1, min(int(limit_raw), PAGE_MAX))
         except ValueError:
             return api_error(400, "invalid_field", "limit must be an integer.")
-        principal = principal_for(request) if request[_ROLE_KEY] == "planner" else None
+        principal = (
+            principal_for(request) if role in ("planner", "operator") else principal_for(request)
+        )
         tasks = store.list_tasks(
             caller_principal=principal,
             project_id=request.query.get("project"),
@@ -387,9 +390,10 @@ def build_app(
         return _json_response({"tasks": [task_public_json(t) for t in tasks]})
 
     async def lookup_task(request: web.Request) -> web.Response:
-        denied = require_role(request, ("planner", "operator"))
-        if denied is not None:
-            return denied
+        role = request[_ROLE_KEY]
+        if role is None or (role != "planner" and role != "operator"
+                            and not role.startswith("bot:")):
+            return api_error(403, "forbidden", "That role cannot perform this operation.")
         key = request.query.get("operation_key", "")
         if not key:
             return api_error(400, "operation_key_required", "operation_key is required.")
@@ -399,6 +403,47 @@ def build_app(
         if task is None:
             return api_error(404, "task_not_found", "No task for that key.")
         return _json_response(task_public_json(task))
+
+    async def _validate_sender_capability(
+        sender: Bot, workflow: str, operation_key: str, recipient_id: str,
+        capability: str,
+    ) -> tuple[int, str, str] | None:
+        """Ask the SENDER's own inbox to validate the capability before admit."""
+        import httpx
+
+        inbox_key = os.environ.get(sender.inbox_key_env or "", "").strip()
+        if not inbox_key:
+            return (503, "sender_key_missing",
+                    f"{sender.inbox_key_env} is not set in the coordinator environment.")
+        validate_body = {
+            "capability": capability,
+            "workflow": workflow,
+            "operation_key": operation_key,
+            "bot_id": recipient_id,
+            "instance_id": "",
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=10.0, follow_redirects=False, trust_env=False
+            ) as client:
+                response = await client.post(
+                    sender.inbox_url.rstrip("/")
+                    + "/v1/agent-inbox/capabilities/validate",
+                    headers={"Authorization": f"Bearer {inbox_key}"},
+                    json=validate_body,
+                )
+        except httpx.HTTPError:
+            return (503, "sender_inbox_unavailable",
+                    "The sender inbox did not answer; the peer send is refused.")
+        if response.status_code == 200:
+            return None
+        detail = ""
+        try:
+            detail = str(response.json().get("code", ""))
+        except ValueError:
+            pass
+        return (422, detail or "capability_invalid",
+                "The sender inbox rejected the reply capability.")
 
     async def peer_send(request: web.Request) -> web.Response:
         """Bot-principal task dispatch along an explicit peer edge (I3-I6)."""
@@ -427,7 +472,8 @@ def build_app(
             hop = int(body.get("hop", 0))
         except (TypeError, ValueError):
             return api_error(400, "invalid_field", "hop must be an integer.")
-        conversation_root = str(body.get("conversation_root", "")).strip()             or str(uuid.uuid4())
+        conversation_root = (str(body.get("conversation_root", "")).strip()
+                            or str(uuid.uuid4()))
         deadline_raw = body.get("deadline_at")
         deadline = None
         if deadline_raw is not None:
@@ -457,23 +503,34 @@ def build_app(
         # Idempotent reconciliation wins over fresh budget checks, exactly
         # like planner submissions.
         principal = principal_for(request)
+        reply_capability = str(body.get("reply_capability", "")).strip()
+        workflow_id = conversation_root
+        delivery_mode = DeliveryMode.WORKBENCH_ONLY
+        if reply_capability:
+            if not sender.inbox_url or not sender.inbox_principal_id or not sender.inbox_key_env:
+                return api_error(
+                    422, "sender_binding_required",
+                    "Auto-return requires the sender's complete receive binding.",
+                )
+            workflow_id = str(body.get("workflow", "")).strip()
+            if not workflow_id:
+                return api_error(
+                    400, "invalid_field",
+                    "workflow is required with a reply capability.",
+                )
+            delivery_mode = DeliveryMode.AUTO_RESUME
         existing = store.lookup_task(principal, str(body["operation_key"]))
         if existing is not None:
             # A replay that omits the envelope keeps the original semantics:
             # the caller did not change what the operation key means.
-            replay_root = (
-                existing.conversation_root
-                if not str(body.get("conversation_root", "")).strip()
-                else conversation_root
-            )
             digest = task_digest(
                 caller_principal=principal,
                 project_id=project_id,
                 bot_id=recipient.bot_id,
                 input_text=input_text,
                 deadline_at=deadline,
-                delivery_mode=DeliveryMode.WORKBENCH_ONLY.value,
-                workflow_id=replay_root,
+                delivery_mode=existing.delivery_mode.value,
+                workflow_id=existing.workflow_id,
             )
             if existing.request_digest == digest:
                 return _json_response(task_public_json(existing), status=200)
@@ -481,17 +538,32 @@ def build_app(
                 409, "operation_key_conflict",
                 "This operation key was used with different semantics.",
             )
+        if delivery_mode is DeliveryMode.AUTO_RESUME:
+            rejected = await _validate_sender_capability(
+                sender, workflow_id, str(body["operation_key"]),
+                recipient.bot_id, reply_capability,
+            )
+            if rejected is not None:
+                store.record_peer_rejection(
+                    sender_bot_id=sender_id,
+                    recipient_bot_id=recipient.bot_id,
+                    code=rejected[1],
+                    conversation_root=conversation_root,
+                    hop=hop,
+                )
+                return api_error(rejected[0], rejected[1], rejected[2])
         try:
             task, created = store.admit_task(
                 caller_principal=principal,
                 project_id=project_id,
-                workflow_id=conversation_root,
+                workflow_id=workflow_id,
                 bot_id=recipient.bot_id,
                 operation_key=str(body["operation_key"]),
                 input_text=input_text,
                 deadline_at=deadline,
-                delivery_mode=DeliveryMode.WORKBENCH_ONLY,
+                delivery_mode=delivery_mode,
                 bot=recipient,
+                reply_capability=reply_capability,
                 kind="peer",
                 conversation_root=conversation_root,
                 hop=hop,
@@ -562,13 +634,14 @@ def build_app(
         return _json_response({"removed": True})
 
     async def get_task(request: web.Request) -> web.Response:
-        denied = require_role(request, ("planner", "operator"))
-        if denied is not None:
-            return denied
+        role = request[_ROLE_KEY]
+        if role is None or (role != "planner" and role != "operator"
+                            and not role.startswith("bot:")):
+            return api_error(403, "forbidden", "That role cannot perform this operation.")
         task = store.get_task(request.match_info["task_id"])
         if task is None:
             return api_error(404, "task_not_found", "No task with that id.")
-        if request[_ROLE_KEY] == "planner" and task.caller_principal != "planner":
+        if request[_ROLE_KEY] != "operator" and task.caller_principal != principal_for(request):
             return api_error(403, "forbidden", "Not your task.")
         return _json_response(task_public_json(task))
 
@@ -579,13 +652,14 @@ def build_app(
         still being fetched answers 409 result_fetch_pending instead of a
         silent empty success.
         """
-        denied = require_role(request, ("planner", "operator"))
-        if denied is not None:
-            return denied
+        role = request[_ROLE_KEY]
+        if role is None or (role != "planner" and role != "operator"
+                            and not role.startswith("bot:")):
+            return api_error(403, "forbidden", "That role cannot perform this operation.")
         task = store.get_task(request.match_info["task_id"])
         if task is None:
             return api_error(404, "task_not_found", "No task with that id.")
-        if request[_ROLE_KEY] == "planner" and task.caller_principal != "planner":
+        if request[_ROLE_KEY] != "operator" and task.caller_principal != principal_for(request):
             return api_error(403, "forbidden", "Not your task.")
         if not task.result_available or not task.result_fetched:
             return api_error(
@@ -604,13 +678,14 @@ def build_app(
         )
 
     async def cancel_task(request: web.Request) -> web.Response:
-        denied = require_role(request, ("planner", "operator"))
-        if denied is not None:
-            return denied
+        role = request[_ROLE_KEY]
+        if role is None or (role != "planner" and role != "operator"
+                            and not role.startswith("bot:")):
+            return api_error(403, "forbidden", "That role cannot perform this operation.")
         task = store.get_task(request.match_info["task_id"])
         if task is None:
             return api_error(404, "task_not_found", "No task with that id.")
-        if request[_ROLE_KEY] == "planner" and task.caller_principal != "planner":
+        if request[_ROLE_KEY] != "operator" and task.caller_principal != principal_for(request):
             return api_error(403, "forbidden", "Not your task.")
         updated = store.request_cancel(task.task_id)
         return _json_response(task_public_json(updated), status=202)

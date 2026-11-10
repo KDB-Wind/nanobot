@@ -186,13 +186,15 @@ class PeerLab:
         }
 
     def write_worker(self, bot: str) -> Path:
+        """A fully peer-wired worker: runs inbox plus the teams-async client."""
         home = self.tmp / bot
         (home / "workspace").mkdir(parents=True)
+        token_env = f"PEER_COORD_TOKEN_{bot.upper()}"
         config = {
             "agents": {"defaults": {
                 "workspace": str(home / "workspace"),
                 "modelPreset": self.preset_name,
-                "maxToolIterations": 10,
+                "maxToolIterations": 40,
             }},
             **self._model_blocks(),
             "api": {"host": "127.0.0.1", "port": self.worker_ports[bot], "runs": {
@@ -203,6 +205,22 @@ class PeerLab:
                 "exclusiveExecution": True,
                 "inboxEnabled": True,
             }},
+            "tools": {
+                "restrictToWorkspace": True,
+                "exec": {"enable": False},
+                "mcpServers": {
+                    "teams-async": {
+                        "type": "stdio",
+                        "command": str(PY_TEAMS),
+                        "args": ["-m", "nanobot_teams", "async-mcp",
+                                 "--url", f"http://127.0.0.1:{self.coord_port}",
+                                 "--token-env", token_env],
+                        "env": {token_env: "${" + token_env + "}"},
+                        "teamsAsync": True,
+                        "toolTimeout": 600,
+                    },
+                },
+            },
         }
         path = home / "config.json"
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -436,40 +454,96 @@ class PeerLab:
             ev["status"] = "fail"
             ev["reason"] = f"recipient run_state={run_state} result_available={result_available}"
             return ev
-        # P5 gate: the reply lands in the sender's own inbox.
-        deadline = time.monotonic() + 60.0
-        delivery = None
+        ev["status"] = "pass"
+        return ev
+
+    def scenario_live_chain(self) -> dict:
+        """The real chain: planner -> research -> (send_to_bot) -> writer ->
+        reply returns to research's inbox and wakes it -> research's run
+        summarizes (E2E-01..04/10)."""
+        ev: dict = {"scenario": "live_chain", "steps": []}
+        status, payload = http_json(
+            "POST", self.coord_url("/v1/teams/tasks"), token=self.planner_token,
+            body={
+                "project": "peer",
+                "bot": "research",
+                "input": (
+                    "You must delegate exactly one task. Call send_to_bot with "
+                    f"recipient 'writer' and the input: 'Reply with exactly {self.marker} "
+                    "and nothing else.' Then poll get_async_task for that task "
+                    "until it reaches a terminal state and you can read its "
+                    "result. Finish by repeating the writer's exact reply."
+                ),
+                "operation_key": str(uuid.uuid4()),
+            },
+        )
+        ev["steps"].append({"step": "planner submits research task", "status": status,
+                            "task_id": payload.get("task_id") if isinstance(payload, dict) else None})
+        if status not in (200, 201, 202):
+            ev["status"] = "fail"
+            ev["reason"] = f"planner submit HTTP {status}"
+            return ev
+        research_task = payload["task_id"]
+
+        deadline = time.monotonic() + 480.0
+        peer_task_id = None
         while time.monotonic() < deadline:
-            status, task = http_json(
-                "GET", self.coord_url(f"/v1/teams/tasks/{task_id}"),
+            status, listing = http_json(
+                "GET", self.coord_url("/v1/teams/tasks?limit=100"),
                 token=self.admin_token,
             )
-            delivery = task.get("delivery_state") if isinstance(task, dict) else None
-            if delivery in ("persisted", "injected", "card_only", "orphaned", "failed"):
+            peers = [t for t in listing.get("tasks", [])
+                     if t.get("kind") == "peer"
+                     and t.get("caller_principal") == "bot:research"
+                     and t.get("bot_id") == "writer"] if status == 200 else []
+            if peers:
+                peer_task_id = peers[0]["task_id"]
                 break
-            time.sleep(2.0)
-        ev["steps"].append({"step": "poll task delivery", "delivery_state": delivery})
-        if delivery not in ("persisted", "injected"):
+            time.sleep(3.0)
+        ev["steps"].append({"step": "research dispatched peer task",
+                            "peer_task_id": peer_task_id})
+        if peer_task_id is None:
             ev["status"] = "fail"
-            ev["reason"] = f"delivery_state={delivery} (P5: result must return to sender inbox)"
+            ev["reason"] = "research never created a peer task via send_to_bot"
             return ev
-        # The reply must land in research's own inbox (E2E-02/I5).
-        lookup = http_json(
-            "GET", self.coord_url(f"/v1/teams/tasks/{task_id}"),
-            token=self.admin_token,
-        )[1]
-        receipt_status, receipt = http_json(
-            "GET",
-            f"http://127.0.0.1:{self.worker_ports['research']}"
-            f"/v1/agent-inbox/{lookup.get('delivery_id', '')}",
-            token=self.runs_keys["research"],
-        )
-        ev["steps"].append({"step": "fetch research inbox receipt",
-                            "status": receipt_status,
-                            "keys": sorted(receipt.keys()) if isinstance(receipt, dict) else None})
-        if receipt_status != 200:
+
+        peer_delivery = None
+        research_state = None
+        while time.monotonic() < deadline:
+            status, peer = http_json(
+                "GET", self.coord_url(f"/v1/teams/tasks/{peer_task_id}"),
+                token=self.admin_token,
+            )
+            peer_delivery = peer.get("delivery_state") if isinstance(peer, dict) else None
+            status2, research = http_json(
+                "GET", self.coord_url(f"/v1/teams/tasks/{research_task}"),
+                token=self.admin_token,
+            )
+            research_state = research.get("run_state") if isinstance(research, dict) else None
+            if peer_delivery in ("persisted", "injected", "card_only", "orphaned", "failed")                     and research_state in ("succeeded", "failed", "cancelled", "interrupted"):
+                break
+            time.sleep(3.0)
+        ev["steps"].append({"step": "chain states", "peer_delivery": peer_delivery,
+                            "research_run": research_state})
+        if peer_delivery not in ("persisted", "injected"):
             ev["status"] = "fail"
-            ev["reason"] = f"research inbox receipt HTTP {receipt_status}"
+            ev["reason"] = (f"writer reply did not reach research inbox "
+                            f"(peer delivery_state={peer_delivery})")
+            return ev
+        if research_state != "succeeded":
+            ev["status"] = "fail"
+            ev["reason"] = f"research run_state={research_state}"
+            return ev
+        status, result = http_json(
+            "GET", self.coord_url(f"/v1/teams/tasks/{research_task}/result"),
+            token=self.admin_token,
+        )
+        body_text = result.get("result_text", "") if isinstance(result, dict) else ""
+        ev["steps"].append({"step": "research result", "status": status,
+                            "contains_marker": self.marker in body_text})
+        if status != 200 or self.marker not in body_text:
+            ev["status"] = "fail"
+            ev["reason"] = "research summary does not carry the writer's marker"
             return ev
         ev["status"] = "pass"
         return ev
@@ -661,6 +735,7 @@ def main() -> int:
         results.append(lab.scenario_idempotent_key(dispatch_ok))
         results.append(lab.scenario_crash_restart(dispatch_ok))
         results.append(lab.scenario_events_shape())
+        results.append(lab.scenario_live_chain())
     except SystemExit as exc:
         results.append({"scenario": "boot", "status": "fail", "reason": str(exc)})
     finally:

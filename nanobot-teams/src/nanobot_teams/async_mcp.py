@@ -417,6 +417,13 @@ def build_async_server(client: CoordinatorClient) -> Server:
                 for optional in ("conversation_root", "hop", "project", "deadline_at"):
                     if arguments.get(optional) is not None:
                         body[optional] = arguments[optional]
+                if meta.get("reply_capability"):
+                    # Peer auto-return: the sender host minted this capability
+                    # for its own session; the reply routes back here and the
+                    # workflow must match the capability binding.
+                    body["reply_capability"] = meta["reply_capability"]
+                    if meta.get("reply_workflow"):
+                        body["workflow"] = meta["reply_workflow"]
                 return _text(await client.send_to_bot(body))
             if name == "get_async_task":
                 task_id = str(arguments.get("task_id", ""))

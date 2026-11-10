@@ -451,19 +451,36 @@ class DispatchWorker:
 
     # ---- delivery ----
 
+    def _delivery_target(self, task) -> tuple[str, str] | None:
+        """(inbox_url, inbox_key_env) replies return to (I5).
+
+        Peer replies return to the SENDER bot's receive binding; planner
+        delegations keep the fixed planner inbox.
+        """
+        if task.kind == "peer":
+            sender = self._store.get_bot(task.caller_principal.removeprefix("bot:"))
+            if sender is None or not sender.inbox_url or not sender.inbox_key_env:
+                return None
+            return sender.inbox_url, sender.inbox_key_env
+        planner = self._planner
+        if planner is None:
+            return None
+        return planner.inbox_url, planner.inbox_key_env
+
     async def _poll_receipt(self, task, client=None, inbox_key=None, delivery_id=None):
         """Observe the planner receipt until it reaches a stable state."""
         import hashlib
 
         import httpx
 
-        planner = self._planner
-        if planner is None:
+        target = self._delivery_target(task)
+        if target is None:
             return
+        inbox_url, key_env = target
         delivery_id = delivery_id or "del_" + hashlib.sha256(
             f"{task.task_id}:{task.remote_revision}".encode("utf-8")
         ).hexdigest()[:24]
-        inbox_key = inbox_key or os.environ.get(planner.inbox_key_env, "").strip()
+        inbox_key = inbox_key or os.environ.get(key_env, "").strip()
         if not inbox_key:
             return
         try:
@@ -472,12 +489,12 @@ class DispatchWorker:
                     timeout=10.0, follow_redirects=False, trust_env=False
                 ) as owned:
                     receipt = await owned.get(
-                        planner.inbox_url.rstrip("/") + f"/v1/agent-inbox/{delivery_id}",
+                        inbox_url.rstrip("/") + f"/v1/agent-inbox/{delivery_id}",
                         headers={"Authorization": f"Bearer {inbox_key}"},
                     )
             else:
                 receipt = await client.get(
-                    planner.inbox_url.rstrip("/") + f"/v1/agent-inbox/{delivery_id}",
+                    inbox_url.rstrip("/") + f"/v1/agent-inbox/{delivery_id}",
                     headers={"Authorization": f"Bearer {inbox_key}"},
                 )
         except httpx.HTTPError:
@@ -512,14 +529,15 @@ class DispatchWorker:
     async def _deliver_one(self, task) -> None:
         import httpx
 
-        planner = self._planner
-        if planner is None or not task.reply_capability:
+        target = self._delivery_target(task)
+        if target is None or not task.reply_capability:
             self._store.set_delivery_state(task.task_id, DeliveryState.FAILED)
             return
+        inbox_url, key_env = target
         delivery_id = "del_" + hashlib.sha256(
             f"{task.task_id}:{task.remote_revision}".encode("utf-8")
         ).hexdigest()[:24]
-        inbox_key = os.environ.get(planner.inbox_key_env, "").strip()
+        inbox_key = os.environ.get(key_env, "").strip()
         if not inbox_key:
             self._store.set_delivery_state(task.task_id, DeliveryState.PENDING)
             return
@@ -542,7 +560,7 @@ class DispatchWorker:
                 timeout=10.0, follow_redirects=False, trust_env=False
             ) as client:
                 response = await client.post(
-                    planner.inbox_url.rstrip("/") + "/v1/agent-inbox",
+                    inbox_url.rstrip("/") + "/v1/agent-inbox",
                     headers={"Authorization": f"Bearer {inbox_key}"},
                     json=payload,
                 )
@@ -754,6 +772,7 @@ def task_public_json(task) -> dict:
         "bot_id": task.bot_id,
         "operation_key": task.operation_key,
         "dispatch_state": task.dispatch_state.value,
+        "delivery_mode": task.delivery_mode.value,
         "run_state": task.run_state,
         "remote_run_id": task.remote_run_id,
         "remote_revision": task.remote_revision,
