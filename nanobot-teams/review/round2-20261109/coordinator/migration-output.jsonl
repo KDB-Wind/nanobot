@@ -1,0 +1,1 @@
+{"mode": "migration_registered_via_http", "registered_instance": null, "unknown_isolated": 1, "quarantines": ["legacy:http://127.0.0.1:56984"], "admission_status": 201, "remote_submits": 1, "bound_instance_after_dispatch": "inst_a"}

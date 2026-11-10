@@ -1,0 +1,151 @@
+[
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_mcp_meta.py"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"is_error\": true, \"mcp_reply\": [\"{\\\"error_code\\\": \\\"origin_required\\\", \\\"detail\\\": \\\"auto_resume requires a host-minted reply capability.\\\"}\"], \"coordinator_submit_requests\": 0}\nREPRODUCED valid_mcp_meta_lost\n",
+    "stderr": "INFO mcp.server.lowlevel.server Processing request of type CallToolRequest\n"
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "cancel_pending"
+    ],
+    "exit_code": 0,
+    "stdout": "before_dispatch cancel_state=confirmed\n{\"submit_requests\": 1, \"cancel_requests\": 0, \"dispatch\": \"accepted\", \"run_state\": \"running\", \"cancel_state\": \"confirmed\"}\nREPRODUCED cancel_pending\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "lost_result"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"run_state\": \"succeeded\", \"result_available\": false, \"result_text\": \"\", \"result_fetch_requests\": 1, \"remaining_observations\": 0}\nREPRODUCED lost_result\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "scaffold"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"http_status\": 201, \"browser_response_has_raw_api_key\": true, \"config_contains_raw_key\": true, \"contains_literal_f_string_segments\": true, \"config_name\": \"nanobot.toml\"}\nload_config=ConfigLoadError: Invalid configuration: C:\\Users\\KDB\\AppData\\Local\\Temp\\nanobot-teams-coordinator-review-iw6zo09k\\scaffold-uv6ftuau\\homes\\new-bot\\nanobot.toml\n\nJSON syntax error at line 1, column 1: Expecting value.\nREPRODUCED scaffold\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "conflict_isolation"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"first_state\": \"indeterminate\", \"second_state\": \"accepted\", \"submit_requests\": 2, \"quarantines\": [], \"third_task_admitted\": true, \"open_count\": 2}\nREPRODUCED conflict_isolation\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "uncertain_isolation"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"first_state\": \"interrupted\", \"effects_uncertain\": true, \"stop_confirmed\": false, \"open_after_uncertain\": 0, \"quarantines\": [], \"new_task_admitted\": true, \"submit_requests\": 2}\nREPRODUCED uncertain_isolation\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "expired_pending"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"dispatch\": \"pending\", \"run_state\": \"unobserved\", \"due_entries\": 1, \"attempts\": 0, \"error\": \"\", \"submit_requests\": 0}\nREPRODUCED expired_pending\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "truncation"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"remote_truncated\": true, \"coordinator_truncated\": false, \"result_text\": \"retained answer\"}\nREPRODUCED truncation\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "storage_lost"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"dispatch\": \"accepted\", \"run_state\": \"running\", \"quarantines\": [], \"submit_requests\": 1}\nREPRODUCED storage_lost\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "response_bounds"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"status\": 200, \"accepted_compressed_response\": true, \"accepted_payload_text_bytes\": 1048576, \"contract_raw_limit\": 262144}\nREPRODUCED response_bounds\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "environment_proxy"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"status\": 200, \"proxy_received_request\": true, \"proxy_received_service_bearer\": true}\nREPRODUCED environment_proxy\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_coordinator.py",
+      "quotas"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"alias_task_admitted_with_16_open_on_same_instance\": true, \"pending_result_bytes\": 0, \"required_pending_reservation\": 524288, \"principal_open_before\": 17, \"principal_open_after_unknown\": 1}\nREPRODUCED quotas\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_extra.py",
+      "missing_result"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"role\": \"planner\", \"detail_status\": 200, \"result_available\": true, \"detail_contains_result_marker\": false, \"result_route_status\": 404, \"snapshot_contains_result_marker\": false}\n{\"role\": \"operator\", \"detail_status\": 200, \"result_available\": true, \"detail_contains_result_marker\": false, \"result_route_status\": 404, \"snapshot_contains_result_marker\": false}\nREPRODUCED missing_result\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_extra.py",
+      "migration"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"legacy_usage\": [1, 32768, 60.0], \"imported_delegations\": 1, \"imported_unknown\": 1, \"active_quarantines\": [\"legacy:http://127.0.0.1:9999\"], \"new_task_admitted_without_quota_confirmation\": true, \"same_endpoint\": true, \"legacy_delegation_limit\": 1}\nREPRODUCED migration\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe",
+      "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot-teams\\review\\async-20261109\\coordinator\\repro_extra.py",
+      "quarantine_existing_outbox"
+    ],
+    "exit_code": 0,
+    "stdout": "{\"quarantine_active\": true, \"submit_requests\": 1, \"task_dispatch\": \"accepted\"}\nREPRODUCED quarantine_existing_outbox\n",
+    "stderr": ""
+  }
+]

@@ -1,0 +1,23 @@
+Error handling request from 127.0.0.1
+Traceback (most recent call last):
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\.venv-nanobot\Lib\site-packages\aiohttp\web_protocol.py", line 577, in _handle_request
+    resp = await request_handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\.venv-nanobot\Lib\site-packages\aiohttp\web_app.py", line 563, in _handle
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\nanobot\api\agent_inbox.py", line 170, in handle_inbox_receive
+    terminal_revision=_bounded_int(body.get("terminal_revision", 0)),
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\nanobot\api\agent_inbox.py", line 77, in _bounded_int
+    parsed = int(value)
+             ^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'bad'
+CRASH_QUEUED {"before": {"tmp": "C:\\Users\\KDB\\AppData\\Local\\Temp\\nanobot-teams-review-round2-20261109\\inbox\\kill-queued-jfin_77q", "key": "websocket:review-chat", "queued": 1, "bus_size": 1, "due": []}, "child_exit": 1, "recovery_pending": [], "recovered_wakes": 0, "planner_calls": 0, "receipt": "injected", "recovery_metadata": null, "runtime_checkpoint": null, "expected": "obligation still visible or explicit recovery offered after process dies before dequeue"}
+REPLACED_GENERATION {"old_generation": "498a313e2ab64e69b6eecd10a7119bfc", "new_generation": "eb8a5030a6654d5e879645358e08b9a1", "queued": 1, "message_generation_before_processing": null, "planner_calls": 1, "saw_new_intent": true, "saw_old_report": false, "contexts": [{"source_workflow": "wf-root", "generation": "eb8a5030a6654d5e879645358e08b9a1", "original_user_text": null}], "receipt": "injected", "expected": "orphaned receipt and no planner call in replacement generation"}
+REVOKED_AFTER_INJECT {"grant": false, "user_calls": 1, "queued": 1, "extra_planner_calls": 1, "contexts": [{"source_workflow": null, "generation": "1a81b82fb6e84f4aa2418627190a0669", "original_user_text": "NEW UNRELATED INTENT"}, {"source_workflow": "wf-root", "generation": "1a81b82fb6e84f4aa2418627190a0669", "original_user_text": null}], "receipt": "injected", "expected": "new real user turn revokes old wake; zero extra planner calls"}
+ACTIVE_RESULT {"planner_calls": 2, "first_saw_report": false, "second_saw_report": false, "second_saw_wake": true, "second_context": {"source_workflow": null, "generation": "7a1fc47887df49c88f074a5e52d5e3da", "original_user_text": "research then write"}, "history_report_count": 1, "due": [], "receipt": "injected", "expected": "followup sees actual report under original workflow and report remains in history"}
+INJECTED_USER_REVOCATION {"planner_calls": 2, "second_saw_new_intent": true, "old_workflow_grant": true, "late_receive": "received", "late_apply": "injected", "wake_due": 1, "expected": "every accepted genuine new user input revokes old workflow, late result card_only"}
+HAPPY_PATH {"planner_calls": 1, "source_workflow": {"source_workflow": "wf-root", "generation": "81a284030c4149f19f51a70028202e11", "original_user_text": null}, "non_authority_envelope": true, "receipt": "injected"}
+CLOSURES {"continued_root": "wf-root", "incapable": {}, "late_http": 200, "late": {"delivery_id": "del-late", "state": "card_only", "received_at": "2026-11-10T04:29:11.141503+00:00"}, "rebind_http": 409, "rebind": {"code": "delivery_conflict", "message": "This capability already delivered a different task/run; a new task requires a fresh capability."}}
+MALFORMED_REVISION {"http": 500, "content_type": "text/plain", "body": "500 Internal Server Error\n\nServer got itself in trouble", "expected": "structured 400 invalid_field"}
