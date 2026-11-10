@@ -57,7 +57,7 @@ asserts the marker is gone; it fails on the pre-fix code and passes now.
 pytest nanobot-teams/tests -q                              280 passed
 pytest tests/runs tests/session \
        tests/tools/test_mcp_teams_meta.py \
-       tests/test_openai_api.py -q                        372 passed, 3 skipped
+       tests/test_openai_api.py -q                        371 passed, 3 skipped
 pytest tests/agent/test_loop_save_turn.py \
        tests/agent/test_auto_compact.py -q                141 passed
 bun run test src/tests/teams-workbench.test.tsx \
@@ -66,6 +66,11 @@ bun run test src/tests/teams-workbench.test.tsx \
 bun run typecheck                                          clean
 ruff check <changed Python files>                          all checks passed
 ```
+
+The full `tests/agent` directory also runs: 2160 passed, 10 failed. All ten
+failures are in `test_mcp_connection.py` and `test_mcp_transient_retry.py`, where
+the test fake rejects the installed client's `meta` kwarg; they fail the same
+way on the pre-fix tree and this change does not touch MCP.
 
 Round-4 probes rerun on the fixed head: `coordinator/probe_head.py` in all
 five modes, `runs/probe_cleanup_overlap.py resistant` and `deadline`,
