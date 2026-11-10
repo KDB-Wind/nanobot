@@ -74,9 +74,11 @@ async def test_hard_kill_recovery(tmp_path, mode):
         if child.poll() is None:  # pragma: no cover - safety net
             child.kill()
 
-    # A new process owns the same store and runs startup recovery.
+    # A new process owns the same store and runs startup recovery. The bounded
+    # wait absorbs the moment Windows takes to release the killed process's
+    # byte-range lock (the same semantics serve uses).
     store = RunStore(db_path)
-    store.open()
+    store.open(lock_wait_s=10.0)
     executor = RecordingExecutor()
     service = RunService(store, executor)
     interrupted = service._store.recover()
@@ -94,19 +96,33 @@ async def test_hard_kill_recovery(tmp_path, mode):
         await service.start()
         assert victim_run_id not in executor.calls
     else:
-        # queued: the queued run was never started; recovery must let it run.
+        # queued: the queued run was never started. Recovery interrupts the
+        # hold run that was active at kill time and isolates the instance, so
+        # the queued run must wait for an operator, not resume by itself.
         victim = store.get(victim_run_id)
         assert victim is not None
         assert victim.state is RunState.QUEUED or victim.state is RunState.SUCCEEDED
         await service.start()
+        isolated, reason = store.isolation()
+        assert isolated, "recovery must isolate after interrupting active runs"
+        deadline_hit = 0.0
+        while victim_run_id not in executor.calls and deadline_hit < 1.0:
+            await _sleep()
+            deadline_hit += 0.05
+        assert victim_run_id not in executor.calls, (
+            "queued work must not start while the instance is isolated"
+        )
+        # The hold run that was executing at kill time is interrupted, not re-run.
+        hold_rows = [r for r in store.list_state(RunState.INTERRUPTED, limit=10)]
+        assert hold_rows, "the hold run active at kill time must be interrupted"
+        store.clear_isolation(actor="operator", reason="effects reviewed")
         deadline_hit = 0.0
         while victim_run_id not in executor.calls and deadline_hit < 10.0:
             await _sleep()
             deadline_hit += 0.05
-        assert victim_run_id in executor.calls, "queued run must resume after recovery"
-        # The hold run that was executing at kill time is interrupted, not re-run.
-        hold_rows = [r for r in store.list_state(RunState.INTERRUPTED, limit=10)]
-        assert hold_rows, "the hold run active at kill time must be interrupted"
+        assert victim_run_id in executor.calls, (
+            "queued run resumes after the operator clears isolation"
+        )
     await service.aclose()
     store.close()
 

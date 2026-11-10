@@ -419,7 +419,10 @@ def serve(
         from nanobot.runs.store import RunStore
 
         runs_store = RunStore(get_runtime_subdir("runs") / "runs.sqlite3")
-        runs_store.open()
+        # Bounded wait: a hard-killed predecessor's OS lock may clear a moment
+        # after death. Failing here happens before any port bind or recovery,
+        # so a competing serve can never disturb existing runs.
+        runs_store.open(lock_wait_s=10.0)
         runs_service = RunService(
             runs_store,
             AgentLoopRunExecutor(agent_loop),

@@ -533,6 +533,38 @@ def build_app(
             status=201,
         )
 
+    async def caller_quota_route(request: web.Request) -> web.Response:
+        denied = require_role(request, ("operator",))
+        if denied is not None:
+            return denied
+        quota = store.caller_quota(request.match_info["caller"])
+        if quota is None:
+            return api_error(404, "quota_not_found", "No imported usage for that caller.")
+        return _json_response(quota)
+
+    async def confirm_caller_quota(request: web.Request) -> web.Response:
+        """Operator confirmation that unlocks admissions for a migrated caller."""
+        denied = require_role(request, ("operator",))
+        if denied is not None:
+            return denied
+        try:
+            body = await request.json()
+        except ValueError:
+            return api_error(400, "invalid_json", "A JSON body is required.")
+        actor = request[_ROLE_KEY]
+        try:
+            confirmed = store.confirm_caller_quota(
+                request.match_info["caller"],
+                delegations_limit=int(body.get("delegations", 0)),
+                result_bytes_limit=int(body.get("result_bytes", 0)),
+                actor=actor,
+            )
+        except AdmissionError as exc:
+            return api_error(422, exc.code, exc.detail)
+        if not confirmed:
+            return api_error(404, "quota_not_found", "No imported usage for that caller.")
+        return _json_response({"confirmed": True})
+
     app.router.add_get("/v1/teams/capabilities", capabilities)
     app.router.add_post("/v1/teams/tasks", create_task)
     app.router.add_get("/v1/teams/tasks", list_tasks)
@@ -546,6 +578,8 @@ def build_app(
     app.router.add_post("/v1/teams/bots/scaffold", scaffold_bot)
     app.router.add_post("/v1/teams/bots", upsert_bot)
     app.router.add_get("/v1/teams/bots", list_bots_route)
+    app.router.add_get("/v1/teams/quota/{caller}", caller_quota_route)
+    app.router.add_post("/v1/teams/quota/{caller}/confirm", confirm_caller_quota)
     return app
 
 

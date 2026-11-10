@@ -2,6 +2,10 @@
 
 日期:2026-11-09。执行分支 `feat/nanobot-teams-mvp`。本文是唯一进度清单,续跑先读本文与 `git diff`,再读 `.audit/async-workbench-decisions.tsv`。
 
+## -1. 撤回声明(R0,2026-11-09)
+
+**本文件此前 §7 的"Q1–Q3 全部 verified / 目标完成"结论自本声明起撤回。** 独立 GPT 家族审核([ASYNC_WORKBENCH_REVIEW.md](ASYNC_WORKBENCH_REVIEW.md))在 HEAD `2e9c28cf4` 用真实反例复现了 16 项 P1(F01–F16)与 12 项次级(S01–S12)缺陷,核心包括:真实 stdio MCP 丢失回传 meta(F01)、Planner 从未被唤醒(F02)、已确认取消仍派发(F03)、stop_confirmed 假阳性(F04)、无单 writer 锁(F05)、隔离不贯穿恢复/准入(F06)、结果一次性读取后永久丢失(F07)、无公开结果读取入口(F08)、工作台重试破坏幂等(F09)等。原 A25"13/13 live 全链"证据不足(脚本未启动 Planner)。本节保留原始记录;阶段表已按当前真实行为回退为 blocked,完成状态须按修复顺序 R1–R5([ASYNC_WORKBENCH_REVIEW.md §6](ASYNC_WORKBENCH_REVIEW.md))重建后才能重新声明。反例脚本在 `review/async-20261109/`,修复前先复跑确认失败、修复后转为回归断言。
+
 ## 0. 退出谓词(完成条件,可核验)
 
 全部满足才算完成,任何一项缺失不得宣布完成:
@@ -32,10 +36,10 @@
 | P4 可信回传 + 续接 | verified | §4 P4:inbox 领域 4 + P4 链路 3 + Teams 210/parent 99 全绿 | A09 wrapper 单测、A10 进程级交错、A12 → Q1/Q2/P5/P7 | P5 |
 | P5 WebUI 工作台 | in_progress | §4 P5:后端提交 ffca428ff;前端组件 5 测试过 + 五门禁过 | 全量 vitest/browser 运行中;真实网关浏览器验收在 P7 | 等待套件结果
 | P6 cron 定时任务 | verified | §4 P6:teams_task kind + 确定性提交键(3 tests)+ 回归 312 绿 | 真实 cron 触发链路(A24)在 P7 live | P7 |
-| P7 真实验收/迁移/交付 | verified | §4 P7 + §7 完成报告 | - | - |
+| P7 真实验收/迁移/交付 | blocked | §4 P7 + §7(完成结论已被 §-1 撤回,审核不通过) | REVIEW F01–F16 | R1–R5 |
 | Q1 独立审核 | verified | §7 Q1:两个新上下文只读审核(状态与安全/HTTP 与 worker),8 blocking+minors | - | Q2(已完成) |
-| Q2 缺陷修复与故障验证 | verified | §7 Q2:13 个缺陷全修+回归锁定;offline 9/9、live 13/13 复跑 | - | Q3 |
-| Q3 最终交付核对 | verified | §7 Q3 门禁快照 | - | - |
+| Q2 缺陷修复与故障验证 | blocked | §7 Q2 记录保留;GPT 复审发现 16 P1,结论不通过 | REVIEW F01–F16 | R1–R4 |
+| Q3 最终交付核对 | blocked | §7 Q3 门禁快照保留;完成声明被撤回 | REVIEW §5 证据偏差 | R5 |
 
 状态取值:pending / in_progress / verified / blocked。
 

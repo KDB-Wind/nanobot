@@ -429,6 +429,13 @@ class RunService:
             self._store.set_isolation(
                 f"Run {run_id} stopped with unconfirmed background effects."
             )
+        elif not result.stop_confirmed:
+            # The executor could not prove the run's background work stopped;
+            # the slot must not be treated as clean until an operator checks.
+            self._store.set_isolation(
+                f"Run {run_id} finished without a confirmed stop of its "
+                "background work."
+            )
         if result.code is OutcomeCode.SUCCEEDED:
             text, truncated, original_bytes = truncate_text(result.text, RESULT_MAX_BYTES)
             outcome = RunOutcome(
@@ -471,7 +478,7 @@ class RunService:
                 current.state,
                 new_state,
                 outcome=outcome,
-                stop_confirmed=True,
+                stop_confirmed=result.stop_confirmed,
                 effects_uncertain=result.effects_uncertain or None,
             )
         except StateTransitionError:

@@ -75,6 +75,32 @@ class CoordinatorService:
 
     # ---- 0.4 migration import ----
 
+    @staticmethod
+    def _normalize_endpoint(endpoint: str) -> str:
+        """Canonical form for matching legacy 0.4 endpoints to registered bots."""
+        from urllib.parse import urlsplit
+
+        raw = endpoint.strip()
+        if not raw:
+            return ""
+        if "://" not in raw:
+            raw = f"http://{raw}"
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+        path = parts.path.rstrip("/")
+        return f"{host}:{port}{path}" if port else f"{host}{path}"
+
+    def _instance_for_endpoint(self, endpoint: str) -> str | None:
+        """Map a legacy endpoint to a registered bot's instance identity."""
+        normalized = self._normalize_endpoint(endpoint)
+        if not normalized:
+            return None
+        for bot in self.store.list_bots():
+            if bot.instance_id and self._normalize_endpoint(bot.endpoint) == normalized:
+                return bot.instance_id
+        return None
+
     def import_04_ledger(
         self,
         *,
@@ -85,9 +111,12 @@ class CoordinatorService:
     ) -> dict[str, Any]:
         """Idempotent one-shot import of a 0.4 teams.json + ledger.
 
-        Preserves caller usage counters, unknown isolation, and budget caps.
-        Never releases unknown reservations; re-importing the same fingerprint
-        is a no-op.
+        Preserves caller usage as an enforced admission guard, isolates unknown
+        outcomes on the registered instance the endpoint maps to (falling back
+        to a legacy key when no bot matches), and never releases unknown
+        reservations. Re-importing the same fingerprint is a no-op. New
+        admissions for the caller stay blocked until an operator confirms fresh
+        quota via ``confirm_caller_quota``.
         """
         from ..ledger import Ledger, LedgerError
 
@@ -125,15 +154,40 @@ class CoordinatorService:
                     )
                 if record.status in ("outcome_unknown", "timed_out") or record.blocked:
                     endpoint = record.endpoint or "unknown-endpoint"
-                    self.store.quarantine_instance(
-                        f"legacy:{endpoint}",
-                        f"0.4 unknown outcome for task {record.task_id}; verify before reuse",
-                    )
+                    instance = self._instance_for_endpoint(endpoint)
+                    if instance is not None:
+                        # The unknown maps to a live registered instance: its
+                        # admission and dispatch guard must actually engage.
+                        self.store.quarantine_instance(
+                            instance,
+                            f"0.4 unknown outcome for task {record.task_id} on "
+                            f"{endpoint}; verify before reuse",
+                        )
+                    else:
+                        self.store.quarantine_instance(
+                            f"legacy:{endpoint}",
+                            f"0.4 unknown outcome for task {record.task_id}; verify "
+                            "before reuse",
+                        )
                     imported["unknown_isolated"] += 1
         finally:
             ledger.close()
+        if imported["usage_delegations"] or imported["usage_result_bytes"]:
+            self.store.record_caller_usage(
+                caller_id,
+                delegations_used=imported["usage_delegations"],
+                result_bytes_used=imported["usage_result_bytes"],
+            )
         if declared_budgets:
             imported["budgets"] = declared_budgets
+            budgets_for_caller = declared_budgets.get(caller_id)
+            if isinstance(budgets_for_caller, dict):
+                self.store.confirm_caller_quota(
+                    caller_id,
+                    delegations_limit=int(budgets_for_caller.get("delegations", 0)),
+                    result_bytes_limit=int(budgets_for_caller.get("result_bytes", 0)),
+                    actor="migration-import",
+                )
         details = {
             "caller": caller_id,
             "team": teams_config.get("team_id"),

@@ -18,6 +18,7 @@ log = logging.getLogger("nanobot_teams.coordinator.worker")
 
 BACKOFF_SECONDS = (1, 2, 4, 8, 16, 30)
 MAX_PARALLEL_BOTS = 4
+QUARANTINE_RECHECK_S = 30.0
 
 
 class MissingSecretError(Exception):
@@ -125,13 +126,33 @@ class DispatchWorker:
                 task.task_id, f"Coordinator secret missing: {exc}"
             )
             return True
+        # Isolation is re-checked at dispatch time, not only at admission: a
+        # task admitted before a quarantine must not create remote work now.
+        if bot.instance_id and bot.instance_id in self._store.active_quarantines():
+            self._store.defer_dispatch(
+                entry.entry_id,
+                utc_now() + timedelta(seconds=QUARANTINE_RECHECK_S),
+                "bot instance quarantined; dispatch deferred",
+            )
+            return True
+        # An unconfirmed cancel on a never-accepted task means a submit may
+        # have been lost in flight: reconcile by the original key first, and
+        # never create a new run after a cancel request.
+        if (
+            task.cancel_state.value == "unconfirmed"
+            and task.dispatch_state.value == "pending"
+            and task.remote_run_id is None
+        ):
+            await self._reconcile_cancelled_pending(client, task, entry)
+            return True
+        if task.cancel_state.value != "none" and task.dispatch_state.value == "pending":
+            # Cancel known-confirmed and outbox closed: nothing to dispatch.
+            return False
         now = utc_now()
         if task.deadline_at <= now and entry.attempts == 0:
             # Never sent and already past the business deadline: no new dispatch.
-            self._store.mark_dispatch_failure(
-                entry.entry_id,
-                error="deadline passed before first dispatch",
-                retry_at=now + timedelta(days=3650),
+            self._store.expire_task_before_dispatch(
+                task.task_id, "deadline passed before first dispatch"
             )
             return True
         body = {
@@ -185,13 +206,21 @@ class DispatchWorker:
             "idempotency_conflict",
             "operation_key_retired",
         ):
+            # The remote disagrees about this key: its storage state is not the
+            # coordinator's, so nothing new may run on that instance until an
+            # operator reconciles.
             self._store.mark_indeterminate(
                 task.task_id,
                 f"Remote rejected the operation key: {(response.payload or {}).get('code')}",
+                quarantine_instance=bot.instance_id,
             )
             return True
         if response.status == 410:
-            self._store.mark_indeterminate(task.task_id, "Remote storage lost the key.")
+            self._store.mark_indeterminate(
+                task.task_id,
+                "Remote storage lost the key.",
+                quarantine_instance=bot.instance_id,
+            )
             return True
         # 4xx/5xx: retryable classification is deferred; unknown delivery for 5xx.
         if response.status >= 500:
@@ -237,6 +266,50 @@ class DispatchWorker:
         jitter = random.uniform(0, delay * 0.25)
         self._store.bump_dispatch_attempt(
             entry.entry_id, utc_now() + timedelta(seconds=delay + jitter), reason
+        )
+
+    async def _reconcile_cancelled_pending(
+        self, client: BotRunClient, task, entry
+    ) -> None:
+        """Settle an unconfirmed cancel on a never-accepted task.
+
+        The lookup proves whether the lost submit created a run: found means the
+        cancel becomes a real remote cancel; not found means nothing was ever
+        created and the task closes as cancelled-before-dispatch.
+        """
+        try:
+            lookup = await client.lookup(task.operation_key)
+        except BotUnreachableError:
+            lookup = None
+        if lookup is not None and lookup.status == 200 and (lookup.payload or {}).get("run_id"):
+            payload = lookup.payload or {}
+            run_id = str(payload["run_id"])
+            instance = str(payload.get("instance_id", ""))
+            bot = self._store.get_bot(task.bot_id)
+            if bot is not None and bot.instance_id and instance and instance != bot.instance_id:
+                await self._indeterminate_identity(task, bot.instance_id, instance)
+                return
+            self._store.update_after_submit(
+                task.task_id, remote_run_id=run_id, remote_instance_id=instance
+            )
+            try:
+                await client.cancel(run_id)
+            except BotUnreachableError:
+                pass  # the accepted task's cancel path keeps driving the stop
+            return
+        if lookup is not None and lookup.status == 404:
+            # The remote definitively never saw this key: no work exists.
+            self._store.close_cancelled_unknown(
+                task.task_id, "reconciled: remote never created this run"
+            )
+            return
+        # Unknown transport: retry the same key on the normal backoff.
+        delay = BACKOFF_SECONDS[min(entry.attempts, len(BACKOFF_SECONDS) - 1)]
+        jitter = random.uniform(0, delay * 0.25)
+        self._store.bump_dispatch_attempt(
+            entry.entry_id,
+            utc_now() + timedelta(seconds=delay + jitter),
+            "cancel reconciliation pending",
         )
 
     async def _indeterminate_identity(self, task, expected: str, actual: str) -> None:
@@ -422,6 +495,14 @@ class DispatchWorker:
                 result_text=result_text,
                 result_truncated=None if result_text is None else False,
             )
+            # Unverified effects from the remote isolate the instance here, not
+            # only at admission: no new task may start on it until an operator
+            # resolves the quarantine.
+            if bool(payload.get("effects_uncertain", False)) and bot.instance_id:
+                self._store.quarantine_instance(
+                    bot.instance_id,
+                    f"Task {task.task_id} reported unconfirmed background effects.",
+                )
             progressed = True
             progressed |= await self._drive_cancel(task, client)
         return progressed
@@ -450,6 +531,16 @@ class DispatchWorker:
             instance = str(caps.payload.get("instance_id", ""))
             if bot.instance_id and instance and instance != bot.instance_id:
                 await self._indeterminate_identity(task, bot.instance_id, instance)
+                return
+            # Identity confirmed and the run is genuinely gone: the remote lost
+            # storage for an admitted run. The task becomes indeterminate and
+            # the instance quarantines; nothing else may run there until an
+            # operator reconciles.
+            self._store.mark_indeterminate(
+                task.task_id,
+                "Remote confirmed its identity but lost the run storage (404).",
+                quarantine_instance=bot.instance_id,
+            )
 
 
 def task_public_json(task) -> dict:

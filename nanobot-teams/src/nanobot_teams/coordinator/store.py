@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ..file_lock import FileLock
 from .models import (
+    TERMINAL_RUN_STATES,
     Bot,
     CancelState,
     DeliveryMode,
@@ -138,6 +139,17 @@ CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS caller_quotas (
+    caller_principal TEXT PRIMARY KEY,
+    delegations_used INTEGER NOT NULL DEFAULT 0,
+    delegations_limit INTEGER NOT NULL DEFAULT 0,
+    result_bytes_used INTEGER NOT NULL DEFAULT 0,
+    result_bytes_limit INTEGER NOT NULL DEFAULT 0,
+    imported_at TEXT NOT NULL,
+    confirmed INTEGER NOT NULL DEFAULT 0,
+    confirmed_by TEXT NOT NULL DEFAULT '',
+    confirmed_at TEXT
+);
 """
 
 TASK_COLUMNS = (
@@ -209,6 +221,15 @@ DEFAULT_QUOTAS = {
     "bot_queue": 16,
     "workflow_result_bytes": 640 * 1024,
 }
+
+# Every admitted-but-unsettled task reserves the run protocol's result cap; a
+# task that has not returned its body yet still owns that quota headroom.
+RESULT_RESERVATION_BYTES = 32 * 1024
+
+# Dispatch states that may still produce remote work: pending was never sent,
+# accepted has a live run, indeterminate means the remote state is unknown.
+_UNKNOWN_DISPATCH_STATES = "('pending','accepted','indeterminate')"
+_TERMINAL_RUN_STATES_SQL = "('succeeded','failed','cancelled','interrupted')"
 
 
 class CoordinatorStore:
@@ -485,33 +506,45 @@ class CoordinatorStore:
                 "SELECT COUNT(*) FROM tasks WHERE workflow_id=?", (workflow_id,)
             ).fetchone()[0]
         )
+        unknown_open = (
+            f"dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND run_state NOT IN "
+            f"{_TERMINAL_RUN_STATES_SQL}"
+        )
         principal_open = int(
             self._conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE caller_principal=? AND dispatch_state IN "
-                "('pending','accepted') AND run_state NOT IN "
-                "('succeeded','failed','cancelled','interrupted')",
+                f"SELECT COUNT(*) FROM tasks WHERE caller_principal=? AND {unknown_open}",
                 (caller_principal,),
             ).fetchone()[0]
         )
         global_open = int(
             self._conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE dispatch_state IN ('pending','accepted') "
-                "AND run_state NOT IN ('succeeded','failed','cancelled','interrupted')"
+                f"SELECT COUNT(*) FROM tasks WHERE {unknown_open}"
             ).fetchone()[0]
         )
+        # Queue quotas attach to the instance identity, not the bot row: alias
+        # endpoints registered against the same instance share one queue.
+        bot_row = self._conn.execute(
+            "SELECT instance_id FROM bots WHERE bot_id=?", (bot_id,)
+        ).fetchone()
+        queue_key = (bot_row[0] if bot_row and bot_row[0] else bot_id) if bot_row else bot_id
         bot_queue = int(
             self._conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE bot_id=? AND dispatch_state IN "
-                "('pending','accepted') AND run_state NOT IN "
-                "('succeeded','failed','cancelled','interrupted')",
-                (bot_id,),
+                "SELECT COUNT(*) FROM tasks JOIN bots ON bots.bot_id=tasks.bot_id "
+                "WHERE COALESCE(bots.instance_id, bots.bot_id)=? AND "
+                f"tasks.dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND tasks.run_state "
+                f"NOT IN {_TERMINAL_RUN_STATES_SQL}",
+                (queue_key,),
             ).fetchone()[0]
         )
+        # Admission reserves the protocol result cap per unsettled task; only a
+        # terminal task's actual stored body replaces its reservation.
         workflow_result_bytes = int(
             self._conn.execute(
-                "SELECT COALESCE(SUM(LENGTH(CAST(result_text AS BLOB))),0) FROM tasks "
+                "SELECT COALESCE(SUM(CASE WHEN dispatch_state IN "
+                f"{_UNKNOWN_DISPATCH_STATES} AND run_state NOT IN {_TERMINAL_RUN_STATES_SQL} "
+                "THEN ? ELSE LENGTH(CAST(result_text AS BLOB)) END),0) FROM tasks "
                 "WHERE workflow_id=?",
-                (workflow_id,),
+                (RESULT_RESERVATION_BYTES, workflow_id),
             ).fetchone()[0]
         )
         return {
@@ -585,6 +618,31 @@ class CoordinatorStore:
                     "bot_quarantined",
                     f"The bot instance is quarantined: {quarantines[bot.instance_id].reason}",
                 )
+            # Imported 0.4 usage is a real guard: a migrated caller cannot admit
+            # new work until an operator confirms fresh quota for it.
+            quota_row = self._conn.execute(
+                "SELECT delegations_used, delegations_limit, imported_at, confirmed "
+                "FROM caller_quotas WHERE caller_principal=?",
+                (caller_principal,),
+            ).fetchone()
+            if quota_row is not None:
+                if not quota_row[3]:
+                    raise AdmissionError(
+                        "migrated_quota_unconfirmed",
+                        "Caller usage was imported from 0.4; an operator must confirm "
+                        "fresh quota before new tasks are admitted.",
+                    )
+                admitted_since = int(
+                    self._conn.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE caller_principal=? AND created_at>=?",
+                        (caller_principal, quota_row[2]),
+                    ).fetchone()[0]
+                )
+                if quota_row[0] + admitted_since >= quota_row[1]:
+                    raise AdmissionError(
+                        "migrated_quota_exhausted",
+                        "The confirmed delegation budget for this caller is exhausted.",
+                    )
             snapshot = self.quota_snapshot(
                 workflow_id=workflow_id,
                 caller_principal=caller_principal,
@@ -718,23 +776,6 @@ class CoordinatorStore:
                 (error, iso(retry_at) if retry_at else None, attempts, task_id),
             )
 
-    def mark_indeterminate(self, task_id: str, reason: str) -> Task:
-        with self._transaction():
-            assert self._conn is not None
-            self._conn.execute(
-                "UPDATE tasks SET dispatch_state=?, last_error=? WHERE task_id=?",
-                (DispatchState.INDETERMINATE.value, reason, task_id),
-            )
-            # An indeterminate task never dispatches again; the operator owns
-            # any manual retry decision.
-            self._conn.execute(
-                "UPDATE dispatch_outbox SET state='failed', last_error=? WHERE task_id=? "
-                "AND state='pending'",
-                (reason, task_id),
-            )
-            self._emit("task_indeterminate", task_id, {"reason": reason})
-            return self._load_task(task_id)
-
     def record_observation(
         self,
         task_id: str,
@@ -806,26 +847,177 @@ class CoordinatorStore:
             self._emit(event, task_id, {"run_state": run_state, "revision": str(revision)})
             return self._load_task(task_id)
 
+    def dispatch_entry_for_task(self, task_id: str) -> DispatchEntry | None:
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT entry_id, task_id, state, attempts, next_attempt_at, last_error FROM "
+            "dispatch_outbox WHERE task_id=? ORDER BY entry_id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return DispatchEntry(
+            entry_id=int(row[0]), task_id=row[1], state=row[2], attempts=int(row[3]),
+            next_attempt_at=datetime.fromisoformat(row[4]), last_error=row[5],
+        )
+
     def request_cancel(self, task_id: str) -> Task | None:
         with self._transaction():
             assert self._conn is not None
             row = self._conn.execute(
-                "SELECT dispatch_state, cancel_state FROM tasks WHERE task_id=?", (task_id,)
+                "SELECT dispatch_state, cancel_state, run_state FROM tasks WHERE task_id=?",
+                (task_id,),
             ).fetchone()
             if row is None:
                 return None
-            dispatch, cancel = row
+            dispatch, cancel, run_state = row
             if cancel != CancelState.NONE.value:
                 return self._load_task(task_id)
-            new_cancel = (
-                CancelState.REQUESTED.value
-                if dispatch == DispatchState.ACCEPTED.value
-                else CancelState.CONFIRMED.value
-            )
+            if run_state in TERMINAL_RUN_STATES:
+                # Terminal observation already settles the cancel; only the
+                # state name is unified here.
+                self._conn.execute(
+                    "UPDATE tasks SET cancel_state=? WHERE task_id=?",
+                    (CancelState.CONFIRMED.value, task_id),
+                )
+                self._emit("task_cancel_requested", task_id, {})
+                return self._load_task(task_id)
+            if dispatch == DispatchState.ACCEPTED.value:
+                new_cancel = CancelState.REQUESTED.value
+            elif dispatch == DispatchState.REJECTED.value:
+                # Deterministic refusal: the remote never created work.
+                new_cancel = CancelState.CONFIRMED.value
+                self._conn.execute(
+                    "UPDATE dispatch_outbox SET state='failed', last_error=? "
+                    "WHERE task_id=? AND state='pending'",
+                    ("cancelled before dispatch", task_id),
+                )
+            elif dispatch == DispatchState.INDETERMINATE.value:
+                # The remote state is unknown; a submit may or may not exist.
+                # Reconciliation decides; nothing new may be submitted.
+                new_cancel = CancelState.UNCONFIRMED.value
+            else:
+                entry = self._conn.execute(
+                    "SELECT attempts FROM dispatch_outbox WHERE task_id=? AND "
+                    "state='pending' ORDER BY entry_id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if entry is not None and int(entry[0]) == 0:
+                    # Definitely never sent: close the task and its outbox in
+                    # this same transaction instead of confirming a phantom.
+                    self._conn.execute(
+                        "UPDATE tasks SET cancel_state=?, run_state='cancelled', "
+                        "outcome_code='cancelled', outcome_message='Cancelled before "
+                        "dispatch.', stop_confirmed=1, finished_at=? WHERE task_id=?",
+                        (
+                            CancelState.CONFIRMED.value,
+                            iso(utc_now()),
+                            task_id,
+                        ),
+                    )
+                    self._conn.execute(
+                        "UPDATE dispatch_outbox SET state='failed', last_error=? "
+                        "WHERE task_id=? AND state='pending'",
+                        ("cancelled before dispatch", task_id),
+                    )
+                    self._emit("task_cancelled_before_dispatch", task_id, {})
+                    return self._load_task(task_id)
+                # Attempts > 0: the submit may have reached the remote; keep the
+                # unknown until the dispatch worker reconciles by the key.
+                new_cancel = CancelState.UNCONFIRMED.value
             self._conn.execute(
                 "UPDATE tasks SET cancel_state=? WHERE task_id=?", (new_cancel, task_id)
             )
             self._emit("task_cancel_requested", task_id, {})
+            return self._load_task(task_id)
+
+    def expire_task_before_dispatch(self, task_id: str, reason: str) -> Task:
+        """Atomically end a task whose deadline passed before its first dispatch."""
+        with self._transaction():
+            assert self._conn is not None
+            self._conn.execute(
+                "UPDATE tasks SET dispatch_state='rejected', run_state='failed', "
+                "outcome_code='deadline_before_start', outcome_message=?, finished_at=? "
+                "WHERE task_id=? AND dispatch_state='pending'",
+                (reason, iso(utc_now()), task_id),
+            )
+            self._conn.execute(
+                "UPDATE dispatch_outbox SET state='failed', last_error=? WHERE task_id=? "
+                "AND state='pending'",
+                (reason, task_id),
+            )
+            self._emit("task_expired_before_dispatch", task_id, {"reason": reason})
+            return self._load_task(task_id)
+
+    def close_cancelled_unknown(self, task_id: str, reason: str) -> Task | None:
+        """Finish a never-created task whose unconfirmed cancel reconciled to nothing.
+
+        The dispatch worker calls this after a lookup by the original key proves
+        no remote run exists: no work was ever created, so the cancel confirms.
+        """
+        with self._transaction():
+            assert self._conn is not None
+            row = self._conn.execute(
+                "SELECT dispatch_state, run_state, remote_run_id FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row[0] != DispatchState.PENDING.value or row[2] is not None:
+                # An accepted or bound task owns remote work; cancel stays
+                # unconfirmed and the normal cancel path handles it.
+                return self._load_task(task_id)
+            self._conn.execute(
+                "UPDATE tasks SET cancel_state=?, run_state='cancelled', "
+                "outcome_code='cancelled', outcome_message=?, stop_confirmed=1, "
+                "dispatch_state='rejected', finished_at=? WHERE task_id=?",
+                (CancelState.CONFIRMED.value, reason, iso(utc_now()), task_id),
+            )
+            self._conn.execute(
+                "UPDATE dispatch_outbox SET state='failed', last_error=? WHERE task_id=? "
+                "AND state='pending'",
+                (reason, task_id),
+            )
+            self._emit("task_cancelled_before_dispatch", task_id, {})
+            return self._load_task(task_id)
+
+    def defer_dispatch(self, entry_id: int, next_at: datetime, error: str) -> None:
+        """Push one outbox entry back without counting an attempt."""
+        with self._transaction():
+            assert self._conn is not None
+            self._conn.execute(
+                "UPDATE dispatch_outbox SET next_attempt_at=?, last_error=? WHERE entry_id=?",
+                (iso(next_at), error, entry_id),
+            )
+
+    def mark_indeterminate(
+        self, task_id: str, reason: str, *, quarantine_instance: str | None = None
+    ) -> Task:
+        with self._transaction():
+            assert self._conn is not None
+            self._conn.execute(
+                "UPDATE tasks SET dispatch_state=?, last_error=? WHERE task_id=?",
+                (DispatchState.INDETERMINATE.value, reason, task_id),
+            )
+            # An indeterminate task never dispatches again; the operator owns
+            # any manual retry decision.
+            self._conn.execute(
+                "UPDATE dispatch_outbox SET state='failed', last_error=? WHERE task_id=? "
+                "AND state='pending'",
+                (reason, task_id),
+            )
+            if quarantine_instance:
+                self._conn.execute(
+                    "INSERT INTO instance_quarantine(instance_id, reason, created_at) "
+                    "VALUES (?,?,?) ON CONFLICT(instance_id) DO UPDATE SET "
+                    "reason=excluded.reason",
+                    (quarantine_instance, reason, iso(utc_now())),
+                )
+                self._emit(
+                    "instance_quarantined", None,
+                    {"instance": quarantine_instance, "reason": reason},
+                )
+            self._emit("task_indeterminate", task_id, {"reason": reason})
             return self._load_task(task_id)
 
     def auto_resume_ready_tasks(self) -> list[Task]:
@@ -894,6 +1086,83 @@ class CoordinatorStore:
             "SELECT fingerprint FROM migration_records WHERE source=?", (source,)
         ).fetchall()
         return {r[0] for r in rows}
+
+    def record_caller_usage(
+        self, caller_principal: str, *, delegations_used: int, result_bytes_used: int
+    ) -> None:
+        """Persist imported 0.4 usage as an unconfirmed quota guard for the caller."""
+        with self._transaction():
+            assert self._conn is not None
+            self._conn.execute(
+                "INSERT INTO caller_quotas(caller_principal, delegations_used, "
+                "result_bytes_used, imported_at, confirmed) VALUES (?,?,?,?,0) "
+                "ON CONFLICT(caller_principal) DO UPDATE SET delegations_used=excluded."
+                "delegations_used, result_bytes_used=excluded.result_bytes_used, "
+                "confirmed=0, confirmed_by='', confirmed_at=NULL",
+                (
+                    caller_principal,
+                    delegations_used,
+                    result_bytes_used,
+                    iso(utc_now()),
+                ),
+            )
+            self._emit("caller_usage_imported", None, {"caller": caller_principal})
+
+    def confirm_caller_quota(
+        self,
+        caller_principal: str,
+        *,
+        delegations_limit: int,
+        result_bytes_limit: int,
+        actor: str,
+    ) -> bool:
+        """Operator confirmation that unlocks new admissions for a migrated caller.
+
+        Returns False when the caller has no imported usage record. Confirmation
+        sets the fresh limits; it does not erase the imported history.
+        """
+        if not actor.strip():
+            raise AdmissionError("confirm_requires_actor", "An actor is required.")
+        with self._transaction():
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                "UPDATE caller_quotas SET confirmed=1, delegations_limit=?, "
+                "result_bytes_limit=?, confirmed_by=?, confirmed_at=? "
+                "WHERE caller_principal=?",
+                (
+                    delegations_limit,
+                    result_bytes_limit,
+                    actor,
+                    iso(utc_now()),
+                    caller_principal,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return False
+            self._emit("caller_quota_confirmed", None, {"caller": caller_principal})
+            return True
+
+    def caller_quota(self, caller_principal: str) -> dict | None:
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT caller_principal, delegations_used, delegations_limit, "
+            "result_bytes_used, result_bytes_limit, imported_at, confirmed, "
+            "confirmed_by, confirmed_at FROM caller_quotas WHERE caller_principal=?",
+            (caller_principal,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "caller_principal": row[0],
+            "delegations_used": int(row[1]),
+            "delegations_limit": int(row[2]),
+            "result_bytes_used": int(row[3]),
+            "result_bytes_limit": int(row[4]),
+            "imported_at": row[5],
+            "confirmed": bool(row[6]),
+            "confirmed_by": row[7],
+            "confirmed_at": row[8],
+        }
 
 
 def _row_to_task(values: dict) -> Task:

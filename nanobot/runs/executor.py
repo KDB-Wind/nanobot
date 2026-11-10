@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 _STOP_REASON_TO_OUTCOME: dict[str, OutcomeCode] = {
     "completed": OutcomeCode.SUCCEEDED,
-    "empty_final_response": OutcomeCode.SUCCEEDED,
+    "empty_final_response": OutcomeCode.EXECUTION_ERROR,
     "error": OutcomeCode.PROVIDER_ERROR,
     "max_iterations": OutcomeCode.ITERATION_LIMIT,
 }
@@ -46,13 +46,26 @@ class AgentLoopRunExecutor:
         self._cancel_unverified = False
         return value
 
+    async def _reap_session_work(self, session_key: str) -> bool:
+        """Stop the run session's tools, subagents, and exec sessions.
+
+        Returns False when the cleanup could not be confirmed; the caller must
+        then report an unverified stop instead of a clean finish.
+        """
+        try:
+            await self._loop.cancel_session_work(session_key)
+        except Exception:
+            return False
+        return True
+
     async def execute(self, run: Run) -> ExecutionResult:
         capture = _RunOutcomeCaptureHook()
+        session_key = f"run:{run.run_id}"
         message: Any = None
         try:
             message = await self._loop.process_direct(
                 content=run.input_text,
-                session_key=f"run:{run.run_id}",
+                session_key=session_key,
                 channel="api",
                 chat_id=run.run_id,
                 hooks=[capture],
@@ -66,9 +79,7 @@ class AgentLoopRunExecutor:
             # Cancel the loop-owned work for this run's session before letting
             # the cancellation surface: stop confirmation needs the background
             # tools and exec sessions gone, not just this coroutine.
-            try:
-                await self._loop.cancel_session_work(f"run:{run.run_id}")
-            except Exception:
+            if not await self._reap_session_work(session_key):
                 # Background tool/exec cleanup could not be confirmed; the
                 # service must isolate the instance instead of trusting stop.
                 self._cancel_unverified = True
@@ -84,7 +95,19 @@ class AgentLoopRunExecutor:
         message_text = ""
         if code is not OutcomeCode.SUCCEEDED:
             message_text = (capture.error or stop_reason or "execution failed")[:512]
-        return ExecutionResult(code=code, text=text, message=message_text)
+        # Every terminal path reaps the session's background work before the
+        # result is recorded: success, provider error, iteration limit, and
+        # execution error all own tools and subprocesses they started.
+        result = ExecutionResult(code=code, text=text, message=message_text)
+        if not await self._reap_session_work(session_key):
+            result = ExecutionResult(
+                code=code,
+                text=text,
+                message=message_text or "background cleanup after the run was unconfirmed"[:512],
+                stop_confirmed=False,
+                effects_uncertain=True,
+            )
+        return result
 
 
 def _response_text(value: Any) -> str:

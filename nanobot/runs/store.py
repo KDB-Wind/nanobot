@@ -1,15 +1,19 @@
 """SQLite persistence for agent runs: idempotent admission, transitions, events, recovery.
 
-One store file belongs to one Nanobot instance (one writer process). Every state
-change and its event commit in a single ``BEGIN IMMEDIATE`` transaction.
+One store file belongs to one Nanobot instance (one writer process). A process
+exclusive writer lock on the control directory is part of :meth:`RunStore.open`,
+so a second service fails before it can read, recover, or mutate anything. Every
+state change and its event commit in a single ``BEGIN IMMEDIATE`` transaction.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -123,12 +127,62 @@ class StateTransitionError(StoreUnavailableError):
     code = "transition_conflict"
 
 
+class _WriterLock:
+    """Process exclusive ownership of one control database (non-blocking OS lock)."""
+
+    def __init__(self, path: Path) -> None:
+        self._fd: int | None = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if os.fstat(self._fd).st_size == 0:
+                os.write(self._fd, b"0")
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self._fd)
+            self._fd = None
+            raise
+
+    def close(self) -> None:
+        if getattr(self, "_fd", None) is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def __del__(self) -> None:
+        self.close()
+
+
 class RunStore:
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._conn: sqlite3.Connection | None = None
+        self._lock: _WriterLock | None = None
 
-    def open(self) -> None:
+    def open(self, *, lock_wait_s: float = 0.0) -> None:
+        """Acquire the writer lock before touching any state.
+
+        A second writer fails here, before it can read runs, recover crashes, or
+        mutate anything. ``lock_wait_s`` bounds the wait for a hard-killed
+        predecessor whose OS lock may clear a moment after death.
+        """
+        lock_path = Path(str(self._path) + ".writer.lock")
+        deadline = time.monotonic() + lock_wait_s
+        while True:
+            try:
+                self._lock = _WriterLock(lock_path)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise StoreUnavailableError(
+                        "Another writer process holds the runs control store."
+                    ) from None
+                time.sleep(0.25)
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(self._path, isolation_level=None, timeout=5.0)
@@ -144,6 +198,9 @@ class RunStore:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+        if self._lock is not None:
+            self._lock.close()
+            self._lock = None
 
     @contextmanager
     def _transaction(self):
@@ -210,11 +267,15 @@ class RunStore:
     def _write_meta(self, key: str, value: str) -> None:
         assert self._conn is not None
         with self._transaction():
-            self._conn.execute(
-                "INSERT INTO instance_meta(key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, value),
-            )
+            self._write_meta_locked(key, value)
+
+    def _write_meta_locked(self, key: str, value: str) -> None:
+        assert self._conn is not None
+        self._conn.execute(
+            "INSERT INTO instance_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
 
     def submit(
         self,
@@ -464,7 +525,12 @@ class RunStore:
         return None if row is None else int(row[0])
 
     def recover(self, now: datetime | None = None) -> list[Run]:
-        """Mark crashed active runs as interrupted; expired queued runs fail."""
+        """Mark crashed active runs as interrupted; expired queued runs fail.
+
+        Interrupting active runs means their background effects are unverified,
+        so the instance isolates itself in the same transaction: no queued work
+        may start until an operator clears the isolation.
+        """
         moment = now or utc_now()
         changed: list[Run] = []
         with self._transaction():
@@ -489,6 +555,20 @@ class RunStore:
                     instance, run_id, "run_interrupted", rfc3339(moment), {}
                 )
                 changed.append(self._load_run(run_id))
+            if changed:
+                self._write_meta_locked(
+                    "isolation",
+                    json.dumps(
+                        {
+                            "isolated": True,
+                            "reason": (
+                                f"Restart interrupted {len(changed)} active run(s); "
+                                "their background effects are unverified."
+                            ),
+                            "at": rfc3339(moment),
+                        }
+                    ),
+                )
             self._expire_queued_locked(moment)
         return changed
 
@@ -542,8 +622,19 @@ class RunStore:
         ).fetchone()
         return int(row[0])
 
+    # Unverified outcome rows never age out: their input, partial body, and
+    # events are the evidence an operator needs before clearing isolation.
+    _UNCONFIRMED_GUARD = (
+        "effects_uncertain=0 AND NOT (state IN ('cancelled','interrupted') "
+        "AND stop_confirmed=0)"
+    )
+
     def cleanup(self, now: datetime | None = None) -> dict[str, int]:
-        """Apply retention: bodies 14d, events 30d, run rows 90d with tombstones."""
+        """Apply retention: bodies 14d, events 30d, run rows 90d with tombstones.
+
+        Runs whose stop was never confirmed or whose effects stayed uncertain
+        are retained regardless of age.
+        """
         moment = now or utc_now()
         counts = {"result_bodies": 0, "events": 0, "runs": 0}
         with self._transaction():
@@ -551,7 +642,7 @@ class RunStore:
             body_cutoff = rfc3339(moment - timedelta(days=RESULT_RETENTION_DAYS))
             rows = self._conn.execute(
                 "SELECT run_id FROM runs WHERE result_cleaned_at IS NULL AND finished_at IS NOT NULL "
-                "AND finished_at < ?",
+                f"AND finished_at < ? AND {self._UNCONFIRMED_GUARD}",
                 (body_cutoff,),
             ).fetchall()
             for (run_id,) in rows:
@@ -581,7 +672,8 @@ class RunStore:
                 )
             meta_cutoff = rfc3339(moment - timedelta(days=METADATA_RETENTION_DAYS))
             stale = self._conn.execute(
-                "SELECT run_id, state FROM runs WHERE finished_at IS NOT NULL AND finished_at < ?",
+                "SELECT run_id, state FROM runs WHERE finished_at IS NOT NULL AND finished_at < ? "
+                f"AND {self._UNCONFIRMED_GUARD}",
                 (meta_cutoff,),
             ).fetchall()
             instance = self.instance_id_ro()
