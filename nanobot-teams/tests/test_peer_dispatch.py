@@ -9,15 +9,14 @@ from __future__ import annotations
 
 import uuid
 
-
 import pytest
 
 from nanobot_teams.coordinator.models import Bot, DeliveryMode
 from nanobot_teams.coordinator.store import (
-    AdmissionError,
-    CoordinatorStore,
     PEER_MAX_HOPS,
     PEER_PAIR_WINDOW_MESSAGES,
+    AdmissionError,
+    CoordinatorStore,
 )
 
 pytest_plugins = ("pytest_asyncio",)
