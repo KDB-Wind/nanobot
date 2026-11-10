@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 from nanobot.agent.stop_report import SessionStopReport
-from nanobot.runs.executor import AgentLoopRunExecutor
+from nanobot.runs.executor import AgentLoopRunExecutor, RunCancelled
 from nanobot.runs.types import OutcomeCode, Run, RunState, utc_now
 
 
@@ -136,10 +136,10 @@ async def test_cancellation_terminates_session_work_and_reraises():
     task = asyncio.create_task(executor.execute(make_run()))
     await asyncio.wait_for(loop.entered.wait(), timeout=1)
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(RunCancelled) as caught:
         await task
     assert loop.cancelled_sessions == ["run:run_x"]
-    assert executor.consume_cancel_unverified() is False
+    assert caught.value.stop_confirmed is True
 
 
 async def test_live_work_in_stop_report_downgrades_a_clean_finish():
@@ -162,7 +162,7 @@ async def test_exception_path_reaps_and_reports_the_live_state():
     assert result.effects_uncertain is True
 
 
-async def test_cancelled_run_sets_unverified_flag_from_the_report():
+async def test_cancelled_run_reports_unconfirmed_when_work_remains():
     """N06: a bounded wait that left work alive is an unverified stop."""
 
     class CancellingLoop(StubLoop):
@@ -175,7 +175,6 @@ async def test_cancelled_run_sets_unverified_flag_from_the_report():
     task = asyncio.create_task(executor.execute(make_run()))
     await asyncio.wait_for(loop.entered.wait(), timeout=1)
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(RunCancelled) as caught:
         await task
-    assert executor.consume_cancel_unverified() is True
-    assert executor.consume_cancel_unverified() is False, "the flag is one-shot"
+    assert caught.value.stop_confirmed is False

@@ -33,18 +33,23 @@ class _RunOutcomeCaptureHook(AgentHook):
         self.error = context.error
 
 
+class RunCancelled(asyncio.CancelledError):
+    """A cancelled execution carrying its own cleanup conclusion.
+
+    The conclusion belongs to the coroutine that observed it, so overlapping
+    cancellations cannot overwrite each other's stop evidence.
+    """
+
+    def __init__(self, *, stop_confirmed: bool) -> None:
+        super().__init__()
+        self.stop_confirmed = stop_confirmed
+
+
 class AgentLoopRunExecutor:
     """Execute one run in its own isolated ephemeral session on the bot's loop."""
 
     def __init__(self, loop: "AgentLoop") -> None:
         self._loop = loop
-        self._cancel_unverified = False
-
-    def consume_cancel_unverified(self) -> bool:
-        """One-shot flag: the last cancellation could not confirm cleanup."""
-        value = self._cancel_unverified
-        self._cancel_unverified = False
-        return value
 
     async def _reap_session_work(self, session_key: str) -> bool:
         """Stop the run session's tools, subagents, and exec sessions.
@@ -77,13 +82,15 @@ class AgentLoopRunExecutor:
         except asyncio.CancelledError:
             # Cancel the loop-owned work for this run's session before letting
             # the cancellation surface: stop confirmation needs the background
-            # tools and exec sessions gone, not just this coroutine. Set the
-            # conservative fact before the await: a second cancel can end this
-            # task here, and the flag must already say the cleanup is unproven.
-            self._cancel_unverified = True
-            if await self._reap_session_work(session_key):
-                self._cancel_unverified = False
-            raise
+            # tools and exec sessions gone, not just this coroutine. The
+            # conclusion stays conservative until the reap proves otherwise, and
+            # a second cancel raises this same typed result as unconfirmed.
+            stop_confirmed = False
+            try:
+                if await self._reap_session_work(session_key):
+                    stop_confirmed = True
+            finally:
+                raise RunCancelled(stop_confirmed=stop_confirmed) from None
         except Exception as exc:
             # The loop may have started tools or subprocesses before failing;
             # the reap below owns them like every other exit path.
@@ -105,8 +112,7 @@ class AgentLoopRunExecutor:
         try:
             stopped = await self._reap_session_work(session_key)
         except asyncio.CancelledError:
-            self._cancel_unverified = True
-            raise
+            raise RunCancelled(stop_confirmed=False) from None
         if not stopped:
             result = ExecutionResult(
                 code=result.code,

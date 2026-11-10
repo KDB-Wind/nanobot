@@ -8,6 +8,7 @@ from datetime import timedelta
 
 import pytest
 
+from nanobot.runs.executor import RunCancelled
 from nanobot.runs.service import (
     EventCursorExpiredError,
     IdempotencyConflictError,
@@ -57,7 +58,7 @@ class FakeExecutor:
             await self.gate.wait()
         except asyncio.CancelledError:
             if not self.resist_cancel:
-                raise
+                raise RunCancelled(stop_confirmed=True) from None
             await self.after_cancel_gate.wait()
             return ExecutionResult(code=OutcomeCode.CANCELLED)
         return self.result

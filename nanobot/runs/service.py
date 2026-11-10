@@ -412,10 +412,10 @@ class RunService:
         try:
             try:
                 result = await self._executor.execute(run)
-            except asyncio.CancelledError:
-                unverified = bool(
-                    getattr(self._executor, "consume_cancel_unverified", lambda: False)()
-                )
+            except asyncio.CancelledError as exc:
+                # The typed cancellation carries this run's cleanup conclusion.
+                # A plain cancellation never proved cleanup and stays uncertain.
+                unverified = not bool(getattr(exc, "stop_confirmed", False))
                 await self._finalize_cancelled(run.run_id, unverified=unverified)
                 raise
             except Exception as exc:
