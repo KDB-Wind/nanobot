@@ -370,6 +370,14 @@ class PeerLab:
                  "code": payload.get("code") if isinstance(payload, dict) else None}
             )
             ok = ok and status == 201
+        # The authorized pair for the E2E chain; writer->analyst stays
+        # deliberately unedged for the unauthorized scenario.
+        status, _ = http_json(
+            "POST", self.coord_url("/v1/teams/peer-edges"), token=self.admin_token,
+            body={"from_bot_id": "research", "to_bot_id": "writer"},
+        )
+        evidence["steps"].append({"step": "edge research->writer", "status": status})
+        ok = ok and status == 201
         evidence["status"] = "pass" if ok else "fail"
         return evidence
 
@@ -405,7 +413,31 @@ class PeerLab:
             ev["reason"] = f"peer send rejected with HTTP {status}"
             return ev
         task_id = payload.get("task_id")
+        # P4 gate: the dispatch pipeline runs the recipient's real serve and
+        # the result becomes queryable.
         deadline = time.monotonic() + 240.0
+        run_state = None
+        result_available = False
+        while time.monotonic() < deadline:
+            status, task = http_json(
+                "GET", self.coord_url(f"/v1/teams/tasks/{task_id}"),
+                token=self.admin_token,
+            )
+            run_state = task.get("run_state") if isinstance(task, dict) else None
+            result_available = bool(
+                task.get("result_available") if isinstance(task, dict) else False
+            )
+            if run_state in ("succeeded", "failed", "cancelled", "interrupted"):
+                break
+            time.sleep(2.0)
+        ev["steps"].append({"step": "poll recipient run", "run_state": run_state,
+                            "result_available": result_available})
+        if run_state != "succeeded" or not result_available:
+            ev["status"] = "fail"
+            ev["reason"] = f"recipient run_state={run_state} result_available={result_available}"
+            return ev
+        # P5 gate: the reply lands in the sender's own inbox.
+        deadline = time.monotonic() + 60.0
         delivery = None
         while time.monotonic() < deadline:
             status, task = http_json(
@@ -419,7 +451,7 @@ class PeerLab:
         ev["steps"].append({"step": "poll task delivery", "delivery_state": delivery})
         if delivery not in ("persisted", "injected"):
             ev["status"] = "fail"
-            ev["reason"] = f"delivery_state={delivery}"
+            ev["reason"] = f"delivery_state={delivery} (P5: result must return to sender inbox)"
             return ev
         # The reply must land in research's own inbox (E2E-02/I5).
         lookup = http_json(
@@ -541,12 +573,13 @@ class PeerLab:
             ev["reason"] = "coordinator did not come back"
             return ev
         ev["steps"].append({"step": "coordinator restarted"})
+        # Reconcile as the sending bot: lookup is caller-scoped idempotency.
         lookup_status, lookup = http_json(
             "GET",
             self.coord_url(
                 f"/v1/teams/tasks/lookup?operation_key={payload['operation_key']}"
             ),
-            token=self.admin_token,
+            token=self.bot_coord_tokens["research"],
         )
         tasks = [lookup] if (
             lookup_status == 200 and isinstance(lookup, dict)
@@ -614,7 +647,14 @@ def main() -> int:
         lab.start()
         results.append(lab.register_bots())
         dispatch = lab.scenario_peer_dispatch()
-        dispatch_ok = dispatch.get("status") == "pass"
+        send_step = next(
+            (s for s in dispatch.get("steps", [])
+             if s.get("step", "").startswith("peer send")),
+            {},
+        )
+        # The dispatch pipeline working is the prerequisite for the dependent
+        # scenarios; the P5 inbox-return gate may still be red.
+        dispatch_ok = send_step.get("status") in (200, 201, 202)
         results.append(dispatch)
         results.append(lab.scenario_unauthorized(dispatch_ok))
         results.append(lab.scenario_hop_guard(dispatch_ok))

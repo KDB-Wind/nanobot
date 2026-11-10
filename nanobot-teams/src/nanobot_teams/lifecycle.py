@@ -74,6 +74,8 @@ def managed_bot_config(
     preset: str,
     runs_api_key_env: str,
     user_config: Path | None = None,
+    coordinator_url: str = "",
+    coord_token_env: str = "",
 ) -> tuple[dict, set[str]]:
     """Build a loadable JSON config for a managed async-workbench bot.
 
@@ -83,6 +85,11 @@ def managed_bot_config(
     service key and the browser-facing scaffold never sees one (F13). The
     runs API key comes from ``runs_api_key_env``. Returns the config dict and
     the set of environment names that must be set before the bot can load.
+
+    When ``coordinator_url`` and ``coord_token_env`` are both given the bot
+    also becomes a peer: its serve listener enables the runs inbox and a
+    teams-async MCP client (send_to_bot and friends) is attached, with the
+    coordinator credential referenced via ``${ENV}`` like every other secret.
     """
     source = user_config or user_config_path()
     user = _load_json(source)
@@ -142,12 +149,44 @@ def managed_bot_config(
                 "principalId": "teams-coordinator",
                 "executionEnabled": True,
                 "exclusiveExecution": True,
+                **({"inboxEnabled": True} if coordinator_url else {}),
             },
         },
-        "tools": {"restrictToWorkspace": True, "exec": {"enable": False}, "mcpServers": {}},
+        "tools": {
+            "restrictToWorkspace": True,
+            "exec": {"enable": False},
+            "mcpServers": (
+                {
+                    "teams-async": {
+                        "type": "stdio",
+                        "command": sys.executable,
+                        "args": [
+                            "-m", "nanobot_teams", "async-mcp",
+                            "--url", coordinator_url,
+                            "--token-env", coord_token_env,
+                        ],
+                        "env": {
+                        coord_token_env: "${" + coord_token_env + "}",
+                        "PYTHONPATH": os.pathsep.join(
+                            p for p in (
+                                str(Path(__file__).resolve().parent.parent),
+                                os.environ.get("PYTHONPATH", ""),
+                            ) if p
+                        ),
+                    },
+                        "teamsAsync": True,
+                        "toolTimeout": 600,
+                    },
+                }
+                if coordinator_url and coord_token_env
+                else {}
+            ),
+        },
         "channels": {},
     }
     required_env.add(runs_api_key_env)
+    if coordinator_url and coord_token_env:
+        required_env.add(coord_token_env)
     return config, required_env
 
 

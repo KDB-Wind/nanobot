@@ -115,7 +115,7 @@ async def test_scaffold_home_loads_without_leaking_the_key(scaffold_env, tmp_pat
         raw_key = line[0].split("=", 1)[1]
         assert raw_key and raw_key not in config_text
         assert raw_key not in json.dumps(body)
-        assert sorted(body["required_env"])[0] == SECRET_ENV
+        assert SECRET_ENV in body["required_env"]
 
         # F12: the real loader accepts the generated JSON and the runs key
         # resolves to the generated value (the same resolve serve performs).
@@ -215,12 +215,20 @@ async def test_scaffolded_bot_really_starts(scaffold_env):
     for name in body["required_env"]:
         env[name] = "sk-test-provider-value"
     env[body["secret_env"]] = raw_key
+    # The spawned serve must run THIS repository's nanobot, not whatever an
+    # editable install in the test venv resolves to from a foreign cwd.
+    repo_root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (repo_root, env.get("PYTHONPATH", "")) if p
+    )
+    serve_log = home / "serve-test.log"
+    log_handle = open(serve_log, "w", encoding="utf-8")
     process = subprocess.Popen(
         [sys.executable, "-m", "nanobot", "serve", "--config", str(home / "config.json")],
         env=env,
         cwd=str(home),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
     )
     try:
         deadline = time.monotonic() + 60.0
@@ -248,6 +256,11 @@ async def test_scaffolded_bot_really_starts(scaffold_env):
             process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             process.kill()
+        finally:
+            log_handle.close()
+            tail = serve_log.read_text(encoding="utf-8", errors="replace")[-3000:]
+            if tail.strip():
+                print(f"--- scaffolded serve log tail ---\n{tail}", end="")
 
 
 async def _sleep() -> None:

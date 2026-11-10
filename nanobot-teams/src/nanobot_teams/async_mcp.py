@@ -28,6 +28,27 @@ _SERVER_NAME = "nanobot-teams-async"
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_JSON_DEPTH = 16
 
+_SEND_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "recipient": {"type": "string", "description": "Target bot id from list_bots."},
+        "input": {"type": "string", "description": "Self-contained task and expected output."},
+        "operation_key": {
+            "type": "string",
+            "description": "Stable UUID for this send; reuse it verbatim on retry.",
+        },
+        "conversation_root": {
+            "type": "string",
+            "description": "Conversation UUID when continuing one; omit to start fresh.",
+        },
+        "hop": {"type": "integer", "description": "Hop index of this send; 0 when fresh."},
+        "project": {"type": "string", "description": "Optional project id; defaults to peer."},
+        "deadline_at": {"type": "string", "description": "Optional RFC 3339 UTC deadline."},
+    },
+    "required": ["recipient", "input", "operation_key"],
+    "additionalProperties": False,
+}
+
 _LIST_BOTS_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
 _SUBMIT_SCHEMA: dict[str, Any] = {
@@ -200,6 +221,9 @@ class CoordinatorClient:
     async def submit_task(self, body: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", "/v1/teams/tasks", json=body)
 
+    async def send_to_bot(self, body: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("POST", "/v1/teams/peer/send", json=body)
+
     async def get_task(self, task_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/v1/teams/tasks/{task_id}")
 
@@ -246,6 +270,21 @@ def build_async_server(client: CoordinatorClient) -> Server:
                     "The bot runs in the background; poll get_async_task."
                 ),
                 inputSchema=_SUBMIT_SCHEMA,
+                annotations=types.ToolAnnotations(
+                    readOnlyHint=False,
+                    idempotentHint=True,
+                    destructiveHint=False,
+                    openWorldHint=False,
+                ),
+            ),
+            types.Tool(
+                name="send_to_bot",
+                description=(
+                    "Dispatch one async task to a peer bot along an authorized "
+                    "edge and return its Task id immediately. The reply returns "
+                    "to this bot's own inbox; poll get_async_task meanwhile."
+                ),
+                inputSchema=_SEND_SCHEMA,
                 annotations=types.ToolAnnotations(
                     readOnlyHint=False,
                     idempotentHint=True,
@@ -358,6 +397,27 @@ def build_async_server(client: CoordinatorClient) -> Server:
                         body["workflow"] = meta["reply_workflow"]
                 task = await client.submit_task(body)
                 return _text(task)
+            if name == "send_to_bot":
+                meta = _trusted_meta()
+                forged = sorted(set(arguments) & {
+                    "reply_capability", "reply_workflow", "coordinator_principal",
+                    "sender",
+                })
+                if forged:
+                    return _text(
+                        {"error_code": "forged_routing_fields",
+                         "detail": f"Model arguments must not carry: {', '.join(forged)}"},
+                        is_error=True,
+                    )
+                body = {
+                    "recipient": arguments.get("recipient"),
+                    "input": arguments.get("input"),
+                    "operation_key": arguments.get("operation_key"),
+                }
+                for optional in ("conversation_root", "hop", "project", "deadline_at"):
+                    if arguments.get(optional) is not None:
+                        body[optional] = arguments[optional]
+                return _text(await client.send_to_bot(body))
             if name == "get_async_task":
                 task_id = str(arguments.get("task_id", ""))
                 payload = await client.get_task(task_id)
