@@ -1,0 +1,22 @@
+# Probe working directories are created per run next to the scripts.
+/*/cancel-race-*/
+/*/uncertainty-*/
+/*/migration-*/
+/*/repeat-quarantine-*/
+/*/scaffold-config-*/
+/*/kill-queued-*/
+/*/crash-queued-*/
+/*/lost-queued-*/
+/*/replaced-*/
+/*/revoked-after-*/
+/*/happy-*/
+/*/closures-*/
+/*/active-result-*/
+/*/injected-user-*/
+/*/malformed-*/
+/*/resistant-*/
+/*/deadline-*/
+/*/exception-*/
+/*/result-*/
+/*/retention-*/
+/*/http-*/
