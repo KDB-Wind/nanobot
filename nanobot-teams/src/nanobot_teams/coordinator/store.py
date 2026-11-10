@@ -1281,7 +1281,7 @@ class CoordinatorStore:
         """Accepted tasks whose cancel is not backed by a confirmed stop.
 
         A terminal run is not stop evidence: these are driven until the remote
-        reports a confirmed stop, even though they no longer need observation.
+        reports a confirmed stop; a newer observation may confirm it first.
         """
         assert self._conn is not None
         rows = self._conn.execute(

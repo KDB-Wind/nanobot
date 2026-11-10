@@ -393,11 +393,12 @@ class DispatchWorker:
     async def _reconcile_cancelled_pending(
         self, client: BotRunClient, task, entry
     ) -> None:
-        """Settle an unconfirmed cancel on a never-accepted task.
+        """Reconcile an unconfirmed cancel on a task with no bound run.
 
-        The lookup proves whether the lost submit created a run: found means the
-        cancel becomes a real remote cancel; not found means nothing was ever
-        created and the task closes as cancelled-before-dispatch.
+        A lookup that finds a run binds it and cancels. A 404 is one
+        observation, not a fence: the original POST may still commit, so the
+        cancel stays unknown and the same key is reconciled again. Nothing new
+        is submitted after the cancel request.
         """
         try:
             lookup = await client.lookup(task.operation_key)
@@ -685,10 +686,11 @@ class DispatchWorker:
     async def _drive_pending_cancels(self) -> None:
         """Keep driving cancels whose stop is not confirmed.
 
-        These tasks may already be terminal: observation stops at a terminal run
-        state, so a cancel that is still unconfirmed has no other pump driving
-        it. This is background reconciliation, not dispatch progress, so it
-        does not force the loop out of its idle sleep.
+        These tasks may already be terminal: a terminal run state is not stop
+        evidence, so a cancel that is still unconfirmed keeps being driven
+        until the remote confirms the stop or a newer observation does. This is
+        background reconciliation, not dispatch progress, so it does not force
+        the loop out of its idle sleep.
         """
         for task in self._store.tasks_with_pending_cancel(limit=16):
             bot = self._store.get_bot(task.bot_id)
