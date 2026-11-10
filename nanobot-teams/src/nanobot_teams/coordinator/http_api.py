@@ -378,9 +378,8 @@ def build_app(
             limit = max(1, min(int(limit_raw), PAGE_MAX))
         except ValueError:
             return api_error(400, "invalid_field", "limit must be an integer.")
-        principal = (
-            principal_for(request) if role in ("planner", "operator") else principal_for(request)
-        )
+        # Operator sees everything; planner and bots are scoped to their own.
+        principal = None if role == "operator" else principal_for(request)
         tasks = store.list_tasks(
             caller_principal=principal,
             project_id=request.query.get("project"),
@@ -689,6 +688,57 @@ def build_app(
             return api_error(403, "forbidden", "Not your task.")
         updated = store.request_cancel(task.task_id)
         return _json_response(task_public_json(updated), status=202)
+
+    async def usage_route(request: web.Request) -> web.Response:
+        from .usage import WINDOW_DELTAS, bot_usage_json, read_bot_usage
+
+        denied = require_role(request, ("planner", "operator"))
+        if denied is not None:
+            return denied
+        window = request.query.get("window", "30d")
+        if window not in WINDOW_DELTAS:
+            return api_error(
+                400, "invalid_field",
+                f"window must be one of {sorted(WINDOW_DELTAS)}.",
+            )
+        if config.bot_homes_root is None:
+            return api_error(
+                400, "bot_homes_root_unconfigured",
+                "Set bot_homes_root in the coordinator config to read usage.",
+            )
+        bots = [
+            bot_usage_json(
+                read_bot_usage(
+                    bot.bot_id, bot.display_name, config.bot_homes_root, window
+                )
+            )
+            for bot in store.list_bots()
+        ]
+        return _json_response({"window": window, "bots": bots})
+
+    async def bot_usage_route(request: web.Request) -> web.Response:
+        from .usage import WINDOW_DELTAS, bot_usage_json, read_bot_usage
+
+        denied = require_role(request, ("planner", "operator"))
+        if denied is not None:
+            return denied
+        window = request.query.get("window", "30d")
+        if window not in WINDOW_DELTAS:
+            return api_error(
+                400, "invalid_field",
+                f"window must be one of {sorted(WINDOW_DELTAS)}.",
+            )
+        if config.bot_homes_root is None:
+            return api_error(
+                400, "bot_homes_root_unconfigured",
+                "Set bot_homes_root in the coordinator config to read usage.",
+            )
+        bot = store.get_bot(request.match_info["bot_id"])
+        if bot is None:
+            return api_error(404, "bot_not_found", "No registered bot with that id.")
+        usage = read_bot_usage(bot.bot_id, bot.display_name,
+                               config.bot_homes_root, window)
+        return _json_response(bot_usage_json(usage))
 
     async def snapshot(request: web.Request) -> web.Response:
         denied = require_role(request, ("planner", "operator"))
@@ -1093,6 +1143,8 @@ def build_app(
     app.router.add_post("/v1/teams/peer/send", peer_send)
     app.router.add_post("/v1/teams/peer-edges", upsert_peer_edge)
     app.router.add_get("/v1/teams/peer-edges", list_peer_edges)
+    app.router.add_get("/v1/teams/usage", usage_route)
+    app.router.add_get("/v1/teams/bots/{bot_id}/usage", bot_usage_route)
     app.router.add_delete(
         "/v1/teams/peer-edges/{from_bot_id}/{to_bot_id}", delete_peer_edge
     )

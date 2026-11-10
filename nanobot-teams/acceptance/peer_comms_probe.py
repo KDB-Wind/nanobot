@@ -277,7 +277,7 @@ class PeerLab:
             "listen": {"host": "127.0.0.1", "port": self.coord_port},
             "admin_token_env": "PEER_COORD_ADMIN",
             "planner_token_env": "PEER_COORD_PLANNER",
-            "bot_homes_root": str(self.tmp / "homes"),
+            "bot_homes_root": str(self.tmp),
             "planner": {
                 "inbox_url": f"http://127.0.0.1:{self.planner_api_port}",
                 "instance_id": f"peer-planner-{self.name}",
@@ -454,6 +454,51 @@ class PeerLab:
             ev["status"] = "fail"
             ev["reason"] = f"recipient run_state={run_state} result_available={result_available}"
             return ev
+        ev["status"] = "pass"
+        return ev
+
+    def scenario_usage_stats(self) -> dict:
+        """P6: every bot reports usage; cache rates follow the §5 contract."""
+        ev: dict = {"scenario": "usage_stats", "steps": []}
+        status, payload = http_json(
+            "GET", self.coord_url("/v1/teams/usage?window=all"),
+            token=self.admin_token,
+        )
+        ev["steps"].append({"step": "usage route", "status": status})
+        if status != 200:
+            ev["status"] = "fail"
+            ev["reason"] = f"usage route HTTP {status}"
+            return ev
+        bots = payload.get("bots", [])
+        by_id = {b["bot_id"]: b for b in bots}
+        ev["steps"].append({
+            "step": "per-bot usage",
+            "summary": {
+                bid: (
+                    {"available": b["available"],
+                     "requests": b.get("totals", {}).get("requests"),
+                     "cache_read_tokens": b.get("totals", {}).get("cache_read_tokens"),
+                     "cache_read_rate": b.get("totals", {}).get("cache_read_rate"),
+                     "coverage": b.get("totals", {}).get("coverage")}
+                    if b["available"] else {"available": False, "reason": b.get("reason")}
+                )
+                for bid, b in by_id.items()
+            },
+        })
+        for worker in ("research", "writer"):
+            entry = by_id.get(worker)
+            if entry is None:
+                ev["status"] = "fail"
+                ev["reason"] = f"{worker} missing from usage listing"
+                return ev
+            if not entry["available"]:
+                ev["status"] = "fail"
+                ev["reason"] = f"{worker} usage unavailable: {entry.get('reason')}"
+                return ev
+            if entry["totals"]["requests"] < 1:
+                ev["status"] = "fail"
+                ev["reason"] = f"{worker} has no recorded calls"
+                return ev
         ev["status"] = "pass"
         return ev
 
@@ -666,22 +711,32 @@ class PeerLab:
             ev["status"] = "fail"
             ev["reason"] = f"{len(tasks)} tasks after restart (want exactly 1)"
             return ev
+        # This crash task carries no capability (the probe cannot mint one),
+        # so convergence means: the single task runs to a terminal state with
+        # its result queryable — exactly once, never re-dispatched.
         deadline = time.monotonic() + 240.0
-        delivery = None
+        run_state = None
+        result_available = False
         while time.monotonic() < deadline:
             status, task = http_json(
                 "GET", self.coord_url(f"/v1/teams/tasks/{task_id}"),
                 token=self.admin_token,
             )
-            delivery = task.get("delivery_state") if isinstance(task, dict) else None
-            if delivery in ("persisted", "injected", "card_only", "orphaned", "failed"):
+            run_state = task.get("run_state") if isinstance(task, dict) else None
+            result_available = bool(
+                task.get("result_available") if isinstance(task, dict) else False
+            )
+            if run_state in ("succeeded", "failed", "cancelled", "interrupted"):
                 break
             time.sleep(2.0)
-        ev["steps"].append({"step": "delivery after restart",
-                            "delivery_state": delivery})
-        ev["status"] = "pass" if delivery in ("persisted", "injected") else "fail"
-        if ev["status"] == "fail":
-            ev["reason"] = f"delivery_state={delivery} after restart"
+        ev["steps"].append({"step": "run converges after restart",
+                            "run_state": run_state,
+                            "result_available": result_available})
+        if run_state != "succeeded" or not result_available:
+            ev["status"] = "fail"
+            ev["reason"] = f"run_state={run_state} result_available={result_available}"
+            return ev
+        ev["status"] = "pass"
         return ev
 
     def scenario_events_shape(self) -> dict:
@@ -736,6 +791,7 @@ def main() -> int:
         results.append(lab.scenario_crash_restart(dispatch_ok))
         results.append(lab.scenario_events_shape())
         results.append(lab.scenario_live_chain())
+        results.append(lab.scenario_usage_stats())
     except SystemExit as exc:
         results.append({"scenario": "boot", "status": "fail", "reason": str(exc)})
     finally:

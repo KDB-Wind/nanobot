@@ -425,7 +425,10 @@ def serve(
         runs_store.open(lock_wait_s=10.0)
         runs_service = RunService(
             runs_store,
-            AgentLoopRunExecutor(agent_loop),
+            AgentLoopRunExecutor(
+                agent_loop,
+                durable_peer_sessions=api_cfg.runs.inbox_enabled,
+            ),
             max_active=api_cfg.runs.max_concurrent,
         )
         console.print(

@@ -46,10 +46,18 @@ class RunCancelled(asyncio.CancelledError):
 
 
 class AgentLoopRunExecutor:
-    """Execute one run in its own isolated ephemeral session on the bot's loop."""
+    """Execute one run in its own isolated ephemeral session on the bot's loop.
 
-    def __init__(self, loop: "AgentLoop") -> None:
+    With ``durable_peer_sessions`` the executor additionally binds a
+    RequestContext for the durable ``peer:<workflow>`` conversation session
+    while the run executes: send_to_bot mints reply capabilities against that
+    durable session (the ephemeral run session could never receive a wake),
+    and the run's own working memory stays isolated exactly as before.
+    """
+
+    def __init__(self, loop: "AgentLoop", *, durable_peer_sessions: bool = False) -> None:
         self._loop = loop
+        self._durable_peer_sessions = durable_peer_sessions
 
     async def _reap_session_work(self, session_key: str) -> bool:
         """Stop the run session's tools, subagents, and exec sessions.
@@ -66,63 +74,84 @@ class AgentLoopRunExecutor:
     async def execute(self, run: Run) -> ExecutionResult:
         capture = _RunOutcomeCaptureHook()
         session_key = f"run:{run.run_id}"
-        try:
-            message = await self._loop.process_direct(
-                content=run.input_text,
-                session_key=session_key,
-                channel="api",
-                chat_id=run.run_id,
-                hooks=[capture],
-                ephemeral=True,
-                # The typed-outcome capture must survive the ephemeral hook
-                # gate; without this flag the runner drops caller hooks.
-                _run_extra_hooks_for_ephemeral=True,
-                persist_user_message=False,
+        context_token = None
+        if self._durable_peer_sessions and run.workflow_id:
+            from nanobot.agent.tools.context import RequestContext, bind_request_context
+
+            durable_key = f"peer:{run.workflow_id}"
+            conversation = await self._loop.sessions.state.get(durable_key)
+            context_token = bind_request_context(
+                RequestContext(
+                    channel="api",
+                    chat_id=run.run_id,
+                    session_key=durable_key,
+                    session_generation=conversation.generation,
+                    source_workflow=run.workflow_id,
+                )
             )
-        except asyncio.CancelledError:
-            # Cancel the loop-owned work for this run's session before letting
-            # the cancellation surface: stop confirmation needs the background
-            # tools and exec sessions gone, not just this coroutine. The
-            # conclusion stays conservative until the reap proves otherwise, and
-            # a second cancel raises this same typed result as unconfirmed.
-            stop_confirmed = False
+        try:
             try:
-                if await self._reap_session_work(session_key):
-                    stop_confirmed = True
-            finally:
-                raise RunCancelled(stop_confirmed=stop_confirmed) from None
-        except Exception as exc:
-            # The loop may have started tools or subprocesses before failing;
-            # the reap below owns them like every other exit path.
-            result = ExecutionResult(
-                code=OutcomeCode.EXECUTION_ERROR,
-                message=f"{type(exc).__name__}: {exc}"[:512],
-            )
-        else:
-            text = _response_text(message)
-            stop_reason = capture.stop_reason or ""
-            code = _STOP_REASON_TO_OUTCOME.get(stop_reason, OutcomeCode.EXECUTION_ERROR)
-            message_text = ""
-            if code is not OutcomeCode.SUCCEEDED:
-                message_text = (capture.error or stop_reason or "execution failed")[:512]
-            result = ExecutionResult(code=code, text=text, message=message_text)
-        # Every terminal path reaps the session's background work before the
-        # result is recorded: success, provider error, iteration limit, and
-        # execution error all own tools and subprocesses they started.
-        try:
-            stopped = await self._reap_session_work(session_key)
-        except asyncio.CancelledError:
-            raise RunCancelled(stop_confirmed=False) from None
-        if not stopped:
-            result = ExecutionResult(
-                code=result.code,
-                text=result.text,
-                message=result.message
-                or "background cleanup after the run was unconfirmed"[:512],
-                stop_confirmed=False,
-                effects_uncertain=True,
-            )
-        return result
+                message = await self._loop.process_direct(
+                    content=run.input_text,
+                    session_key=session_key,
+                    channel="api",
+                    chat_id=run.run_id,
+                    hooks=[capture],
+                    ephemeral=True,
+                    # The typed-outcome capture must survive the ephemeral hook
+                    # gate; without this flag the runner drops caller hooks.
+                    _run_extra_hooks_for_ephemeral=True,
+                    persist_user_message=False,
+                )
+            except asyncio.CancelledError:
+                # Cancel the loop-owned work for this run's session before letting
+                # the cancellation surface: stop confirmation needs the background
+                # tools and exec sessions gone, not just this coroutine. The
+                # conclusion stays conservative until the reap proves otherwise,
+                # and a second cancel raises this same typed result as unconfirmed.
+                stop_confirmed = False
+                try:
+                    if await self._reap_session_work(session_key):
+                        stop_confirmed = True
+                finally:
+                    raise RunCancelled(stop_confirmed=stop_confirmed) from None
+            except Exception as exc:
+                # The loop may have started tools or subprocesses before failing;
+                # the reap below owns them like every other exit path.
+                result = ExecutionResult(
+                    code=OutcomeCode.EXECUTION_ERROR,
+                    message=f"{type(exc).__name__}: {exc}"[:512],
+                )
+            else:
+                text = _response_text(message)
+                stop_reason = capture.stop_reason or ""
+                code = _STOP_REASON_TO_OUTCOME.get(stop_reason, OutcomeCode.EXECUTION_ERROR)
+                message_text = ""
+                if code is not OutcomeCode.SUCCEEDED:
+                    message_text = (capture.error or stop_reason or "execution failed")[:512]
+                result = ExecutionResult(code=code, text=text, message=message_text)
+            # Every terminal path reaps the session's background work before the
+            # result is recorded: success, provider error, iteration limit, and
+            # execution error all own tools and subprocesses they started.
+            try:
+                stopped = await self._reap_session_work(session_key)
+            except asyncio.CancelledError:
+                raise RunCancelled(stop_confirmed=False) from None
+            if not stopped:
+                result = ExecutionResult(
+                    code=result.code,
+                    text=result.text,
+                    message=result.message
+                    or "background cleanup after the run was unconfirmed"[:512],
+                    stop_confirmed=False,
+                    effects_uncertain=True,
+                )
+            return result
+        finally:
+            if context_token is not None:
+                from nanobot.agent.tools.context import reset_request_context
+
+                reset_request_context(context_token)
 
 
 def _response_text(value: Any) -> str:
