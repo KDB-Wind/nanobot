@@ -24,7 +24,7 @@ The executor sets `_cancel_unverified=True` before awaiting the reap and clears 
 
 ## P16-06 legacy endpoint identity
 
-A new `legacy_endpoint_guards` table records the guard key, the original endpoint, the credential environment the 0.4 task used, and the instance once it is mapped. Preflight probes the original endpoint with that credential before binding a new instance. Same instance means defer and persist the mapping. A different instance or an auth failure maps and allows. An unreachable or unmappable guard defers, and the operator resolves the incident.
+A new `legacy_endpoint_guards` table records the guard key, the original endpoint, the credential environment the 0.4 task used, and the instance once it is mapped. Preflight probes the original endpoint with that credential before binding a new instance. Same instance means defer and persist the mapping; a different instance maps and allows. A rejected probe, a missing credential, or an unreachable guard defers, and the operator resolves the incident.
 
 ## P16-07 result byte reservation
 
