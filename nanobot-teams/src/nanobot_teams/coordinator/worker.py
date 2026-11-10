@@ -63,6 +63,11 @@ class DispatchWorker:
         self._clients = clients
         self._planner = planner
         self._running = False
+        # Per-task delivery retry clock: a PENDING delivery must not spin the
+        # pump; each failed attempt backs off exponentially (in-memory; a
+        # restart simply retries immediately).
+        self._delivery_retry_at: dict[str, float] = {}
+        self._delivery_attempts: dict[str, int] = {}
 
     async def run_loop(self, *, poll_s: float = 0.5) -> None:
         self._running = True
@@ -516,15 +521,35 @@ class DispatchWorker:
 
     async def _deliver_results(self) -> bool:
         """Deliver terminal auto_resume results to the fixed planner inbox."""
+        import time as _time
+
         tasks = self._store.auto_resume_ready_tasks()
         if not tasks:
             return False
-        for task in tasks:
-            if task.delivery_state.value == "persisted":
+        now = _time.monotonic()
+        progressed = False
+        due = [t for t in tasks if self._delivery_retry_at.get(t.task_id, 0.0) <= now]
+        for stale in set(self._delivery_retry_at) - {t.task_id for t in tasks}:
+            self._delivery_retry_at.pop(stale, None)
+            self._delivery_attempts.pop(stale, None)
+        for task in due:
+            before = task.delivery_state.value
+            if before == "persisted":
                 await self._poll_receipt(task)
             else:
                 await self._deliver_one(task)
-        return True
+            after = self._store.get_task(task.task_id)
+            after_state = after.delivery_state.value if after else before
+            if after_state == before and after_state == "pending":
+                attempts = self._delivery_attempts.get(task.task_id, 0) + 1
+                self._delivery_attempts[task.task_id] = attempts
+                delay = min(30.0, (2.0 ** min(attempts, 5)))
+                self._delivery_retry_at[task.task_id] = _time.monotonic() + delay
+            else:
+                self._delivery_attempts.pop(task.task_id, None)
+                self._delivery_retry_at.pop(task.task_id, None)
+            progressed = True
+        return progressed or bool(tasks)
 
     async def _deliver_one(self, task) -> None:
         import httpx

@@ -55,8 +55,8 @@ queryable from the coordinator and visible in the workbench.
   carries the writer's marker. Unauthorized edges, the fifth hop, and
   duplicate keys answer with typed rejections; killing the coordinator
   mid-flight converges to exactly one completed task after restart.
-- Real usage evidence: research recorded 4 requests with 25,600
-  cache-read tokens (93.7% hit rate, 100% coverage) during the live run.
+- Real usage evidence: research recorded 4 requests with 25,344
+  cache-read tokens (94.0% hit rate, 100% coverage) during the live run.
 
 
 ## 0.5.0 - 2026-11-09

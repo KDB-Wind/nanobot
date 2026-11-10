@@ -217,7 +217,7 @@ export function cancelTeamsTask(
 
 export interface TeamsWorkflowStopResult {
   workflow_id: string;
-  revoked: number;
+  revoked: boolean;
   cancelled: number;
   unconfirmed: number;
   total: number;

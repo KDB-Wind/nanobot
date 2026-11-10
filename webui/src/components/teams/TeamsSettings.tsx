@@ -88,16 +88,18 @@ export function TeamsSettings() {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
     try {
-      const [usageData, edgeData] = await Promise.all([
-        fetchTeamsUsage(getToken(), usageWindow),
-        fetchTeamsPeerEdges(getToken()),
-      ]);
+      const usageData = await fetchTeamsUsage(getToken(), usageWindow);
       setUsage(usageData);
       setUsageError(null);
-      setEdges(edgeData.edges);
     } catch (reason) {
       setUsage(null);
       setUsageError(reason instanceof Error ? reason.message : String(reason));
+    }
+    try {
+      const edgeData = await fetchTeamsPeerEdges(getToken());
+      setEdges(edgeData.edges);
+    } catch {
+      setEdges([]);
     }
   }, [enabled, getToken, usageWindow]);
 

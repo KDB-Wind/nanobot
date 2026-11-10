@@ -70,12 +70,15 @@ def _validate_scaffold_config(
         json.loads(config_path.read_text(encoding="utf-8"))
         return
     added: dict[str, str] = {}
+    saved: dict[str, str | None] = {}
     try:
         for name in required_env:
             if not os.environ.get(name):
                 placeholder = f"scaffold-placeholder-{name.lower()}"
+                saved[name] = os.environ.get(name)
                 os.environ[name] = placeholder
                 added[name] = placeholder
+        saved[secret_env] = os.environ.get(secret_env)
         os.environ[secret_env] = api_key
         added[secret_env] = api_key
         # The same two-step resolve the serve command performs.
@@ -86,7 +89,11 @@ def _validate_scaffold_config(
             )
     finally:
         for name in added:
-            os.environ.pop(name, None)
+            original = saved.get(name)
+            if original is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = original
 
 
 @dataclass(frozen=True)
@@ -100,7 +107,7 @@ class Roles:
             return None
         token = auth[len("Bearer "):]
         for role, secret in (("operator", self.operator), ("planner", self.planner)):
-            if hmac.compare_digest(token, secret):
+            if hmac.compare_digest(token.encode("utf-8"), secret.encode("utf-8")):
                 return role
         return None
 
@@ -214,7 +221,9 @@ def build_app(
             if not bot.coord_secret_env:
                 continue
             secret = os.environ.get(bot.coord_secret_env, "")
-            if secret and hmac.compare_digest(token, secret):
+            if secret and hmac.compare_digest(
+                token.encode("utf-8"), secret.encode("utf-8")
+            ):
                 return f"bot:{bot.bot_id}"
         return None
 
@@ -347,10 +356,11 @@ def build_app(
             return api_error(400, "bot_unavailable", "No registered bot with that id.")
         reply_capability = str(body.get("reply_capability", "")).strip()
         try:
+            workflow_id = str(body.get("workflow", "wf-default"))
             task, created = store.admit_task(
                 caller_principal=principal_for(request),
                 project_id=str(body["project"]),
-                workflow_id=str(body.get("workflow", "wf-default")),
+                workflow_id=workflow_id,
                 bot_id=str(body["bot"]),
                 operation_key=str(body["operation_key"]),
                 input_text=str(body["input"]),
@@ -358,6 +368,11 @@ def build_app(
                 delivery_mode=delivery_mode,
                 bot=bot,
                 reply_capability=reply_capability,
+                # The conversation is server-threaded: the planner's workflow
+                # IS the conversation root, so the first recipient is marked
+                # and later peer hops can be cycle-checked (I6).
+                conversation_root=workflow_id,
+                hop=0,
             )
         except IdempotencyConflictError as exc:
             return api_error(409, exc.code, exc.detail)
@@ -378,14 +393,22 @@ def build_app(
             limit = max(1, min(int(limit_raw), PAGE_MAX))
         except ValueError:
             return api_error(400, "invalid_field", "limit must be an integer.")
-        # Operator sees everything; planner and bots are scoped to their own.
+        # Operator sees everything; planner and bots are scoped to their own
+        # tasks — plus, for the planner, the peer traffic of the workbench
+        # (single-user view; observing never injects into the user session).
         principal = None if role == "operator" else principal_for(request)
-        tasks = store.list_tasks(
-            caller_principal=principal,
-            project_id=request.query.get("project"),
-            workflow_id=request.query.get("workflow"),
-            limit=limit,
-        )
+        kwargs: dict[str, Any] = {
+            "project_id": request.query.get("project"),
+            "workflow_id": request.query.get("workflow"),
+            "limit": limit,
+        }
+        if role == "planner":
+            own = store.list_tasks(caller_principal=principal, **kwargs)
+            peer = [t for t in store.list_tasks(**kwargs) if t.kind == "peer"]
+            seen = {t.task_id for t in own}
+            tasks = own + [t for t in peer if t.task_id not in seen]
+        else:
+            tasks = store.list_tasks(caller_principal=principal, **kwargs)
         return _json_response({"tasks": [task_public_json(t) for t in tasks]})
 
     async def lookup_task(request: web.Request) -> web.Response:
@@ -467,12 +490,6 @@ def build_app(
             return api_error(
                 400, "input_too_large", "Peer input exceeds the 16 KiB protocol cap."
             )
-        try:
-            hop = int(body.get("hop", 0))
-        except (TypeError, ValueError):
-            return api_error(400, "invalid_field", "hop must be an integer.")
-        conversation_root = (str(body.get("conversation_root", "")).strip()
-                            or str(uuid.uuid4()))
         deadline_raw = body.get("deadline_at")
         deadline = None
         if deadline_raw is not None:
@@ -486,46 +503,48 @@ def build_app(
                 return api_error(
                     400, "invalid_field", "deadline_at must carry a UTC timezone."
                 )
-        sender = store.get_bot(sender_id)
-        if sender is None or not sender.enabled:
-            return api_error(
-                403, "unknown_sender", "The sending bot is not registered or enabled."
-            )
-        recipient = store.get_bot(str(body["recipient"]))
-        if recipient is None or not recipient.enabled:
-            return api_error(400, "bot_unavailable", "No registered bot with that id.")
-        project_id = str(body.get("project", "peer")).strip() or "peer"
-        try:
-            store.create_project(project_id, "Peer comms")
-        except AdmissionError:
-            pass  # already present on every send but the first
-        # Idempotent reconciliation wins over fresh budget checks, exactly
-        # like planner submissions.
+        # Idempotent reconciliation wins over fresh budget checks AND over
+        # catalog state: a retry of an accepted send must return the original
+        # task even if the recipient was disabled in between.
         principal = principal_for(request)
         reply_capability = str(body.get("reply_capability", "")).strip()
-        workflow_id = conversation_root
-        delivery_mode = DeliveryMode.WORKBENCH_ONLY
-        if reply_capability:
-            if not sender.inbox_url or not sender.inbox_principal_id or not sender.inbox_key_env:
-                return api_error(
-                    422, "sender_binding_required",
-                    "Auto-return requires the sender's complete receive binding.",
-                )
-            workflow_id = str(body.get("workflow", "")).strip()
-            if not workflow_id:
-                return api_error(
-                    400, "invalid_field",
-                    "workflow is required with a reply capability.",
-                )
-            delivery_mode = DeliveryMode.AUTO_RESUME
+        delivery_mode = (
+            DeliveryMode.AUTO_RESUME if reply_capability else DeliveryMode.WORKBENCH_ONLY
+        )
+        # The envelope is server-authoritative (I6): the conversation root is
+        # the workflow thread — the host-minted capability carries the
+        # sender's session workflow, and a capability-less send starts a
+        # fresh thread. Client-supplied conversation_root/hop never influence
+        # authorization; the hop is derived from the tasks already in the
+        # conversation inside admission.
+        project_id = str(body.get("project", "peer")).strip() or "peer"
+        if len(project_id) > 64:
+            return api_error(400, "invalid_field", "project must be at most 64 chars.")
+        recipient_id = str(body["recipient"])
+        workflow_id = (
+            str(body.get("workflow", "")).strip()
+            or (str(body.get("conversation_root", "")).strip()[:64] or str(uuid.uuid4()))
+        )
+        if reply_capability and not str(body.get("workflow", "")).strip():
+            return api_error(
+                400, "invalid_field",
+                "workflow is required with a reply capability.",
+            )
+        conversation_root = workflow_id
         existing = store.lookup_task(principal, str(body["operation_key"]))
         if existing is not None:
+            if existing.delivery_mode is not delivery_mode:
+                # The delivery promise is part of the operation's semantics.
+                return api_error(
+                    409, "operation_key_conflict",
+                    "This operation key was used with a different delivery mode.",
+                )
             # A replay that omits the envelope keeps the original semantics:
             # the caller did not change what the operation key means.
             digest = task_digest(
                 caller_principal=principal,
                 project_id=project_id,
-                bot_id=recipient.bot_id,
+                bot_id=recipient_id,
                 input_text=input_text,
                 deadline_at=deadline,
                 delivery_mode=existing.delivery_mode.value,
@@ -537,7 +556,20 @@ def build_app(
                 409, "operation_key_conflict",
                 "This operation key was used with different semantics.",
             )
+        sender = store.get_bot(sender_id)
+        if sender is None or not sender.enabled:
+            return api_error(
+                403, "unknown_sender", "The sending bot is not registered or enabled."
+            )
+        recipient = store.get_bot(recipient_id)
+        if recipient is None or not recipient.enabled:
+            return api_error(400, "bot_unavailable", "No registered bot with that id.")
         if delivery_mode is DeliveryMode.AUTO_RESUME:
+            if not sender.inbox_url or not sender.inbox_principal_id or not sender.inbox_key_env:
+                return api_error(
+                    422, "sender_binding_required",
+                    "Auto-return requires the sender's complete receive binding.",
+                )
             rejected = await _validate_sender_capability(
                 sender, workflow_id, str(body["operation_key"]),
                 recipient.bot_id, reply_capability,
@@ -548,7 +580,6 @@ def build_app(
                     recipient_bot_id=recipient.bot_id,
                     code=rejected[1],
                     conversation_root=conversation_root,
-                    hop=hop,
                 )
                 return api_error(rejected[0], rejected[1], rejected[2])
         try:
@@ -565,7 +596,6 @@ def build_app(
                 reply_capability=reply_capability,
                 kind="peer",
                 conversation_root=conversation_root,
-                hop=hop,
                 sender_bot_id=sender_id,
             )
         except IdempotencyConflictError as exc:
@@ -583,7 +613,6 @@ def build_app(
                 recipient_bot_id=recipient.bot_id,
                 code=exc.code,
                 conversation_root=conversation_root,
-                hop=hop,
             )
             return api_error(status, exc.code, exc.detail)
         return _json_response(task_public_json(task), status=201 if created else 200)
@@ -855,7 +884,9 @@ def build_app(
         bot_id = str(body.get("bot_id", "")).strip()
         endpoint = str(body.get("endpoint", "")).strip()
         secret_env = str(body.get("secret_env", "")).strip()
-        if not bot_id or not _is_loopback_http_endpoint(endpoint):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", bot_id):
+            return api_error(400, "invalid_field", "bot_id must be a bounded slug.")
+        if not _is_loopback_http_endpoint(endpoint):
             return api_error(
                 400, "invalid_field", "v1 accepts loopback bot endpoints only."
             )
@@ -876,6 +907,12 @@ def build_app(
                 400, "invalid_field", "inbox_url must be a loopback http endpoint."
             )
         # I2: the receive binding is all-or-nothing.
+        coord_value = os.environ.get(coord_secret_env, "") if coord_secret_env else ""
+        if coord_value and coord_value in (tokens["operator"], tokens["planner"]):
+            return api_error(
+                400, "credential_collision",
+                "A bot coordinator credential must differ from the role tokens.",
+            )
         inbox_fields = (inbox_url, inbox_principal_id, inbox_key_env)
         if any(inbox_fields) and not all(inbox_fields):
             return api_error(
@@ -903,9 +940,12 @@ def build_app(
         return _json_response(bot_public_json(store.get_bot(bot_id)), status=201)
 
     async def list_bots_route(request: web.Request) -> web.Response:
-        denied = require_role(request, ("planner", "operator"))
-        if denied is not None:
-            return denied
+        role = request[_ROLE_KEY]
+        if role is None or (role != "planner" and role != "operator"
+                            and not role.startswith("bot:")):
+            return api_error(403, "forbidden", "That role cannot perform this operation.")
+        # Bots discover dispatch targets here; the payload already excludes
+        # secret env names for non-operator readers.
         return _json_response(
             {
                 "bots": [
@@ -972,6 +1012,19 @@ def build_app(
             )
         except ConfigError as exc:
             return api_error(422, "invalid_preset", str(exc))
+        store.upsert_bot(
+            Bot(
+                bot_id=bot_id,
+                display_name=str(body.get("display_name", bot_id)),
+                role=str(body.get("role", "")),
+                endpoint=f"http://127.0.0.1:{port}",
+                secret_env=secret_env,
+                coord_secret_env=coord_env,
+                inbox_url=f"http://127.0.0.1:{port}",
+                inbox_principal_id="teams-coordinator",
+                inbox_key_env=secret_env,
+            )
+        )
         home.mkdir(parents=True)
         (home / "workspace").mkdir()
         try:
@@ -995,19 +1048,6 @@ def build_app(
                 422, "scaffold_validation_failed",
                 f"The generated config did not validate; no home was kept: {exc}",
             )
-        store.upsert_bot(
-            Bot(
-                bot_id=bot_id,
-                display_name=str(body.get("display_name", bot_id)),
-                role=str(body.get("role", "")),
-                endpoint=f"http://127.0.0.1:{port}",
-                secret_env=secret_env,
-                coord_secret_env=coord_env,
-                inbox_url=f"http://127.0.0.1:{port}",
-                inbox_principal_id="teams-coordinator",
-                inbox_key_env=secret_env,
-            )
-        )
         start_command = f'nanobot serve --config "{home / "config.json"}"'
         return _json_response(
             {
@@ -1065,20 +1105,55 @@ def build_app(
             return api_error(400, "invalid_field", "workflow_id is required.")
         # Authorize the workflow before any grant revocation or task write. A
         # planner owns only its own tasks; an operator owns the whole workflow.
+        # Peer tasks ride the same workflow (the conversation thread), so a
+        # verified owner's stop must reach them too.
         planner_scope = "planner" if request[_ROLE_KEY] == "planner" else None
-        tasks = store.list_tasks(
+        own_tasks = store.list_tasks(
             workflow_id=workflow_id,
             caller_principal=planner_scope,
             limit=WORKFLOW_STOP_TASK_LIMIT,
         )
-        if planner_scope is not None and not tasks:
+        if planner_scope is not None and not own_tasks:
             return api_error(403, "forbidden", "Not your workflow.")
+        if planner_scope is not None:
+            tasks = store.list_tasks(
+                workflow_id=workflow_id,
+                limit=WORKFLOW_STOP_TASK_LIMIT,
+            )
+        else:
+            tasks = own_tasks
         revoked = False
         if config.planner is not None:
             try:
                 revoked = await _revoke_planner_workflow(config.planner, workflow_id)
             except Exception:  # noqa: BLE001 - the cancel pass must still run
                 revoked = False
+        # Peer senders keep their own host-side grants for this workflow;
+        # stopping the conversation revokes them at their own inboxes too.
+        import httpx
+
+        for sender_bot in {
+            t.caller_principal.removeprefix("bot:")
+            for t in tasks
+            if t.caller_principal.startswith("bot:")
+        }:
+            bot = store.get_bot(sender_bot)
+            if bot is None or not bot.inbox_url or not bot.inbox_key_env:
+                continue
+            inbox_key = os.environ.get(bot.inbox_key_env, "").strip()
+            if not inbox_key:
+                continue
+            try:
+                async with httpx.AsyncClient(
+                    timeout=10.0, follow_redirects=False, trust_env=False
+                ) as client:
+                    await client.post(
+                        bot.inbox_url.rstrip("/")
+                        + f"/v1/agent-inbox/workflows/{workflow_id}/revoke",
+                        headers={"Authorization": f"Bearer {inbox_key}"},
+                    )
+            except Exception:  # noqa: BLE001 - the cancel pass must still run
+                pass
         cancelled: list[str] = []
         unconfirmed: list[str] = []
         for task in tasks:

@@ -57,7 +57,7 @@ BIG_QUEUE = {
 
 def admit_peer(store: CoordinatorStore, sender: str, recipient: str, *,
                operation_key: str | None = None, conversation_root: str | None = None,
-               hop: int = 0, quotas: dict | None = None):
+               quotas: dict | None = None):
     return store.admit_task(
         caller_principal=f"bot:{sender}",
         project_id="peer",
@@ -70,7 +70,6 @@ def admit_peer(store: CoordinatorStore, sender: str, recipient: str, *,
         bot=bot(recipient),
         kind="peer",
         conversation_root=conversation_root or str(uuid.uuid4()),
-        hop=hop,
         sender_bot_id=sender,
         quotas=quotas,
     )
@@ -98,11 +97,18 @@ def test_peer_task_persists_envelope(store):
     seed_three(store)
     store.upsert_peer_edge("research", "writer")
     root = str(uuid.uuid4())
+    store.admit_task(
+        caller_principal="planner", project_id="peer", workflow_id=root,
+        bot_id="analyst", operation_key=str(uuid.uuid4()), input_text="first",
+        deadline_at=None, delivery_mode=DeliveryMode.WORKBENCH_ONLY,
+        bot=store.get_bot("analyst"), conversation_root=root, hop=0,
+    )
     task, created = admit_peer(store, "research", "writer",
-                               conversation_root=root, hop=1)
+                               conversation_root=root)
     assert created
     assert task.kind == "peer"
     assert task.conversation_root == root
+    # The hop is derived from the conversation, not from the client.
     assert task.hop == 1
     assert task.caller_principal == "bot:research"
     assert task.bot_id == "writer"
@@ -118,9 +124,16 @@ def test_peer_send_without_edge_is_denied(store):
 def test_hop_bound_rejects_the_fifth_hop(store):
     seed_three(store)
     store.upsert_peer_edge("research", "writer")
+    root = str(uuid.uuid4())
+    for _ in range(PEER_MAX_HOPS):
+        store.admit_task(
+            caller_principal="planner", project_id="peer", workflow_id=root,
+            bot_id="analyst", operation_key=str(uuid.uuid4()), input_text="x",
+            deadline_at=None, delivery_mode=DeliveryMode.WORKBENCH_ONLY,
+            bot=store.get_bot("analyst"), conversation_root=root, hop=0,
+        )
     with pytest.raises(AdmissionError) as exc:
-        admit_peer(store, "research", "writer", conversation_root=str(uuid.uuid4()),
-                   hop=PEER_MAX_HOPS)
+        admit_peer(store, "research", "writer", conversation_root=root)
     assert exc.value.code == "hop_limit_exceeded"
 
 
@@ -137,9 +150,9 @@ def test_recipient_reentry_is_a_cycle(store):
         deadline_at=None, delivery_mode=DeliveryMode.WORKBENCH_ONLY,
         bot=bot("research"), conversation_root=root, hop=0,
     )
-    admit_peer(store, "research", "writer", conversation_root=root, hop=1)
+    admit_peer(store, "research", "writer", conversation_root=root)
     with pytest.raises(AdmissionError) as exc:
-        admit_peer(store, "writer", "research", conversation_root=root, hop=2)
+        admit_peer(store, "writer", "research", conversation_root=root)
     assert exc.value.code == "conversation_cycle"
 
 
@@ -148,9 +161,9 @@ def test_relay_chain_is_not_a_cycle(store):
     store.upsert_peer_edge("research", "writer")
     store.upsert_peer_edge("writer", "analyst")
     root = str(uuid.uuid4())
-    admit_peer(store, "research", "writer", conversation_root=root, hop=0)
+    admit_peer(store, "research", "writer", conversation_root=root)
     task, created = admit_peer(store, "writer", "analyst",
-                               conversation_root=root, hop=1)
+                               conversation_root=root)
     assert created and task.hop == 1
 
 

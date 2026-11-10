@@ -28,9 +28,10 @@ SHOTS = probe.EVIDENCE / "ui"
 def main() -> int:
     SHOTS.mkdir(parents=True, exist_ok=True)
     lab = probe.PeerLab("p7ui")
-    lab.start()
+    lab.ws_requires_token = False  # browser labs connect without pairing
     rc = 1
     try:
+        lab.start()
         reg = lab.register_bots()
         if reg.get("status") != "pass":
             print(json.dumps(reg, ensure_ascii=False))
@@ -71,6 +72,8 @@ def main() -> int:
                 f"http://127.0.0.1:{lab.planner_ws_port}",
                 str(SHOTS),
                 str(WEBUI / "package.json"),
+                str(lab.coord_port),
+                lab.ws_token,
             ],
             cwd=str(WEBUI), capture_output=True, text=True, timeout=420,
         )

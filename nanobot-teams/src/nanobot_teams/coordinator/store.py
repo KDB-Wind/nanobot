@@ -416,7 +416,6 @@ class CoordinatorStore:
         recipient_bot_id: str,
         code: str,
         conversation_root: str,
-        hop: int,
     ) -> None:
         """Audit a typed peer rejection (I10): no bodies, full routing facts."""
         with self._transaction():
@@ -427,7 +426,6 @@ class CoordinatorStore:
                     "recipient": recipient_bot_id,
                     "code": code,
                     "conversation_root": conversation_root,
-                    "hop": hop,
                 },
             )
 
@@ -952,11 +950,10 @@ class CoordinatorStore:
                 quotas=limits,
             )
             if kind == "peer":
-                self._admit_peer_guards(
+                hop = self._admit_peer_guards(
                     sender_bot_id=sender_bot_id or "",
                     recipient_bot_id=bot_id,
                     conversation_root=conversation_root,
-                    hop=hop,
                 )
             if snapshot["workflow_tasks"] >= limits["workflow_tasks"]:
                 raise AdmissionError(
@@ -1012,8 +1009,7 @@ class CoordinatorStore:
         sender_bot_id: str,
         recipient_bot_id: str,
         conversation_root: str,
-        hop: int,
-    ) -> None:
+    ) -> int:
         """Peer authorization edges and conversation budgets (I3/I6).
 
         Runs inside the admission transaction; fanout rides principal_open and
@@ -1036,7 +1032,13 @@ class CoordinatorStore:
                 "unauthorized_edge",
                 "No explicit peer edge authorizes this sender to dispatch to that bot.",
             )
-        if hop < 0 or hop >= PEER_MAX_HOPS:
+        # The hop is derived from the conversation itself, never from the
+        # client: the next send is hop = tasks already in the conversation.
+        derived_hop = int(self._conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE conversation_root=?",
+            (conversation_root,),
+        ).fetchone()[0])
+        if derived_hop >= PEER_MAX_HOPS:
             raise AdmissionError(
                 "hop_limit_exceeded",
                 f"The conversation reached its {PEER_MAX_HOPS}-hop limit.",
@@ -1065,6 +1067,7 @@ class CoordinatorStore:
                 f"This sender already dispatched {PEER_PAIR_WINDOW_MESSAGES} peer "
                 f"tasks to that bot in the last hour.",
             )
+        return derived_hop
 
     # ---- peer edges ----
 

@@ -628,12 +628,24 @@ class PeerLab:
     def scenario_hop_guard(self, dispatch_ok: bool) -> dict:
         ev: dict = {"scenario": "hop_guard", "steps": []}
         root = str(uuid.uuid4())
+        # The hop is server-derived from the conversation; fill the thread
+        # with four planner delegations before the peer send.
+        seeded = 0
+        for _ in range(4):
+            status, _payload = http_json(
+                "POST", self.coord_url("/v1/teams/tasks"), token=self.planner_token,
+                body={"project": "peer", "bot": "analyst", "input": "filler",
+                      "operation_key": str(uuid.uuid4()), "workflow": root},
+            )
+            if status == 201:
+                seeded += 1
+        ev["steps"].append({"step": "seed conversation", "seeded": seeded})
         status, payload = self.peer_send(
             "research", "writer", token=self.bot_coord_tokens["research"],
-            conversation_root=root, hop=4,
+            conversation_root=root,
         )
         code = payload.get("code") if isinstance(payload, dict) else None
-        ev["steps"].append({"step": "peer send hop=4 (fifth hop)",
+        ev["steps"].append({"step": "peer send at hop 4 (fifth hop)",
                             "status": status, "code": code})
         if status in (403, 422) and code == "hop_limit_exceeded":
             ev["status"] = "pass"
@@ -761,8 +773,9 @@ class PeerLab:
         peer_events = [
             e for e in events
             if isinstance(e.get("data"), dict)
-            and "sender" in e["data"] and "recipient" in e["data"]
-            and "hop" in e["data"] and e.get("task_id")
+            and e["data"].get("kind") == "peer"
+            and e["data"].get("sender") and e["data"].get("recipient")
+            and e.get("task_id") and "conversation_root" in e["data"]
         ]
         if peer_events:
             ev["status"] = "pass"

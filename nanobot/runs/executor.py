@@ -74,6 +74,15 @@ class AgentLoopRunExecutor:
     async def execute(self, run: Run) -> ExecutionResult:
         capture = _RunOutcomeCaptureHook()
         session_key = f"run:{run.run_id}"
+        # Providers can be rebuilt lazily at runtime; re-attaching the usage
+        # observer per run keeps per-bot llm_usage recording alive regardless
+        # of swaps instead of trusting a startup-time pointer.
+        try:
+            from nanobot.llm_usage import record_llm_call
+
+            self._loop.provider.set_llm_call_observer(record_llm_call)
+        except Exception:
+            pass
         peer_token = None
         if self._durable_peer_sessions and run.workflow_id:
             from nanobot.agent.tools.context import (

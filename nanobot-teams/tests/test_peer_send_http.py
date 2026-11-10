@@ -104,6 +104,7 @@ async def test_peer_send_creates_a_peer_task(lab):
     assert payload["bot_id"] == "writer"
     assert payload["caller_principal"] == "bot:research"
     assert payload["conversation_root"]
+    # The hop is server-derived; a fresh conversation starts at 0.
     assert payload["hop"] == 0
 
 
@@ -137,17 +138,29 @@ async def test_peer_send_without_edge_is_a_typed_rejection_with_audit(lab):
         and e.data.get("sender") == "writer"
         and e.data.get("recipient") == "research"
         and e.data.get("code") == "unauthorized_edge"
-        and "hop" in e.data
+        and e.data.get("conversation_root")
     ]
     assert events, "the rejection must be audited with routing facts"
 
 
 async def test_peer_send_fifth_hop_is_typed_rejected(lab):
     client, store = lab
+    # Seed four tasks into the conversation via the planner route, which now
+    # threads the workflow as the conversation root.
+    root = str(uuid.uuid4())
+    for _ in range(4):
+        seeded = await client.post(
+            "/v1/teams/tasks",
+            headers={"Authorization": f"Bearer {PLANNER}"},
+            json={"project": "peer", "bot": "research",
+                  "input": "x", "operation_key": str(uuid.uuid4()),
+                  "workflow": root},
+        )
+        assert seeded.status == 201, await seeded.text()
     resp = await client.post(
         "/v1/teams/peer/send",
         headers=bot_headers(RESEARCH_KEY),
-        json=send_body(hop=4, conversation_root=str(uuid.uuid4())),
+        json=send_body(conversation_root=root),
     )
     assert resp.status == 422
     assert (await resp.json())["code"] == "hop_limit_exceeded"
@@ -223,7 +236,7 @@ async def test_peer_send_events_carry_routing_facts(lab):
     data = created[0].data
     assert data["sender"] == "research"
     assert data["recipient"] == "writer"
-    assert "hop" in data and "conversation_root" in data
+    assert "conversation_root" in data and "sender" in data
 
 
 async def test_peer_task_json_has_no_secret_material(lab):
