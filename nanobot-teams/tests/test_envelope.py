@@ -272,7 +272,8 @@ def test_validate_continuation_unit() -> None:
     assert exc.value.error_code == "hop_limit"
 
 
-def test_preamble_round_trip() -> None:
+def test_preamble_round_trip(monkeypatch) -> None:
+    monkeypatch.setattr("nanobot_teams.envelope.time.time", lambda: 1_000_000.0)
     envelope = envelope_for_root(str(uuid.uuid4()), "planner", 100.0)
     child = preamble_envelope(envelope, str(uuid.uuid4()), "research")
     text = task_with_preamble("do the thing", child, str(uuid.uuid4()))
@@ -280,6 +281,15 @@ def test_preamble_round_trip() -> None:
     assert fields["chain"] == ["planner", "research"]
     assert fields["deadline_remaining_s"] == pytest.approx(90.0)
     assert text.endswith("do the thing")
+
+
+def test_preamble_deducts_elapsed_time(monkeypatch) -> None:
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr("nanobot_teams.envelope.time.time", lambda: clock["now"])
+    envelope = envelope_for_root(str(uuid.uuid4()), "planner", 100.0)
+    clock["now"] += 10.0
+    child = preamble_envelope(envelope, str(uuid.uuid4()), "research")
+    assert child.deadline_remaining_s == pytest.approx(81.0)
 
 
 def test_session_id_spans_callers(tmp_path: Path) -> None:
