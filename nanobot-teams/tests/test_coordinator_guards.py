@@ -209,8 +209,8 @@ async def test_unconfirmed_cancel_reconciles_lost_submit_to_remote_cancel(store)
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
-async def test_unconfirmed_cancel_with_no_remote_run_closes_locally(store):
-    """F03: lookup 404 proves no work exists; the task closes as cancelled."""
+async def test_unconfirmed_cancel_with_lookup_404_stays_unknown(store):
+    """A 404 is one observation, not proof the in-flight submit will not commit."""
     bot_app = ScriptedBot()
     bot_app.lookup_status = 404
     bot_app.lookup_payload = {"code": "run_not_found"}
@@ -223,12 +223,13 @@ async def test_unconfirmed_cancel_with_no_remote_run_closes_locally(store):
         store.mark_submit_started(entry.entry_id)
         store.request_cancel(task.task_id)
         worker = DispatchWorker(store, ClientFactory({"GUARD_BOT_KEY": SECRET}))
-        assert await _pump_until(
-            worker,
-            lambda: store.get_task(task.task_id).run_state == "cancelled",
-        )
+        for _ in range(2):
+            store.defer_dispatch(entry.entry_id, utc_now(), "test: force reconcile")
+            await worker.pump_once()
         current = store.get_task(task.task_id)
-        assert current.cancel_state.value == "confirmed"
+        assert current.cancel_state.value == "unconfirmed"
+        assert current.run_state != "cancelled"
+        assert current.dispatch_state.value == "pending"
         assert bot_app.submits == 0, "reconciliation must not submit after a cancel"
     finally:
         await server.close()

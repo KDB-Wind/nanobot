@@ -459,6 +459,18 @@ async def test_pump_drives_cancel_for_terminal_unconfirmed_run(store):
     """N08: observation stops at terminal; the cancel pump must keep driving."""
     store.create_project("proj", "Main")
     bot_app = FakeBotApp()
+    # The run exists remotely and is terminal without a confirmed stop; a
+    # missing run here would instead exercise the lost-storage path.
+    bot_app.runs["run_terminal"] = {
+        "run_id": "run_terminal",
+        "state": "interrupted",
+        "revision": 2,
+        "instance_id": "inst_bot_a",
+        "stop_confirmed": False,
+        "effects_uncertain": False,
+        "outcome": {"code": "interrupted"},
+        "result_available": False,
+    }
     server = await make_bot_server(bot_app)
     try:
         register_bot(

@@ -26,6 +26,7 @@ from .models import (
     DispatchEntry,
     DispatchState,
     Event,
+    LegacyEndpointGuard,
     Project,
     Quarantine,
     Task,
@@ -130,6 +131,14 @@ CREATE TABLE IF NOT EXISTS instance_quarantine (
     resolved_at TEXT,
     resolved_by TEXT NOT NULL DEFAULT '',
     resolution_note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS legacy_endpoint_guards (
+    guard_key TEXT PRIMARY KEY,
+    endpoint TEXT NOT NULL,
+    secret_env TEXT NOT NULL DEFAULT '',
+    instance_id TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
 );
 CREATE TABLE IF NOT EXISTS migration_records (
     record_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,6 +266,15 @@ RESULT_RESERVATION_BYTES = 32 * 1024
 # accepted has a live run, indeterminate means the remote state is unknown.
 _UNKNOWN_DISPATCH_STATES = "('pending','accepted','indeterminate')"
 _TERMINAL_RUN_STATES_SQL = "('succeeded','failed','cancelled','interrupted')"
+_UNSETTLED_SQL = (
+    f"dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND (run_state NOT IN "
+    f"{_TERMINAL_RUN_STATES_SQL} OR stop_confirmed=0 OR effects_uncertain=1)"
+)
+# Bytes settle on the body, not on execution or stop. An advertised body
+# that was never persisted still owns the maximum reservation.
+_RESULT_UNSETTLED_SQL = (
+    f"({_UNSETTLED_SQL} OR (result_available=1 AND result_fetched=0))"
+)
 
 
 class CoordinatorStore:
@@ -535,6 +553,11 @@ class CoordinatorStore:
                 "WHERE instance_id=? AND resolved_at IS NULL",
                 (iso(utc_now()), actor, note, instance_id),
             )
+            self._conn.execute(
+                "UPDATE legacy_endpoint_guards SET resolved_at=? "
+                "WHERE guard_key=? AND resolved_at IS NULL",
+                (iso(utc_now()), instance_id),
+            )
             # The row's resolution fields are cleared by the next incident, so
             # the audit of who cleared this one lives in the event log.
             self._emit(
@@ -558,6 +581,50 @@ class CoordinatorStore:
             for r in rows
         }
 
+    def quarantine_legacy_endpoint(
+        self, endpoint: str, reason: str, *, secret_env: str = ""
+    ) -> None:
+        """Record the endpoint behind a 0.4 unknown and isolate its guard key."""
+        guard_key = endpoint_guard_key(endpoint)
+        with self._transaction():
+            assert self._conn is not None
+            self._quarantine_locked(guard_key, reason)
+            self._conn.execute(
+                "INSERT INTO legacy_endpoint_guards(guard_key, endpoint, secret_env, "
+                "created_at) VALUES (?,?,?,?) ON CONFLICT(guard_key) DO UPDATE SET "
+                "endpoint=excluded.endpoint, secret_env=excluded.secret_env, "
+                "created_at=excluded.created_at, instance_id=NULL, resolved_at=NULL",
+                (guard_key, endpoint, secret_env, iso(utc_now())),
+            )
+
+    def active_legacy_guards(self) -> list[LegacyEndpointGuard]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT g.guard_key, g.endpoint, g.secret_env, g.instance_id, g.created_at "
+            "FROM legacy_endpoint_guards g JOIN instance_quarantine q "
+            "ON q.instance_id=g.guard_key "
+            "WHERE q.resolved_at IS NULL AND g.resolved_at IS NULL "
+            "ORDER BY g.created_at"
+        ).fetchall()
+        return [
+            LegacyEndpointGuard(
+                guard_key=r[0],
+                endpoint=r[1],
+                secret_env=r[2],
+                instance_id=r[3],
+                created_at=datetime.fromisoformat(r[4]),
+            )
+            for r in rows
+        ]
+
+    def map_legacy_guard(self, guard_key: str, instance_id: str) -> None:
+        with self._transaction():
+            assert self._conn is not None
+            self._conn.execute(
+                "UPDATE legacy_endpoint_guards SET instance_id=? WHERE guard_key=?",
+                (instance_id, guard_key),
+            )
+
     # ---- admission ----
 
     def quota_snapshot(
@@ -578,10 +645,8 @@ class CoordinatorStore:
         # An execution state alone does not settle a task: a terminal run whose
         # stop is unconfirmed, or whose effects stayed uncertain, still owns the
         # same open-slot and result reservation as a running one.
-        unsettled = (
-            f"dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND (run_state NOT IN "
-            f"{_TERMINAL_RUN_STATES_SQL} OR stop_confirmed=0 OR effects_uncertain=1)"
-        )
+        unsettled = _UNSETTLED_SQL
+        result_unsettled = _RESULT_UNSETTLED_SQL
         principal_open = int(
             self._conn.execute(
                 f"SELECT COUNT(*) FROM tasks WHERE caller_principal=? AND {unsettled}",
@@ -614,7 +679,7 @@ class CoordinatorStore:
         workflow_result_bytes = int(
             self._conn.execute(
                 "SELECT COALESCE(SUM(CASE WHEN "
-                f"{unsettled} "
+                f"{result_unsettled} "
                 "THEN ? ELSE LENGTH(CAST(result_text AS BLOB)) END),0) FROM tasks "
                 "WHERE workflow_id=?",
                 (RESULT_RESERVATION_BYTES, workflow_id),
@@ -733,9 +798,7 @@ class CoordinatorStore:
                 admitted_bytes = int(
                     self._conn.execute(
                         "SELECT COALESCE(SUM(CASE WHEN "
-                        f"dispatch_state IN {_UNKNOWN_DISPATCH_STATES} AND (run_state "
-                        f"NOT IN {_TERMINAL_RUN_STATES_SQL} OR stop_confirmed=0 OR "
-                        "effects_uncertain=1) THEN ? ELSE "
+                        f"{_RESULT_UNSETTLED_SQL} THEN ? ELSE "
                         "LENGTH(CAST(result_text AS BLOB)) END),0) FROM tasks "
                         "WHERE caller_principal=? AND created_at>=?",
                         (RESULT_RESERVATION_BYTES, caller_principal, quota_row[2]),
@@ -1103,38 +1166,6 @@ class CoordinatorStore:
             self._emit("task_expired_before_dispatch", task_id, {"reason": reason})
             return self._load_task(task_id)
 
-    def close_cancelled_unknown(self, task_id: str, reason: str) -> Task | None:
-        """Finish a never-created task whose unconfirmed cancel reconciled to nothing.
-
-        The dispatch worker calls this after a lookup by the original key proves
-        no remote run exists: no work was ever created, so the cancel confirms.
-        """
-        with self._transaction():
-            assert self._conn is not None
-            row = self._conn.execute(
-                "SELECT dispatch_state, run_state, remote_run_id FROM tasks WHERE task_id=?",
-                (task_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            if row[0] != DispatchState.PENDING.value or row[2] is not None:
-                # An accepted or bound task owns remote work; cancel stays
-                # unconfirmed and the normal cancel path handles it.
-                return self._load_task(task_id)
-            self._conn.execute(
-                "UPDATE tasks SET cancel_state=?, run_state='cancelled', "
-                "outcome_code='cancelled', outcome_message=?, stop_confirmed=1, "
-                "dispatch_state='rejected', finished_at=? WHERE task_id=?",
-                (CancelState.CONFIRMED.value, reason, iso(utc_now()), task_id),
-            )
-            self._conn.execute(
-                "UPDATE dispatch_outbox SET state='failed', last_error=? WHERE task_id=? "
-                "AND state='pending'",
-                (reason, task_id),
-            )
-            self._emit("task_cancelled_before_dispatch", task_id, {})
-            return self._load_task(task_id)
-
     def defer_dispatch(self, entry_id: int, next_at: datetime, error: str) -> None:
         """Push one outbox entry back without counting an attempt."""
         with self._transaction():
@@ -1238,8 +1269,10 @@ class CoordinatorStore:
     def tasks_to_observe(self, limit: int = 20) -> list[Task]:
         assert self._conn is not None
         rows = self._conn.execute(
-            "SELECT task_id FROM tasks WHERE dispatch_state='accepted' AND run_state NOT IN "
-            "('succeeded','failed','cancelled','interrupted') ORDER BY created_at LIMIT ?",
+            "SELECT task_id FROM tasks WHERE dispatch_state='accepted' AND ("
+            "run_state NOT IN ('succeeded','failed','cancelled','interrupted') OR ("
+            "cancel_state IN ('requested','unconfirmed') AND stop_confirmed=0)) "
+            "ORDER BY created_at LIMIT ?",
             (limit,),
         ).fetchall()
         return [self._load_task(r[0]) for r in rows]

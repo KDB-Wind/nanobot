@@ -178,6 +178,10 @@ class DispatchWorker:
         if not seen_instance:
             self._defer_preflight(entry, "capabilities did not report an instance id")
             return True
+        legacy_reason = await self._legacy_guard_reason(bot, seen_instance)
+        if legacy_reason is not None:
+            self._defer_for_quarantine(entry, legacy_reason)
+            return True
         if not bot.instance_id:
             if not self._store.bind_instance(bot.bot_id, seen_instance):
                 await self._indeterminate_identity(
@@ -307,6 +311,43 @@ class DispatchWorker:
             return active[key].reason
         return None
 
+    async def _legacy_guard_reason(self, bot, seen_instance: str) -> str | None:
+        """Refuse a target that may be the legacy unknown's alias.
+
+        The guard records the original endpoint and the credential the 0.4
+        task used. Probing that endpoint with that credential is the only
+        evidence that links a newly seen instance to the incident. An unmapped
+        or unreachable guard stays closed until an operator resolves it.
+        """
+        for guard in self._store.active_legacy_guards():
+            if guard.instance_id == seen_instance:
+                return f"legacy guard {guard.guard_key} maps to this instance"
+            if guard.instance_id:
+                continue
+            if not guard.secret_env:
+                return (
+                    f"legacy guard {guard.guard_key} has no credential mapping; "
+                    "an operator must resolve it"
+                )
+            try:
+                probe = await self._clients.for_bot(
+                    guard.endpoint, guard.secret_env
+                ).capabilities()
+            except (MissingSecretError, BotUnreachableError):
+                return (
+                    f"legacy guard {guard.guard_key} is unresolved and "
+                    f"{guard.endpoint} is unreachable"
+                )
+            if probe.status != 200 or not isinstance(probe.payload, dict):
+                return f"legacy guard {guard.guard_key} probe returned {probe.status}"
+            instance = str(probe.payload.get("instance_id", ""))
+            if not instance:
+                return f"legacy guard {guard.guard_key} probe reported no instance"
+            self._store.map_legacy_guard(guard.guard_key, instance)
+            if instance == seen_instance:
+                return f"legacy guard {guard.guard_key} maps to this instance"
+        return None
+
     def _defer_for_quarantine(self, entry, reason: str) -> None:
         self._store.defer_dispatch(
             entry.entry_id,
@@ -379,9 +420,15 @@ class DispatchWorker:
                 pass  # the accepted task's cancel path keeps driving the stop
             return
         if lookup is not None and lookup.status == 404:
-            # The remote definitively never saw this key: no work exists.
-            self._store.close_cancelled_unknown(
-                task.task_id, "reconciled: remote never created this run"
+            # A missing row at this instant is not a fence: the original POST
+            # may still be in flight and can commit later. Keep the cancel
+            # unknown and reconcile the same key again.
+            delay = BACKOFF_SECONDS[min(entry.attempts, len(BACKOFF_SECONDS) - 1)]
+            jitter = random.uniform(0, delay * 0.25)
+            self._store.bump_dispatch_attempt(
+                entry.entry_id,
+                utc_now() + timedelta(seconds=delay + jitter),
+                "cancel reconciliation pending: lookup returned 404",
             )
             return
         # Unknown transport: retry the same key on the normal backoff.

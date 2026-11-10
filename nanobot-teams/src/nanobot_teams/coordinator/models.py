@@ -133,6 +133,15 @@ class Quarantine:
 
 
 @dataclass(frozen=True)
+class LegacyEndpointGuard:
+    guard_key: str
+    endpoint: str
+    secret_env: str
+    instance_id: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True)
 class Event:
     seq: int
     at: datetime

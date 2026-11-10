@@ -14,7 +14,6 @@ from .models import DeliveryMode
 from .store import (
     AdmissionError,
     CoordinatorStore,
-    endpoint_guard_key,
     normalize_endpoint,
 )
 from .worker import ClientFactory, DispatchWorker
@@ -153,10 +152,14 @@ class CoordinatorService:
                             f"{endpoint}; verify before reuse",
                         )
                     else:
-                        self.store.quarantine_instance(
-                            endpoint_guard_key(endpoint),
+                        target_bot = (
+                            self.store.get_bot(record.target) if record.target else None
+                        )
+                        self.store.quarantine_legacy_endpoint(
+                            endpoint,
                             f"0.4 unknown outcome for task {record.task_id}; verify "
                             "before reuse",
+                            secret_env=target_bot.secret_env if target_bot else "",
                         )
                     imported["unknown_isolated"] += 1
         finally:

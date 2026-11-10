@@ -719,6 +719,16 @@ def build_app(
         workflow_id = request.match_info["workflow_id"].strip()
         if not workflow_id:
             return api_error(400, "invalid_field", "workflow_id is required.")
+        # Authorize the workflow before any grant revocation or task write. A
+        # planner owns only its own tasks; an operator owns the whole workflow.
+        planner_scope = "planner" if request[_ROLE_KEY] == "planner" else None
+        tasks = store.list_tasks(
+            workflow_id=workflow_id,
+            caller_principal=planner_scope,
+            limit=WORKFLOW_STOP_TASK_LIMIT,
+        )
+        if planner_scope is not None and not tasks:
+            return api_error(403, "forbidden", "Not your workflow.")
         revoked = False
         if config.planner is not None:
             try:
@@ -727,11 +737,6 @@ def build_app(
                 revoked = False
         cancelled: list[str] = []
         unconfirmed: list[str] = []
-        # The workflow's full task list is the operator's total; the stop
-        # pass only acts on tasks that can still receive a cancel request.
-        tasks = store.list_tasks(
-            workflow_id=workflow_id, limit=WORKFLOW_STOP_TASK_LIMIT
-        )
         for task in tasks:
             if task.cancel_state is not CancelState.NONE:
                 continue

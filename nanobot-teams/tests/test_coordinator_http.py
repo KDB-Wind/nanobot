@@ -508,6 +508,26 @@ async def test_stop_workflow_cancels_tasks_when_grant_cannot_be_revoked(
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_stop_workflow_keeps_the_planner_task_ownership_boundary(client):
+    """P16-01: the aggregate entry may not cancel another principal's tasks."""
+    await seed_catalog(client)
+    test_client, store = client
+    created = await test_client.post(
+        "/v1/teams/tasks",
+        headers=admin_headers(),
+        json=task_body(workflow="wf-operator-owned"),
+    )
+    assert created.status == 201, await created.text()
+    task_id = (await created.json())["task_id"]
+    stopped = await test_client.post(
+        "/v1/teams/workflows/wf-operator-owned/stop", headers=planner_headers()
+    )
+    assert stopped.status == 403, await stopped.text()
+    assert (await stopped.json())["code"] == "forbidden"
+    assert store.get_task(task_id).cancel_state.value == "none"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
 async def test_resolve_quarantine_is_operator_only_and_records_actor(client):
     test_client, store = client
     key = "legacy:http://127.0.0.1:8921"
