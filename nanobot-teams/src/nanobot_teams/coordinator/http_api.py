@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hmac
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -166,6 +167,9 @@ def bot_public_json(bot: Bot, *, include_secret_env: bool = True) -> dict[str, A
         "enabled": bot.enabled,
         "instance_id": bot.instance_id,
         "capabilities": list(bot.capabilities),
+        "inbox_url": bot.inbox_url,
+        "inbox_principal_id": bot.inbox_principal_id,
+        "inbox_bound": all((bot.inbox_url, bot.inbox_principal_id, bot.inbox_key_env)),
         "has_open_tasks": False,
     }
     if include_secret_env:
@@ -186,10 +190,32 @@ def build_app(
     @web.middleware
     async def auth_middleware(request: web.Request, handler):
         role = roles.identify(request)
+        if role is None:
+            auth = request.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                role = _identify_bot_principal(auth[len("Bearer "):])
         request[_ROLE_KEY] = role
         if role is None:
             return api_error(401, "unauthorized", "A coordinator role bearer token is required.")
         return await handler(request)
+
+    def _identify_bot_principal(token: str) -> str | None:
+        """Per-bot coordinator credentials identify their own bot principal.
+
+        The stored value is only an env-var name; a bot row whose env is unset
+        carries no credential at all.
+        """
+        try:
+            bots = store.list_bots()
+        except Exception:
+            return None
+        for bot in bots:
+            if not bot.coord_secret_env:
+                continue
+            secret = os.environ.get(bot.coord_secret_env, "")
+            if secret and hmac.compare_digest(token, secret):
+                return f"bot:{bot.bot_id}"
+        return None
 
     def require_role(request: web.Request, allowed: tuple[str, ...]) -> web.Response | None:
         if request[_ROLE_KEY] not in allowed:
@@ -197,9 +223,10 @@ def build_app(
         return None
 
     def principal_for(request: web.Request) -> str:
-        # The planner role is a single fixed principal; the operator acts as itself.
+        # Identity comes from token verification: the planner and operator
+        # roles are fixed principals; each bot credential is its own principal.
         role = request[_ROLE_KEY]
-        return "planner" if role == "planner" else "operator"
+        return role if role is not None else "operator"
 
     async def capabilities(request: web.Request) -> web.Response:
         return _json_response(
@@ -553,6 +580,22 @@ def build_app(
             return api_error(
                 409, "bot_has_open_tasks", "Settle or cancel open tasks before editing this bot."
             )
+        inbox_url = str(body.get("inbox_url", "")).strip() or None
+        inbox_principal_id = str(body.get("inbox_principal_id", "")).strip() or None
+        inbox_key_env = str(body.get("inbox_key_env", "")).strip() or None
+        coord_secret_env = str(body.get("coord_secret_env", "")).strip() or None
+        if inbox_url is not None and not _is_loopback_http_endpoint(inbox_url):
+            return api_error(
+                400, "invalid_field", "inbox_url must be a loopback http endpoint."
+            )
+        # I2: the receive binding is all-or-nothing.
+        inbox_fields = (inbox_url, inbox_principal_id, inbox_key_env)
+        if any(inbox_fields) and not all(inbox_fields):
+            return api_error(
+                400, "invalid_field",
+                "A receive binding requires inbox_url, inbox_principal_id, and "
+                "inbox_key_env together.",
+            )
         bot = Bot(
             bot_id=bot_id,
             display_name=str(body.get("display_name", bot_id)),
@@ -561,6 +604,10 @@ def build_app(
             secret_env=secret_env,
             enabled=bool(body.get("enabled", True)),
             capabilities=tuple(str(c) for c in body.get("capabilities", [])),
+            inbox_url=inbox_url,
+            inbox_principal_id=inbox_principal_id,
+            inbox_key_env=inbox_key_env,
+            coord_secret_env=coord_secret_env,
         )
         try:
             store.upsert_bot(bot)

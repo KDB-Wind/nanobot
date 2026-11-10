@@ -51,7 +51,11 @@ CREATE TABLE IF NOT EXISTS bots (
     capabilities TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    archived_at TEXT
+    archived_at TEXT,
+    inbox_url TEXT,
+    inbox_principal_id TEXT,
+    inbox_key_env TEXT,
+    coord_secret_env TEXT
 );
 CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT PRIMARY KEY,
@@ -325,6 +329,14 @@ class CoordinatorStore:
                     "WHERE attempts>0 AND submit_started_at IS NULL",
                     (iso(utc_now()),),
                 )
+            bots_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(bots)")
+            }
+            for column in (
+                "inbox_url", "inbox_principal_id", "inbox_key_env", "coord_secret_env"
+            ):
+                if column not in bots_columns:
+                    self._conn.execute(f"ALTER TABLE bots ADD COLUMN {column} TEXT")
             # Older databases recorded a legacy unknown only as a quarantine
             # key; dispatch identity checks read the guard table. Derive the
             # missing rows before any worker can run.
@@ -425,16 +437,23 @@ class CoordinatorStore:
             now = iso(utc_now())
             self._conn.execute(
                 "INSERT INTO bots(bot_id, display_name, role, endpoint, secret_env, enabled, "
-                "instance_id, capabilities, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "instance_id, capabilities, created_at, updated_at, inbox_url, "
+                "inbox_principal_id, inbox_key_env, coord_secret_env) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(bot_id) DO UPDATE SET display_name=excluded.display_name, "
                 "role=excluded.role, endpoint=excluded.endpoint, secret_env=excluded.secret_env, "
                 "enabled=excluded.enabled, instance_id=COALESCE(bots.instance_id, "
                 "excluded.instance_id), capabilities=excluded.capabilities, "
-                "updated_at=excluded.updated_at",
+                "updated_at=excluded.updated_at, inbox_url=excluded.inbox_url, "
+                "inbox_principal_id=excluded.inbox_principal_id, "
+                "inbox_key_env=excluded.inbox_key_env, "
+                "coord_secret_env=excluded.coord_secret_env",
                 (
                     bot.bot_id, bot.display_name, bot.role, bot.endpoint, bot.secret_env,
                     int(bot.enabled), bot.instance_id,
                     json.dumps(list(bot.capabilities)), now, now,
+                    bot.inbox_url, bot.inbox_principal_id, bot.inbox_key_env,
+                    bot.coord_secret_env,
                 ),
             )
             self._emit("bot_upserted", None, {"bot": bot.bot_id})
@@ -485,7 +504,8 @@ class CoordinatorStore:
         assert self._conn is not None
         row = self._conn.execute(
             "SELECT bot_id, display_name, role, endpoint, secret_env, enabled, instance_id, "
-            "capabilities, created_at, updated_at, archived_at FROM bots WHERE bot_id=? "
+            "capabilities, created_at, updated_at, archived_at, inbox_url, "
+            "inbox_principal_id, inbox_key_env, coord_secret_env FROM bots WHERE bot_id=? "
             "AND archived_at IS NULL",
             (bot_id,),
         ).fetchone()
@@ -497,6 +517,8 @@ class CoordinatorStore:
             capabilities=tuple(json.loads(row[7])), created_at=datetime.fromisoformat(row[8]),
             updated_at=datetime.fromisoformat(row[9]),
             archived_at=None if row[10] is None else datetime.fromisoformat(row[10]),
+            inbox_url=row[11], inbox_principal_id=row[12], inbox_key_env=row[13],
+            coord_secret_env=row[14],
         )
 
     def list_bots(self) -> list[Bot]:

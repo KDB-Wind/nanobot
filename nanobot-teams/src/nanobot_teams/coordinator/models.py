@@ -67,6 +67,14 @@ class Bot:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     archived_at: datetime | None = None
+    # Peer binding (I2): a bot receives async results only when its inbox URL,
+    # inbox principal, and inbox key reference are all present.
+    inbox_url: str | None = None
+    inbox_principal_id: str | None = None
+    inbox_key_env: str | None = None
+    # Coordinator credential reference (I1): the env var holding this bot's
+    # coordinator token; the value never enters the store or logs.
+    coord_secret_env: str | None = None
 
 
 @dataclass(frozen=True)
