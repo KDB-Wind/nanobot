@@ -441,6 +441,21 @@ def serve(
         runs_config=api_cfg.runs if api_cfg.runs.enabled else None,
     )
 
+    inbox_pump: Any | None = None
+    if api_cfg.runs.enabled and api_cfg.runs.inbox_enabled and runs_service is not None:
+        from nanobot.cli.serve_inbox import mount_serve_inbox
+
+        inbox_pump = mount_serve_inbox(
+            api_app,
+            session_manager=session_manager,
+            bus=bus,
+            runs_config=api_cfg.runs,
+        )
+        console.print(
+            f"  [cyan]Inbox[/cyan]     : enabled on the API listener "
+            f"(principal {api_cfg.runs.principal_id})"
+        )
+
     async def on_startup(_app: Any) -> None:
         await mcp_provider.connect()
         if runs_service is not None:
@@ -450,18 +465,29 @@ def serve(
                     "agent runs: {} run(s) interrupted by the previous shutdown",
                     len(interrupted),
                 )
+        if inbox_pump is not None:
+            _app["serve_inbox_wake"] = asyncio.create_task(
+                inbox_pump.run_forever(), name="nanobot-inbox-wake"
+            )
 
     async def on_cleanup(_app: Any) -> None:
         try:
-            if runs_service is not None:
-                await runs_service.aclose()
+            wake_task = _app.get("serve_inbox_wake")
+            if wake_task is not None:
+                wake_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await wake_task
         finally:
             try:
-                await agent_loop.aclose()
+                if runs_service is not None:
+                    await runs_service.aclose()
             finally:
-                if runs_store is not None:
-                    runs_store.close()
-                await mcp_provider.aclose()
+                try:
+                    await agent_loop.aclose()
+                finally:
+                    if runs_store is not None:
+                        runs_store.close()
+                    await mcp_provider.aclose()
 
     api_app.on_startup.append(on_startup)
     api_app.on_cleanup.append(on_cleanup)
