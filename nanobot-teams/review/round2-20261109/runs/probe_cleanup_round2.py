@@ -10,6 +10,7 @@ from nanobot.runs.executor import AgentLoopRunExecutor
 from nanobot.runs.service import RunService
 from nanobot.runs.store import RunStore
 from nanobot.runs.types import *
+from nanobot.runs.types import InstanceIsolatedError
 from nanobot.config.home import set_home_path
 from loguru import logger
 logger.remove()
@@ -59,9 +60,13 @@ async def resistant(root,deadline=False):
         final=s.get(r.run_id)
         running=loop.subagents.get_running_count_by_session(f'run:{r.run_id}')
         out('resistant_child_finalized',deadline=deadline,outcome=final.outcome.code,state=final.state,stop_confirmed=final.stop_confirmed,effects_uncertain=final.effects_uncertain,isolation=s.isolation()[0],live_owned_subagents=running,cancellations_seen=p.cancel_count)
-        r2=(await v.submit(req('next'))).run
-        await until(lambda:s.get(r2.run_id).terminal)
-        out('resistant_child_next_run',state=s.get(r2.run_id).state,prior_child_alive=not p.release.is_set() and loop.subagents.get_running_count_by_session(f'run:{r.run_id}')>0)
+        try:
+            r2=(await v.submit(req('next'))).run
+        except InstanceIsolatedError as exc:
+            out('resistant_child_next_run',state='blocked_by_isolation',reason=str(exc)[:120],prior_child_alive=not p.release.is_set() and loop.subagents.get_running_count_by_session(f'run:{r.run_id}')>0)
+        else:
+            await until(lambda:s.get(r2.run_id).terminal)
+            out('resistant_child_next_run',state=s.get(r2.run_id).state,prior_child_alive=not p.release.is_set() and loop.subagents.get_running_count_by_session(f'run:{r.run_id}')>0)
     finally:
         p.release.set();await asyncio.sleep(.1);await v.aclose();await loop.aclose();s.close()
 async def exception(root):

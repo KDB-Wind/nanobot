@@ -48,8 +48,7 @@ the process ends first, recovery marks it interrupted (unknown), not cancelled.
 
 ## T2 durable continuation
 
-external_inbox gains wake_state columns? No. wake_due stays 1 until the turn is
-accepted. The pump no longer clears it. It holds an in-process lease per
+wake_due stays 1 until the turn is accepted. The pump no longer clears it. It holds an in-process lease per
 delivery (30s) so one pump tick cannot double-publish; lease state dies with
 the process, which is exactly when the obligation must be republished.
 

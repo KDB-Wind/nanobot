@@ -10,7 +10,7 @@ import repro_coordinator; repro_coordinator.ROOT=Path(__file__).parent
 from nanobot_teams.coordinator.worker import DispatchWorker,ClientFactory
 from nanobot_teams.coordinator.models import Bot
 from nanobot_teams.coordinator.store import AdmissionError
-from nanobot_teams.async_mcp import CoordinatorClient
+from nanobot_teams.async_mcp import CoordinatorClient, CoordinatorHttpError
 
 def emit(mode, **kw): print(json.dumps(dict(mode=mode,**kw)))
 async def cancel_race():
@@ -45,7 +45,15 @@ async def mcp_bounds():
     async def get(req):return web.Response(body=gzip.compress(json.dumps({'bots':[{'payload':'x'*1048576}]}).encode()),headers={'Content-Encoding':'gzip'})
     app=web.Application();app.router.add_get('/v1/teams/bots',get)
     async with TestServer(app) as server:
-        client=CoordinatorClient(str(server.make_url('/')).rstrip('/'),'synthetic');result=await client.list_bots();emit('mcp_bounds',gzip_accepted=True,decoded_bytes=len(result[0]['payload']));await client.aclose()
+        client=CoordinatorClient(str(server.make_url('/')).rstrip('/'),'synthetic')
+        try:
+            result=await client.list_bots()
+        except CoordinatorHttpError as exc:
+            emit('mcp_bounds',gzip_accepted=False,code=exc.code,expected='compressed and oversize replies rejected')
+        else:
+            emit('mcp_bounds',gzip_accepted=True,decoded_bytes=len(result[0]['payload']))
+        finally:
+            await client.aclose()
 async def main():
     for fn in (cancel_race,uncertainty,mcp_bounds):await fn()
     migration_bytes()
