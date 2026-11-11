@@ -154,7 +154,7 @@ class ChannelManager:
         self._teams_event_relay: Any | None = None
         import nanobot.cli.gateway_runtime as _gr
         if self._teams_proxy is not None:
-            _gr._PENDING_TEAMS_PROXY["proxy"] = self._teams_proxy
+            _gr.register_pending_teams_proxy(self._teams_proxy)
         self._webui_discard_session = webui_discard_session
         self.channels: dict[str, BaseChannel] = {}
         self._channel_owners: dict[str, str] = {}

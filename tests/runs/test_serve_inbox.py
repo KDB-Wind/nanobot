@@ -45,7 +45,7 @@ async def inbox_app(tmp_path):
     from nanobot.runs.store import RunStore
     from nanobot.session.inbox_wake import InboxWakePump
     from nanobot.session.manager import SessionManager
-    from tests.runs.test_run_service import FakeExecutor
+    from runs.test_run_service import FakeExecutor
 
     store = RunStore(tmp_path / "runs.sqlite3")
     store.open()

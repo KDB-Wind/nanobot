@@ -24,7 +24,7 @@ from nanobot.runs.types import (
     StoreUnavailableError,
     utc_now,
 )
-from tests.runs.test_run_service import FakeExecutor
+from runs.test_run_service import FakeExecutor
 
 
 def _req(key: str | None = None) -> RunSubmit:

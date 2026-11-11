@@ -698,21 +698,21 @@ def _mcp_image_tool_result(text_parts: list[str], artifacts: list[dict[str, Any]
     return json.dumps(payload, ensure_ascii=False)
 
 
-_TEAMS_ASYNC_META_HOOK: Callable[[str], Callable[[], dict[str, str]]] | None = None
+_teams_async_meta_hook: Callable[[str], Callable[[], dict[str, str]]] | None = None
 
 
 def set_teams_async_meta_hook(
     hook: Callable[[str], Callable[[], dict[str, str]]] | None,
 ) -> None:
     """Gateway assembly injects the capability mint; other hosts stay inert."""
-    global _TEAMS_ASYNC_META_HOOK
-    _TEAMS_ASYNC_META_HOOK = hook
+    global _teams_async_meta_hook
+    _teams_async_meta_hook = hook
 
 
 def _teams_async_meta_provider(server_name: str) -> Callable[[], dict[str, str]] | None:
-    if _TEAMS_ASYNC_META_HOOK is None:
+    if _teams_async_meta_hook is None:
         return None
-    return _TEAMS_ASYNC_META_HOOK(server_name)
+    return _teams_async_meta_hook(server_name)
 
 
 class MCPToolWrapper(_MCPWrapperBase):
@@ -772,13 +772,24 @@ class MCPToolWrapper(_MCPWrapperBase):
                     f"Rejected model-supplied routing fields: {', '.join(forged)}"
                 )
             meta = self._trusted_meta_provider()
-        result = await self._request_with_recovery(
-            lambda session: session.call_tool(
-                self._original_name, arguments=kwargs, meta=meta
-            ),
-            self._tool_timeout,
-            "tool",
-        )
+        # Older MCP clients expose call_tool(name, arguments) only. Pass meta
+        # only when this tool actually minted routing fields.
+        if meta is None:
+            result = await self._request_with_recovery(
+                lambda session: session.call_tool(
+                    self._original_name, arguments=kwargs
+                ),
+                self._tool_timeout,
+                "tool",
+            )
+        else:
+            result = await self._request_with_recovery(
+                lambda session: session.call_tool(
+                    self._original_name, arguments=kwargs, meta=meta
+                ),
+                self._tool_timeout,
+                "tool",
+            )
         if isinstance(result, ToolResult):
             return result
         try:

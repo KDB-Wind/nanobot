@@ -14,7 +14,7 @@ from nanobot.config.schema import ApiRunsConfig
 from nanobot.runs.service import RunService
 from nanobot.runs.store import RunStore
 from nanobot.runs.types import ExecutionResult, OutcomeCode, utc_now
-from tests.runs.test_run_service import FakeExecutor
+from runs.test_run_service import FakeExecutor
 
 try:
     from aiohttp.test_utils import TestClient, TestServer

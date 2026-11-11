@@ -103,6 +103,10 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --dev
 
+      # tests/runs/test_p4_chain.py imports the in-repo teams package.
+      - name: Install the teams subpackage for integration tests
+        run: uv pip install --no-deps -e nanobot-teams
+
       # Feishu selects websockets<16. Check the default transport before the
       # all-channel suite exercises the older compatible resolution.
       - name: Test default WebSocket transport

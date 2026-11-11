@@ -61,12 +61,19 @@ from nanobot.webui.dev import WebUIDevError, WebUIDevServer
 from nanobot.webui.sidebar_state import ensure_webui_session_archives
 
 # Set by the inbox sidecar assembly; read once by the startup recovery scan.
-_PENDING_EXTERNAL_INBOX: dict[str, object] = {}
-_PENDING_TEAMS_PROXY: dict[str, object] = {}
+_PENDING_EXTERNAL_INBOX: dict[str, "ExternalInbox"] = {}
+_PENDING_TEAMS_PROXY: dict[str, "TeamsProxy"] = {}
+
+
+def register_pending_teams_proxy(proxy: "TeamsProxy") -> None:
+    """ChannelManager hands its proxy to the gateway assembly through here."""
+    _PENDING_TEAMS_PROXY["proxy"] = proxy
 
 if TYPE_CHECKING:
+    from nanobot.session.external_inbox import ExternalInbox
     from nanobot.update_profiles import ProfileReceipt
     from nanobot.update_restart import GatewayStartup
+    from nanobot.webui.teams_proxy import TeamsProxy
 
 __all__ = ["_run_gateway"]
 

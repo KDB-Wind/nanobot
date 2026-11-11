@@ -124,6 +124,7 @@ if TYPE_CHECKING:
         ToolsConfig,
     )
     from nanobot.cron.service import CronService
+    from nanobot.session.external_inbox import ExternalInbox
     from nanobot.triggers.local_store import LocalTriggerStore
 
 _T = TypeVar("_T")
@@ -226,6 +227,10 @@ class AgentLoop:
     4. Executes tool calls
     5. Sends responses back
     """
+
+    # Installed by the gateway when the runs inbox sidecar is enabled. The
+    # user-turn hook checks it to revoke stale workflow grants.
+    external_inbox: ExternalInbox | None = None
 
     @property
     def tool_names(self) -> list[str]:
@@ -2673,7 +2678,10 @@ class AgentLoop:
             )
             skip_user_persist = (
                 isinstance(internal_meta, dict)
-                and internal_meta.get(turn_continuation.SKIP_USER_PERSIST_META) is True
+                and cast(dict[str, Any], internal_meta).get(
+                    turn_continuation.SKIP_USER_PERSIST_META
+                )
+                is True
             )
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):

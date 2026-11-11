@@ -150,8 +150,9 @@ class _WriterLock:
             raise
 
     def close(self) -> None:
-        if getattr(self, "_fd", None) is not None:
-            os.close(self._fd)
+        fd = self._fd
+        if fd is not None:
+            os.close(fd)
             self._fd = None
 
     def __del__(self) -> None:

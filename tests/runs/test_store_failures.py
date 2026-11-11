@@ -45,7 +45,7 @@ async def test_runs_admission_fails_closed_on_readonly_db(tmp_path):
 
 async def test_runs_observation_failure_keeps_pending_run(tmp_path):
     """Result writes failing must not turn the run terminal or free the slot."""
-    from tests.runs.test_run_service import FakeExecutor
+    from runs.test_run_service import FakeExecutor
 
     store = RunStore(tmp_path / "runs.sqlite3")
     store.open()
