@@ -1003,11 +1003,13 @@ class GatewayHTTPHandler:
             if body is None:
                 return _http_error(400, "invalid teams payload")
         result = await proxy.forward(method, path, body)
-        payload = result.payload if isinstance(result.payload, (dict, list)) else {
-            "message": str(result.payload),
-        }
+        raw_payload: Any = result.payload
+        payload: dict[str, Any] = (
+            raw_payload if isinstance(raw_payload, dict)
+            else {"message": str(raw_payload)}
+        )
         return _http_json_response(
-            cast(dict[str, Any], payload),
+            payload,
             status=result.status,
             extra_headers=_NO_STORE_HEADERS,
         )
