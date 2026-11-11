@@ -422,7 +422,7 @@ def serve(
         # Bounded wait: a hard-killed predecessor's OS lock may clear a moment
         # after death. Failing here happens before any port bind or recovery,
         # so a competing serve can never disturb existing runs.
-        runs_store.open(lock_wait_s=60.0)
+        runs_store.open(lock_wait_s=10.0)
         runs_service = RunService(
             runs_store,
             AgentLoopRunExecutor(

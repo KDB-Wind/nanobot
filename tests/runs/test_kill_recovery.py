@@ -36,7 +36,18 @@ def _wait_for(path: Path, timeout: float = 20.0) -> str:
 
 
 def _kill_child(proc: subprocess.Popen) -> None:
-    proc.kill()  # TerminateProcess on Windows: no cleanup handlers run.
+    if sys.platform == "win32":
+        # The venv's python.exe is a launcher that re-executes the script as a
+        # child, so killing only the launcher leaves the real interpreter and
+        # its writer lock alive.
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        proc.kill()
     proc.wait(timeout=10)
 
 
@@ -78,7 +89,7 @@ async def test_hard_kill_recovery(tmp_path, mode):
     # wait absorbs the moment Windows takes to release the killed process's
     # byte-range lock (the same semantics serve uses).
     store = RunStore(db_path)
-    store.open(lock_wait_s=60.0)
+    store.open(lock_wait_s=10.0)
     executor = RecordingExecutor()
     service = RunService(store, executor)
     interrupted = service._store.recover()

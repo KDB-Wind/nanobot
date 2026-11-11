@@ -170,8 +170,7 @@ class RunStore:
 
         A second writer fails here, before it can read runs, recover crashes, or
         mutate anything. ``lock_wait_s`` bounds the wait for a hard-killed
-        predecessor whose OS lock may clear a moment after death; a loaded
-        Windows runner can take longer than ten seconds to release it.
+        predecessor whose OS lock may clear a moment after death.
         """
         lock_path = Path(str(self._path) + ".writer.lock")
         deadline = time.monotonic() + lock_wait_s
