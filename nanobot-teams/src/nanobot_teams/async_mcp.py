@@ -49,6 +49,24 @@ _SEND_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+def _normalize_operation_key(raw: str) -> str:
+    """Accept any stable model-chosen key, forward a protocol UUID.
+
+    The runs protocol hard-requires UUID Idempotency-Keys; models sometimes
+    invent readable keys instead. A non-UUID key maps deterministically to
+    uuid5 so retries with the same model string stay one business send.
+    """
+    import uuid as _uuid
+
+    candidate = raw.strip()
+    try:
+        return str(_uuid.UUID(candidate))
+    except (ValueError, AttributeError):
+        return str(
+            _uuid.uuid5(_uuid.NAMESPACE_URL, f"nanobot-teams/peer/{candidate}")
+        )
+
+
 _LIST_BOTS_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
 _SUBMIT_SCHEMA: dict[str, Any] = {
@@ -412,7 +430,9 @@ def build_async_server(client: CoordinatorClient) -> Server:
                 body = {
                     "recipient": arguments.get("recipient"),
                     "input": arguments.get("input"),
-                    "operation_key": arguments.get("operation_key"),
+                    "operation_key": _normalize_operation_key(
+                        str(arguments.get("operation_key", ""))
+                    ),
                 }
                 for optional in ("conversation_root", "hop", "project", "deadline_at"):
                     if arguments.get(optional) is not None:

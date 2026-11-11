@@ -258,3 +258,23 @@ async def test_stdio_mcp_roundtrip_and_reopen(coord_server, tmp_path, monkeypatc
     finally:
         await server.close()
         store.close()
+
+
+def test_normalize_operation_key_accepts_uuids_verbatim() -> None:
+    from nanobot_teams.async_mcp import _normalize_operation_key
+
+    key = "0e373347-2f79-4a90-9438-9238ae5ec399"
+    assert _normalize_operation_key(key) == key
+
+
+def test_normalize_operation_key_maps_model_strings_deterministically() -> None:
+    from nanobot_teams.async_mcp import _normalize_operation_key
+
+    first = _normalize_operation_key("a199b129-0000-4000-8000-peerdelegate")
+    second = _normalize_operation_key("a199b129-0000-4000-8000-peerdelegate")
+    other = _normalize_operation_key("some-other-idea")
+    assert first == second
+    assert first != other
+    import uuid as _uuid
+
+    _uuid.UUID(first)
