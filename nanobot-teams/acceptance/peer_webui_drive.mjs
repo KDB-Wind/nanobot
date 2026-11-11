@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { execSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 
-const [url, shotsDir, packageJson, coordPort, wsToken] = process.argv.slice(2);
+const [url, shotsDir, packageJson, coordPort, wsToken, stopBot] = process.argv.slice(2);
 const require = createRequire(packageJson);
 const { chromium } = require("playwright");
 mkdirSync(shotsDir, { recursive: true });
@@ -96,6 +96,45 @@ try {
   await page.screenshot({ path: shotsDir + "/03-narrow.png", fullPage: true });
   check("narrow viewport stays usable",
     (await page.locator("[data-teams-usage]").count()) === 1);
+
+  if (stopBot) {
+    // The lab killed this worker, so a task addressed to it never leaves the
+    // pending state: the stop control stays clickable and nothing races it.
+    await page.evaluate(() => localStorage.setItem("nanobot.locale", "en"));
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("about:blank");
+    await page.goto(url + "#/settings?section=teams", { waitUntil: "domcontentloaded" });
+    await connectOnce();
+    await page.locator("[data-teams-root]").waitFor();
+    const input = page.locator("[data-teams-root] textarea");
+    await input.locator("xpath=preceding-sibling::select[1]").selectOption(stopBot);
+    await input.fill("Summarise the archive in twenty paragraphs.");
+    await input.locator("xpath=following-sibling::button[1]").click();
+    const stop = page.locator("[data-stop-workflow]").first();
+    await stop.waitFor({ timeout: 60_000 });
+    const submitted = (await page.locator("[data-submit-state]").textContent()) || "";
+    const taskId = (submitted.match(/task_[0-9a-f-]+/) || [null])[0];
+    await page.screenshot({ path: shotsDir + "/05-stop-before.png", fullPage: true });
+    await stop.click();
+    const stopped = await page
+      .waitForFunction(
+        (id) => {
+          const row = document.querySelector(`tr[data-task-id="${id}"]`);
+          if (!row) return false;
+          // A cell whose whole text is "confirmed"; "unconfirmed" must not count.
+          return [...row.querySelectorAll("td")].some(
+            (cell) => (cell.textContent || "").trim().toLowerCase() === "confirmed",
+          );
+        },
+        taskId,
+        { timeout: 60_000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+    await page.screenshot({ path: shotsDir + "/05-stop-after.png", fullPage: true });
+    console.log("stop target:", taskId);
+    check("the workbench stop control cancels the pending task", stopped);
+  }
 
   if (coordPort) {
     execSync(

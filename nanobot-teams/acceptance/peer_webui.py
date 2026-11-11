@@ -36,6 +36,10 @@ def main() -> int:
         if reg.get("status") != "pass":
             print(json.dumps(reg, ensure_ascii=False))
             return 2
+        # The browser lab stops one worker so a task addressed to it can never
+        # leave the pending state: that is the row the workbench's stop
+        # control acts on, and it keeps the exercise free of run races.
+        lab.stop_worker("analyst")
         # One writer run via the protocol-level peer dispatch (usage + a peer
         # task the workbench can show), then one quick research run so two
         # bots have usage data.
@@ -74,6 +78,7 @@ def main() -> int:
                 str(WEBUI / "package.json"),
                 str(lab.coord_port),
                 lab.ws_token,
+                "analyst",
             ],
             cwd=str(WEBUI), capture_output=True, text=True, timeout=420,
         )

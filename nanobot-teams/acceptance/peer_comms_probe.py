@@ -163,6 +163,7 @@ class PeerLab:
         self.ws_token = secrets.token_urlsafe(12)
         self.procs: list[subprocess.Popen] = []
         self.logs: list[tuple[subprocess.Popen, object]] = []
+        self.named: dict[str, subprocess.Popen] = {}
         # Browser labs disable the websocket token; MCP-driven labs keep it.
         self.ws_requires_token = True
         self.coord_proc: subprocess.Popen | None = None
@@ -300,7 +301,36 @@ class PeerLab:
                                 stdout=handle, stderr=subprocess.STDOUT)
         self.procs.append(proc)
         self.logs.append((proc, handle))
+        self.named[name] = proc
         return proc
+
+    def stop_worker(self, bot: str) -> None:
+        """Kill one worker and wait for its port to close.
+
+        Used by the browser lab to leave a task permanently pending, so the
+        workbench's stop control has something to act on.
+        """
+        proc = self.named.pop(bot, None)
+        if proc is None:
+            raise SystemExit(f"FAIL {self.name}: no process named {bot}")
+        if sys.platform == "win32":
+            # The venv launcher re-executes the script; kill the tree.
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+        else:
+            proc.kill()
+        proc.wait(timeout=15)
+        port = self.worker_ports[bot]
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    time.sleep(0.2)
+            except OSError:
+                return
+        raise SystemExit(f"FAIL {self.name}: worker {bot} still listens on {port}")
 
     def spawn_coordinator(self, config_path: Path) -> subprocess.Popen:
         self.coord_proc = self.spawn(
