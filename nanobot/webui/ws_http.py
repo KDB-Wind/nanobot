@@ -984,6 +984,9 @@ class GatewayHTTPHandler:
         """Proxy one browser workbench call to the coordinator."""
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
+        proxy = self.teams_proxy
+        if proxy is None:
+            return _http_error(503, "Teams workbench not configured")
         # Plain GETs arrive from the websockets parser, whose Request carries
         # only path and headers — the method is GET by construction. Bodies
         # ride the aiohttp bridge, whose BaseRequest does carry .method.
@@ -999,9 +1002,12 @@ class GatewayHTTPHandler:
             body = _mutation_payload(request)
             if body is None:
                 return _http_error(400, "invalid teams payload")
-        result = await self.teams_proxy.forward(method, path, body)
+        result = await proxy.forward(method, path, body)
+        payload = result.payload if isinstance(result.payload, (dict, list)) else {
+            "message": str(result.payload),
+        }
         return _http_json_response(
-            result.payload if isinstance(result.payload, (dict, list)) else {"message": str(result.payload)},
+            cast(dict[str, Any], payload),
             status=result.status,
             extra_headers=_NO_STORE_HEADERS,
         )
