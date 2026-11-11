@@ -415,6 +415,10 @@ class GatewayHTTPHandler:
     services owned by the composition layer.
     """
 
+    # Tests build the handler with object.__new__; construction paths that do
+    # not touch teams still need the attribute to exist.
+    teams_proxy: Any | None = None
+
     def __init__(
         self,
         *,

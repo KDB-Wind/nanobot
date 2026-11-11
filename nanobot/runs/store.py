@@ -177,23 +177,42 @@ class RunStore:
         while True:
             try:
                 self._lock = _WriterLock(lock_path)
-                break
             except OSError:
                 if time.monotonic() >= deadline:
                     raise StoreUnavailableError(
                         "Another writer process holds the runs control store."
                     ) from None
                 time.sleep(0.25)
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(self._path, isolation_level=None, timeout=5.0)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=FULL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.executescript(_SCHEMA)
-        except (OSError, sqlite3.Error) as exc:
-            self.close()
-            raise StoreUnavailableError("Cannot open the runs control database.") from exc
+                continue
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                self._conn = sqlite3.connect(self._path, isolation_level=None, timeout=5.0)
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=FULL")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._conn.executescript(_SCHEMA)
+                return
+            except sqlite3.OperationalError as exc:
+                # A hard-killed predecessor can keep the file busy for a moment
+                # on Windows, where SQLite reports it as a disk I/O error rather
+                # than a locked database. Hold the writer lock and retry.
+                transient = (
+                    "disk I/O error" in str(exc) or "database is locked" in str(exc)
+                )
+                if self._conn is not None:
+                    self._conn.close()
+                    self._conn = None
+                if not transient or time.monotonic() >= deadline:
+                    self.close()
+                    raise StoreUnavailableError(
+                        "Cannot open the runs control database."
+                    ) from exc
+                time.sleep(0.25)
+            except (OSError, sqlite3.Error) as exc:
+                self.close()
+                raise StoreUnavailableError(
+                    "Cannot open the runs control database."
+                ) from exc
 
     def close(self) -> None:
         if self._conn is not None:
