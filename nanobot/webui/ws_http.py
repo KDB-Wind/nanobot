@@ -984,10 +984,14 @@ class GatewayHTTPHandler:
         """Proxy one browser workbench call to the coordinator."""
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
-        if request.method not in ("GET", "POST"):
+        # Plain GETs arrive from the websockets parser, whose Request carries
+        # only path and headers — the method is GET by construction. Bodies
+        # ride the aiohttp bridge, whose BaseRequest does carry .method.
+        method = getattr(request, "method", None) or "GET"
+        if method not in ("GET", "POST"):
             return _http_error(405, "Method not allowed")
         body: dict[str, Any] | None = None
-        if request.method == "POST":
+        if method == "POST":
             if not getattr(request, _WEBUI_MUTATION_REQUEST_ATTR, False):
                 return _http_error(
                     405, "Teams mutations require an authenticated WebSocket"
@@ -995,7 +999,7 @@ class GatewayHTTPHandler:
             body = _mutation_payload(request)
             if body is None:
                 return _http_error(400, "invalid teams payload")
-        result = await self.teams_proxy.forward(request.method, path, body)
+        result = await self.teams_proxy.forward(method, path, body)
         return _http_json_response(
             result.payload if isinstance(result.payload, (dict, list)) else {"message": str(result.payload)},
             status=result.status,
