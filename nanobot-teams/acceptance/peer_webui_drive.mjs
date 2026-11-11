@@ -51,7 +51,11 @@ const check = (name, ok) => {
 
 try {
   await page.addInitScript(() => {
-    try { localStorage.setItem("nanobot.locale", "en"); } catch {}
+    // Init scripts re-run on every load; only seed the default so a later
+    // in-test locale change survives the reload.
+    try {
+      if (!localStorage.getItem("nanobot.locale")) localStorage.setItem("nanobot.locale", "en");
+    } catch {}
   });
   await openWorkbench();
 
@@ -78,6 +82,9 @@ try {
   await page.evaluate(() => {
     localStorage.setItem("nanobot.locale", "zh-CN");
   });
+  // The locale is read at boot; a hash-only goto never reloads the app.
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await connectOnce();
   await openWorkbench();
   await page.waitForFunction(() =>
     document.body.innerText.includes("每 Bot 用量"));
@@ -98,6 +105,7 @@ try {
       { stdio: "ignore" },
     );
     await page.evaluate(() => localStorage.setItem("nanobot.locale", "en"));
+    await page.goto("about:blank");
     await page.goto(url + "#/settings?section=teams", { waitUntil: "domcontentloaded" });
     await page.locator("[data-teams-root]").waitFor();
     const sawError = await page
