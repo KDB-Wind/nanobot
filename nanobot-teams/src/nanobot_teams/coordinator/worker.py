@@ -540,7 +540,9 @@ class DispatchWorker:
                 await self._deliver_one(task)
             after = self._store.get_task(task.task_id)
             after_state = after.delivery_state.value if after else before
-            if after_state == before and after_state == "pending":
+            if after_state == before and after_state in ("pending", "persisted"):
+                # Neither the delivery nor the receipt poll moved the state:
+                # an unreachable inbox must back off, not re-poll every pump.
                 attempts = self._delivery_attempts.get(task.task_id, 0) + 1
                 self._delivery_attempts[task.task_id] = attempts
                 delay = min(30.0, (2.0 ** min(attempts, 5)))
@@ -549,7 +551,9 @@ class DispatchWorker:
                 self._delivery_attempts.pop(task.task_id, None)
                 self._delivery_retry_at.pop(task.task_id, None)
             progressed = True
-        return progressed or bool(tasks)
+        # Report progress only when work happened: a queue of fully backed-off
+        # tasks must let the run loop sleep instead of busy-querying the store.
+        return progressed
 
     async def _deliver_one(self, task) -> None:
         import httpx

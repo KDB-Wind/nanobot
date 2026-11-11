@@ -103,3 +103,24 @@ async def test_teams_proxy_still_reads_the_method_from_bridged_posts() -> None:
     # POSTs without the authenticated-WebSocket mutation marker stay refused.
     assert response.status_code == 405
     assert proxy.calls == []
+
+
+@pytest.mark.asyncio
+async def test_teams_proxy_mutation_marker_forces_post_on_parser_shape() -> None:
+    """Workbench stop/cancel mutations arrive as parser-shaped requests with
+    the authenticated mutation marker; they must forward as POST, not ride
+    the GET fallback into a coordinator 405."""
+    from nanobot.webui.ws_http import _WEBUI_MUTATION_REQUEST_ATTR
+
+    proxy = _RecordingProxy()
+    handler = _MinimalHandler(proxy)
+    request = _WebsocketsStyleRequest("/api/teams/workflows/wf-1/stop")
+    from nanobot.webui.ws_http import _WEBUI_MUTATION_PAYLOAD_ATTR
+
+    setattr(request, _WEBUI_MUTATION_REQUEST_ATTR, True)
+    setattr(request, _WEBUI_MUTATION_PAYLOAD_ATTR, {"workflow_id": "wf-1"})
+    response = await handler._handle_teams_proxy(
+        request, "/api/teams/workflows/wf-1/stop"
+    )
+    assert response.status_code == 200
+    assert proxy.calls[0][0] == "POST"

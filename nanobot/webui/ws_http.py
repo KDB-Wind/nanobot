@@ -988,9 +988,13 @@ class GatewayHTTPHandler:
         if proxy is None:
             return _http_error(503, "Teams workbench not configured")
         # Plain GETs arrive from the websockets parser, whose Request carries
-        # only path and headers — the method is GET by construction. Bodies
-        # ride the aiohttp bridge, whose BaseRequest does carry .method.
-        method = getattr(request, "method", None) or "GET"
+        # only path and headers — the method is GET by construction. Workbench
+        # mutations arrive the same shape but carry the authenticated-WebSocket
+        # mutation marker, which is what makes them POSTs. Bodies via the
+        # aiohttp bridge carry .method explicitly.
+        method = getattr(request, "method", None) or (
+            "POST" if getattr(request, _WEBUI_MUTATION_REQUEST_ATTR, False) else "GET"
+        )
         if method not in ("GET", "POST"):
             return _http_error(405, "Method not allowed")
         body: dict[str, Any] | None = None
