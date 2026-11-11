@@ -78,7 +78,7 @@ async def test_hard_kill_recovery(tmp_path, mode):
     # wait absorbs the moment Windows takes to release the killed process's
     # byte-range lock (the same semantics serve uses).
     store = RunStore(db_path)
-    store.open(lock_wait_s=10.0)
+    store.open(lock_wait_s=60.0)
     executor = RecordingExecutor()
     service = RunService(store, executor)
     interrupted = service._store.recover()
