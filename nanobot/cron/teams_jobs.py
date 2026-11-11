@@ -22,7 +22,11 @@ async def run_teams_cron_job(job: CronJob, teams_proxy: Any | None) -> CronRunRe
     details: dict[str, Any] = {"kind": "teams_task", "run_id": run_id}
     if teams_proxy is None or not getattr(teams_proxy, "enabled", False):
         raise RuntimeError("teams cron job requires a configured coordinator")
-    trigger_id = f"{job.id}:{job.state.last_run_at_ms or _now_ms()}"
+    # The fire's identity is the slot it came due for, not the wall clock at
+    # callback time. If the state save is lost the scheduler delivers the same
+    # slot again, and that redelivery has to reconcile to the same task.
+    slot = job.state.next_run_at_ms or job.state.last_run_at_ms or _now_ms()
+    trigger_id = f"{job.id}:{slot}"
     operation_key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"teams-cron:{trigger_id}"))
     body = {
         "project": payload.origin_metadata.get("teams_project", "cron"),

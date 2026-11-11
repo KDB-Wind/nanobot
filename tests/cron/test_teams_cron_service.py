@@ -46,12 +46,15 @@ async def test_cron_service_runs_teams_job_and_dedupes_fire(tmp_path):
 
     service.on_job = on_job
     job = make_job()
+    slot = 1_770_000_000_000
+    job.state.next_run_at_ms = slot
     await service._execute_job(job)
     assert job.state.last_status == "ok"
     first_run_id = job.state.run_history[-1].run_id
 
-    # The same fire redelivered (e.g. timer raced): same job state, one task.
-    job.state.last_run_at_ms = job.state.run_history[-1].run_at_ms
+    # The advanced schedule did not persist (crash before the store save), so
+    # the scheduler delivers the same slot again: one task, a second run record.
+    job.state.next_run_at_ms = slot
     await service._execute_job(job)
     assert job.state.last_status == "ok"
     assert len(proxy.submissions) == 1
