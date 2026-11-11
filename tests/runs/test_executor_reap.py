@@ -49,10 +49,11 @@ class _ExecProvider(LLMProvider):
                         "sleep",
                         "exec",
                         {
+                            # No explicit shell: pwsh is Windows-only here, so
+                            # the platform default keeps this runnable on Linux.
                             "command": (
-                                f'& "{sys.executable}" -c "import time; time.sleep(60)"'
+                                f'"{sys.executable}" -c "import time; time.sleep(60)"'
                             ),
-                            "shell": "pwsh",
                             "login": False,
                             "yield_time_ms": 0,
                         },
