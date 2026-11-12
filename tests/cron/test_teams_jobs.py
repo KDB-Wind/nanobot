@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from nanobot.cron.service import CronJob, CronJobState
+from nanobot.cron.service import CronJob
 from nanobot.cron.teams_jobs import run_teams_cron_job
-from nanobot.cron.types import CronPayload, CronSchedule
+from nanobot.cron.types import CronInvocation, CronPayload, CronSchedule
 
 
 class FakeProxy:
@@ -30,7 +30,7 @@ class _Result:
         self.payload = payload
 
 
-def make_job(job_id="job-1", last_run_ms=1000):
+def make_job(job_id="job-1"):
     payload = CronPayload(
         kind="teams_task",
         message="daily research brief",
@@ -42,15 +42,15 @@ def make_job(job_id="job-1", last_run_ms=1000):
         schedule=CronSchedule(kind="every"),
         payload=payload,
     )
-    job.state = CronJobState(last_run_at_ms=last_run_ms)
     return job
 
 
 async def test_same_fire_duplicate_delivery_submits_one_task():
     proxy = FakeProxy()
-    job = make_job(last_run_ms=1000)
-    first = await run_teams_cron_job(job, proxy)
-    second = await run_teams_cron_job(job, proxy)
+    job = make_job()
+    invocation = CronInvocation.scheduled(job.id, 1000)
+    first = await run_teams_cron_job(job, proxy, invocation=invocation)
+    second = await run_teams_cron_job(job, proxy, invocation=invocation)
     assert len(proxy.submissions) == 1
     assert first.response == "ok"
     assert second.response == "ok"  # replay reconciles
@@ -58,8 +58,9 @@ async def test_same_fire_duplicate_delivery_submits_one_task():
 
 async def test_distinct_fires_use_distinct_keys():
     proxy = FakeProxy()
-    await run_teams_cron_job(make_job(last_run_ms=1000), proxy)
-    await run_teams_cron_job(make_job(last_run_ms=60000), proxy)
+    job = make_job()
+    await run_teams_cron_job(job, proxy, invocation=CronInvocation.scheduled(job.id, 1000))
+    await run_teams_cron_job(job, proxy, invocation=CronInvocation.scheduled(job.id, 60000))
     assert len(proxy.submissions) == 2
 
 
@@ -67,6 +68,6 @@ async def test_missing_bot_or_proxy_fails_the_run():
     job = make_job()
     job.payload.origin_metadata.pop("teams_bot")
     with pytest.raises(RuntimeError):
-        await run_teams_cron_job(job, FakeProxy())
+        await run_teams_cron_job(job, FakeProxy(), invocation=CronInvocation.manual(job.id))
     with pytest.raises(RuntimeError):
-        await run_teams_cron_job(make_job(), None)
+        await run_teams_cron_job(make_job(), None, invocation=CronInvocation.manual(job.id))

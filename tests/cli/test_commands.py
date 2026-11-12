@@ -31,7 +31,7 @@ from nanobot.cli.commands import app
 from nanobot.config.schema import Config
 from nanobot.cron.service import CronJobSkippedError
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
-from nanobot.cron.types import CronJob, CronPayload, CronRunResult
+from nanobot.cron.types import CronInvocation, CronJob, CronPayload, CronRunResult
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
 from nanobot.providers.factory import ProviderSnapshot, make_provider, provider_signature
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
@@ -2303,7 +2303,7 @@ def test_heartbeat_empty_response_is_not_evaluated(
 
     assert isinstance(result.exception, _StopGatewayError)
     cron = seen["cron"]
-    response = asyncio.run(cron.on_job(CronJob(id="heartbeat", name="heartbeat")))
+    response = asyncio.run(cron.on_job(CronJob(id="heartbeat", name="heartbeat"), CronInvocation.manual("heartbeat")))
 
     assert response is None
 
@@ -3422,7 +3422,7 @@ def test_gateway_unbound_agent_cron_is_skipped(
     )
 
     with pytest.raises(CronJobSkippedError, match="unbound agent cron job"):
-        asyncio.run(cron.on_job(job))
+        asyncio.run(cron.on_job(job, CronInvocation.manual(job.id)))
 
     bus.publish_outbound.assert_not_awaited()
 
@@ -3526,7 +3526,7 @@ def test_gateway_bound_cron_runs_as_session_turn(
         ),
     )
 
-    response = asyncio.run(cron.on_job(job))
+    response = asyncio.run(cron.on_job(job, CronInvocation.manual(job.id)))
 
     assert isinstance(response, CronRunResult)
     assert response.response == "Checked the repo."
@@ -3570,7 +3570,7 @@ def test_gateway_bound_cron_runs_as_session_turn(
         ),
     )
 
-    response = asyncio.run(cron.on_job(discord_job))
+    response = asyncio.run(cron.on_job(discord_job, CronInvocation.manual(discord_job.id)))
 
     assert isinstance(response, CronRunResult)
     assert response.response == "Checked the repo."
@@ -3596,7 +3596,7 @@ def test_gateway_bound_cron_runs_as_session_turn(
         ),
     )
 
-    response = asyncio.run(cron.on_job(telegram_job))
+    response = asyncio.run(cron.on_job(telegram_job, CronInvocation.manual(telegram_job.id)))
 
     assert isinstance(response, CronRunResult)
     assert response.response == "Checked the repo."
@@ -3624,7 +3624,7 @@ def test_gateway_bound_cron_runs_as_session_turn(
         ),
     )
 
-    response = asyncio.run(cron.on_job(feishu_job))
+    response = asyncio.run(cron.on_job(feishu_job, CronInvocation.manual(feishu_job.id)))
 
     assert isinstance(response, CronRunResult)
     assert response.response == "Checked the repo."

@@ -562,7 +562,7 @@ def _run_claimed_gateway(
         return _PENDING_TEAMS_PROXY.get("proxy")
     from nanobot.cron.service import CronJobSkippedError, CronService
     from nanobot.cron.session_turns import is_bound_cron_job
-    from nanobot.cron.types import CronJob, CronRunResult
+    from nanobot.cron.types import CronInvocation, CronJob, CronRunResult
     from nanobot.llm_usage import record_llm_call
     from nanobot.llm_usage.context import llm_usage_source
     from nanobot.providers.factory import (
@@ -768,7 +768,7 @@ def _run_claimed_gateway(
     if isinstance(message_tool, MessageTool):
         message_tool.set_send_callback(deliver_to_channel)
 
-    async def on_cron_job(job: CronJob) -> str | CronRunResult | None:
+    async def on_cron_job(job: CronJob, invocation: CronInvocation) -> str | CronRunResult | None:
         async def _silent(*_args: Any, **_kwargs: Any) -> None:
             pass
 
@@ -905,7 +905,7 @@ def _run_claimed_gateway(
             return response
 
         if job.payload.kind == "teams_task":
-            return await run_teams_cron_job(job, teams_proxy=_teams_proxy())
+            return await run_teams_cron_job(job, teams_proxy=_teams_proxy(), invocation=invocation)
 
         if is_bound_cron_job(job):
             return await run_bound_cron_job(job, agent=agent, cron=cron)

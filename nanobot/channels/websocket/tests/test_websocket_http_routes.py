@@ -18,7 +18,7 @@ from nanobot.channels.base import BaseChannel
 from nanobot.channels.websocket.runtime import WebSocketChannel, WebSocketConfig
 from nanobot.config.loader import load_config, save_config
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronJob, CronPayload, CronRunResult, CronSchedule
+from nanobot.cron.types import CronInvocation, CronJob, CronPayload, CronRunResult, CronSchedule
 from nanobot.optional_features import InstallResult
 from nanobot.security.workspace_access import WORKSPACE_SCOPE_METADATA_KEY
 from nanobot.session.keys import UNIFIED_SESSION_KEY
@@ -2709,7 +2709,7 @@ async def test_webui_automation_result_is_authenticated_and_returns_only_selecte
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
 
-    async def execute(job: CronJob) -> CronRunResult:
+    async def execute(job: CronJob, _invocation: CronInvocation) -> CronRunResult:
         cron.write_run_record("selected-run", {
             "job_id": job.id, "session_key": job.payload.session_key,
             "status": "ok", "response": "Selected **reply**", "rendered_prompt": "private prompt",

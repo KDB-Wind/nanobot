@@ -102,7 +102,7 @@ async def test_new_cron_run_identity_survives_reload(tmp_path: Path) -> None:
         async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="reply")
 
-    async def execute(job: CronJob) -> CronRunResult:
+    async def execute(job: CronJob, _invocation) -> CronRunResult:
         return await run_bound_cron_job(job, agent=Agent(), cron=service)
 
     service = CronService(tmp_path / "jobs.json", on_job=execute)

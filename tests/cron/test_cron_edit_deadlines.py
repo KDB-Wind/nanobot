@@ -44,7 +44,7 @@ async def test_metadata_edit_preserves_due_occurrence(tmp_path, monkeypatch, kin
 
     calls = []
 
-    async def execute(job):
+    async def execute(job, _invocation):
         calls.append((job.id, job.name, job.payload.message))
 
     reader = CronService(store_path, on_job=execute)
@@ -82,7 +82,7 @@ async def test_reschedule_during_execution_preserves_new_occurrence(
     release = asyncio.Event()
     calls: list[str] = []
 
-    async def execute(job: CronJob) -> None:
+    async def execute(job: CronJob, _invocation) -> None:
         calls.append(job.id)
         entered.set()
         await release.wait()

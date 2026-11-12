@@ -31,7 +31,7 @@ async def test_history_reads_recent_runs_without_changing_job(tmp_path: Path, mo
     monkeypatch.setattr(cron_service, "_now_ms", lambda: now)
     outcomes = iter(["ok"] * 5 + ["error", "skipped"])
 
-    async def run(_job):
+    async def run(_job, _invocation):
         nonlocal now
         now += 125
         outcome = next(outcomes)

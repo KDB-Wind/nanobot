@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from nanobot.cron.service import CronService
 from nanobot.cron.teams_jobs import run_teams_cron_job
-from nanobot.cron.types import CronJob, CronPayload, CronSchedule, CronStore
+from nanobot.cron.types import CronInvocation, CronJob, CronPayload, CronSchedule, CronStore
 
 
 class FakeProxy:
@@ -41,21 +41,21 @@ async def test_cron_service_runs_teams_job_and_dedupes_fire(tmp_path):
     proxy = FakeProxy()
     service = CronService(tmp_path / "cron" / "jobs.json")
 
-    async def on_job(job):
-        return await run_teams_cron_job(job, proxy)
+    async def on_job(job, invocation):
+        return await run_teams_cron_job(job, proxy, invocation=invocation)
 
     service.on_job = on_job
     job = make_job()
     slot = 1_770_000_000_000
     job.state.next_run_at_ms = slot
-    await service._execute_job(job)
+    await service._execute_job(job, CronInvocation.scheduled(job.id, slot))
     assert job.state.last_status == "ok"
     first_run_id = job.state.run_history[-1].run_id
 
     # The advanced schedule did not persist (crash before the store save), so
     # the scheduler delivers the same slot again: one task, a second run record.
     job.state.next_run_at_ms = slot
-    await service._execute_job(job)
+    await service._execute_job(job, CronInvocation.scheduled(job.id, slot))
     assert job.state.last_status == "ok"
     assert len(proxy.submissions) == 1
     assert first_run_id != job.state.run_history[-1].run_id
@@ -64,12 +64,12 @@ async def test_cron_service_runs_teams_job_and_dedupes_fire(tmp_path):
 async def test_teams_job_without_proxy_marks_error(tmp_path):
     service = CronService(tmp_path / "cron" / "jobs.json")
 
-    async def on_job(job):
-        return await run_teams_cron_job(job, None)
+    async def on_job(job, invocation):
+        return await run_teams_cron_job(job, None, invocation=invocation)
 
     service.on_job = on_job
     job = make_job()
-    await service._execute_job(job)
+    await service._execute_job(job, CronInvocation.manual(job.id))
     assert job.state.last_status == "error"
     assert "coordinator" in (job.state.last_error or "")
 
@@ -79,8 +79,8 @@ async def test_manual_teams_runs_each_submit_a_new_task(tmp_path, monkeypatch):
     monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now_ms)
     proxy = FakeProxy()
 
-    async def on_job(job):
-        return await run_teams_cron_job(job, proxy)
+    async def on_job(job, invocation):
+        return await run_teams_cron_job(job, proxy, invocation=invocation)
 
     service = CronService(tmp_path / "cron" / "jobs.json", on_job=on_job)
     job = make_job()
@@ -105,8 +105,8 @@ async def test_manual_teams_run_does_not_consume_the_next_scheduled_fire(
     monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now_ms)
     proxy = FakeProxy()
 
-    async def on_job(job):
-        return await run_teams_cron_job(job, proxy)
+    async def on_job(job, invocation):
+        return await run_teams_cron_job(job, proxy, invocation=invocation)
 
     service = CronService(tmp_path / "cron" / "jobs.json", on_job=on_job)
     job = make_job()

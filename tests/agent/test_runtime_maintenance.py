@@ -639,7 +639,7 @@ async def test_subagent_execution_and_cleanup_are_both_busy(agent, monkeypatch):
 async def test_cron_timer_waits_without_consuming_and_manual_run_is_refused(agent, tmp_path, stop):
     ran = asyncio.Event()
 
-    async def callback(job):
+    async def callback(job, _invocation):
         with pytest.raises(RuntimeBusyError):
             with agent.maintenance():
                 pytest.fail("cron callback was missed")

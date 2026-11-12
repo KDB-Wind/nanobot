@@ -29,7 +29,7 @@ def _job(service, *, delete_after_run=False):
 
 
 async def test_update_text_keeps_schedule_routing_and_history(tmp_path: Path):
-    async def run(_job):
+    async def run(_job, _invocation):
         return "Report ready"
 
     path = tmp_path / "jobs.json"

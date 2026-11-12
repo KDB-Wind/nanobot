@@ -103,7 +103,7 @@ async def test_durable_move_stale_edit_failed_save_and_old_action(tmp_path, monk
 async def test_running_job_cannot_move(tmp_path):
     _, cron, job = seed(tmp_path)
     entered, release = asyncio.Event(), asyncio.Event()
-    async def execute(_job):
+    async def execute(_job, _invocation):
         entered.set()
         await release.wait()
     cron.on_job = execute
@@ -223,7 +223,7 @@ async def test_real_gateway_move_run_reload_and_previous_result(tmp_path, target
     agent = AgentLoop(bus=bus, provider=provider, workspace=tmp_path / "workspace",
         model="test-model", session_manager=sessions, tools_config=Config().tools)
     agent.tools.get_definitions = MagicMock(return_value=[])
-    async def execute(job):
+    async def execute(job, _invocation):
         return await run_bound_cron_job(job, agent=agent, cron=cron)
     cron.on_job = execute
     await cron.start()
