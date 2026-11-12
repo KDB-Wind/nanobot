@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from nanobot.cron.service import CronService
 from nanobot.cron.teams_jobs import run_teams_cron_job
-from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+from nanobot.cron.types import CronJob, CronPayload, CronSchedule, CronStore
 
 
 class FakeProxy:
@@ -72,3 +72,54 @@ async def test_teams_job_without_proxy_marks_error(tmp_path):
     await service._execute_job(job)
     assert job.state.last_status == "error"
     assert "coordinator" in (job.state.last_error or "")
+
+
+async def test_manual_teams_runs_each_submit_a_new_task(tmp_path, monkeypatch):
+    now_ms = 1_767_268_800_000
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now_ms)
+    proxy = FakeProxy()
+
+    async def on_job(job):
+        return await run_teams_cron_job(job, proxy)
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=on_job)
+    job = make_job()
+    job.schedule = CronSchedule(kind="cron", expr="0 0 * * *", tz="UTC")
+    job.state.next_run_at_ms = 1_767_312_000_000
+    service._store = CronStore(jobs=[job])
+    service._save_store()
+
+    for _ in range(3):
+        assert await service.run_job(job.id) is True
+
+    saved = service.get_job(job.id)
+    assert saved is not None
+    assert len(saved.state.run_history) == 3
+    assert len(proxy.submissions) == 3
+
+
+async def test_manual_teams_run_does_not_consume_the_next_scheduled_fire(
+    tmp_path, monkeypatch
+):
+    now_ms = 1_767_268_800_000
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now_ms)
+    proxy = FakeProxy()
+
+    async def on_job(job):
+        return await run_teams_cron_job(job, proxy)
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=on_job)
+    job = make_job()
+    job.schedule = CronSchedule(kind="cron", expr="0 0 * * *", tz="UTC")
+    job.state.next_run_at_ms = 1_767_312_000_000
+    service._store = CronStore(jobs=[job])
+    service._save_store()
+
+    assert await service.run_job(job.id) is True
+    now_ms = 1_767_312_000_000
+    await service._on_timer()
+
+    saved = service.get_job(job.id)
+    assert saved is not None
+    assert len(saved.state.run_history) == 2
+    assert len(proxy.submissions) == 2
