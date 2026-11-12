@@ -121,3 +121,106 @@ async def test_plain_app_has_no_inbox_route(tmp_path):
         assert resp.status == 404
     finally:
         await client.close()
+
+
+async def test_serve_inbox_continues_an_idle_peer_session(tmp_path, monkeypatch):
+    import asyncio
+    import json
+
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.cli import commands
+    from nanobot.config.schema import Config
+    from nanobot.providers.base import LLMProvider, LLMResponse
+    from nanobot.session.external_inbox import ExternalInbox
+
+    class ReplyProvider(LLMProvider):
+        def __init__(self):
+            super().__init__(provider_name="offline-inbox")
+            self.called = asyncio.Event()
+            self.inputs = []
+
+        def get_default_model(self):
+            return "offline-inbox"
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.inputs.extend(messages)
+            self.called.set()
+            return LLMResponse(content="WAKE_ACK result-token")
+
+        async def chat_stream(self, messages, tools=None, **kwargs):
+            return await self.chat(messages, tools=tools, **kwargs)
+
+    class NoMCP:
+        async def connect(self):
+            return None
+
+        async def aclose(self):
+            return None
+
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    config.api.runs = inbox_runs_config()
+    (tmp_path / "runs").mkdir()
+    provider = ReplyProvider()
+    assembled = {}
+
+    def make_loop(_config, bus, **kwargs):
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=config.workspace_path,
+            session_manager=kwargs["session_manager"],
+            tool_registry=kwargs["tool_registry"],
+        )
+        assembled["loop"] = loop
+        return loop
+
+    monkeypatch.setattr(commands, "_load_runtime_config", lambda *_args: config)
+    monkeypatch.setattr(commands, "_provider_setup_error", lambda _config: None)
+    monkeypatch.setattr(commands, "sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr(commands.AgentLoop, "from_config", make_loop)
+    monkeypatch.setattr(commands.MCPProvider, "from_config", lambda *_args: NoMCP())
+    monkeypatch.setattr("nanobot.config.paths.get_runtime_subdir", lambda _name: tmp_path / "runs")
+    monkeypatch.setattr("aiohttp.web.run_app", lambda app, **kwargs: assembled.update(app=app))
+    commands.serve(host="127.0.0.1", port=8765, timeout=30, verbose=False,
+                   workspace=None, config=None)
+    loop = assembled["loop"]
+    state = loop.sessions.state
+    session = await state.get("peer:wf-idle")
+    inbox = ExternalInbox(state)
+    capability = inbox.mint_capability(
+        session_key=session.key, session_generation=session.generation,
+        workflow_id="wf-idle", operation_key="op-idle", bot_id="writer",
+        instance_id="writer-instance", principal_id="teams-coordinator",
+    )
+    client = TestClient(TestServer(assembled["app"]))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/v1/agent-inbox",
+            headers={"Authorization": f"Bearer {RUNS_KEY}"},
+            json={
+                "delivery_id": "del_idle", "task_id": "task_idle",
+                "bot_id": "writer", "instance_id": "writer-instance",
+                "run_id": "run_idle", "terminal_revision": 1,
+                "outcome": {"code": "succeeded"}, "result_text": "result-token",
+                "result_truncated": False, "workflow_id": "wf-idle",
+                "operation_key": "op-idle", "reply_capability": capability.token,
+            },
+        )
+        assert response.status == 202, await response.text()
+        await asyncio.wait_for(provider.called.wait(), timeout=4)
+        assert "result-token" in json.dumps(provider.inputs)
+        async with asyncio.timeout(4):
+            while True:
+                saved = await state.read(session.key)
+                replies = [m for m in saved.messages if m.get("role") == "assistant"]
+                if replies:
+                    break
+                await asyncio.sleep(0.01)
+        assert [m["content"] for m in replies] == ["WAKE_ACK result-token"]
+        assert len([m for m in saved.messages if m.get("external_delivery_id")]) == 1
+        assert inbox.wake_due_deliveries() == []
+        assert "pending_user_turn_owner" not in saved.metadata
+    finally:
+        await client.close()
