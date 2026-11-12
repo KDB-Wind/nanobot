@@ -35,6 +35,8 @@ python nanobot-teams/acceptance/peer_webui.py --output-dir <外部截图目录>
 
 P0 至 P4 的身份、绑定、授权边及派发实现沿用原基准。P6 的统计公式和只读读取沿用原基准。P5 的真实唤醒和回执崩溃恢复因本轮发现重新验收。P7 的浏览器结果按实际具名断言计数。P8 本地修复与验收完成，远端 CI 和操作者合并仍分别记录。
 
+修复已推送到 PR #18。2026-11-11 查询新提交没有 CI run，手动执行 `gh workflow run ci.yml --repo KDB-Wind/nanobot --ref feat/nanobot-teams-mvp` 返回 HTTP 422，原因是 `Actions has been disabled for this repository`。远端 CI 当前受仓库设置阻塞，不能引用原基准的全绿结果作为本轮验证。
+
 原 wheel 的 SHA-256 为 `3a458d7b6b4c5a08f0a513c98aad889efb68b0c3c88e7d12d116d8d5d6484e59`，仅代表原基准插件产物。本轮没有据此声称宿主修改已经被打包发布。独立插件仓此前同步到 `c44b17390`，不代表本轮验收脚本已同步。
 
 ## 下一步
