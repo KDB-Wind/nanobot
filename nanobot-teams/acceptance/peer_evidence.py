@@ -107,10 +107,16 @@ def one_database(home: Path, name: str) -> Path:
 
 
 def read_rows(db: Path, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
-    with sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5) as conn:
+    # sqlite3's context manager only commits; it never closes the connection.
+    # The probe polls these reads every 20 ms, so leaked handles keep the lab
+    # home locked and the teardown cannot delete it.
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
 
 
 def continuation_evidence(home: Path, task_id: str, secret: str) -> dict:

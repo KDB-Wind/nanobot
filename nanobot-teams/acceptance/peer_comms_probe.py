@@ -389,7 +389,17 @@ class PeerLab:
             watcher.close()
         self.reply_gate.close()
         for proc in self.procs:
-            proc.kill()
+            if os.name == "nt":
+                # The venv launcher re-executes the script, so killing the
+                # launcher leaves the real interpreter running and holding the
+                # sqlite handles the lab teardown then tries to delete.
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                proc.kill()
         for proc, handle in self.logs:
             try:
                 proc.wait(timeout=10)
@@ -804,6 +814,28 @@ class PeerLab:
         return ev
 
 
+def _remove_lab_dir(path: Path, *, attempts: int = 20) -> None:
+    """Best-effort removal of the lab home; never changes the verdict.
+
+    A locked sqlite file makes rmtree raise WinError 32 on Windows. Cleanup
+    runs after the evidence write for that reason, and when it still fails it
+    only warns: cleanup is not a test result.
+    """
+    import shutil
+
+    for remaining in range(attempts, 0, -1):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if remaining == 1:
+                print(f"warning: could not remove {path}", file=sys.stderr)
+                return
+            time.sleep(0.25)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep", action="store_true", help="retain the isolated bot homes")
@@ -834,13 +866,12 @@ def main() -> int:
     except (SystemExit, Exception) as exc:
         results.append({"scenario": "runtime", "status": "fail", "reason": str(exc)})
     finally:
-        lab.teardown()
         if args.keep:
             results.append({"scenario": "meta", "topology_dir": str(lab.tmp)})
-        else:
-            import shutil
-
-            shutil.rmtree(lab.tmp)
+        try:
+            lab.teardown()
+        except Exception as exc:  # noqa: BLE001 - cleanup must not cost the evidence
+            print(f"warning: teardown failed: {exc}", file=sys.stderr)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = args.evidence_dir / f"peer-probe-{stamp}.jsonl"
     with open(out, "w", encoding="utf-8") as handle:
@@ -853,6 +884,8 @@ def main() -> int:
     print(json.dumps({"probe": "peer_comms", "passed": passed, "failed": failed,
                       "blocked": blocked, "evidence": str(out),
                       "verdict": "GREEN" if green else "RED"}))
+    if not args.keep:
+        _remove_lab_dir(lab.tmp)
     return 0 if green else 1
 
 
