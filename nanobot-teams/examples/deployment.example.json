@@ -1,0 +1,8 @@
+{
+  "mcp_tool_timeout_s": 180,
+  "planner_timeout_s": 210,
+  "targets": {
+    "research": {"api_timeout_s": 120, "queue_included": true},
+    "writer": {"api_timeout_s": 120, "queue_included": true}
+  }
+}

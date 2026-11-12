@@ -1,0 +1,569 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+import {
+  cancelTeamsTask,
+  createTeamsProject,
+  createTeamsTask,
+  fetchTeamsPeerEdges,
+  fetchTeamsSnapshot,
+  fetchTeamsTaskResult,
+  fetchTeamsUsage,
+  scaffoldTeamsBot,
+  stopTeamsWorkflow,
+  TeamsBotUsage,
+  TeamsPeerEdge,
+  TeamsScaffoldResult,
+  TeamsSnapshot,
+  TeamsTaskResult,
+  TeamsUsageResponse,
+} from "@/lib/teams-api";
+import { useClient } from "@/providers/ClientProvider";
+
+function newOperationKey(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `op-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function StateChip({ label, tone }: { label: string; tone: "ok" | "warn" | "bad" | "idle" }) {
+  const palette = {
+    ok: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
+    warn: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
+    bad: "bg-red-500/15 text-red-600 dark:text-red-400",
+    idle: "bg-zinc-500/15 text-zinc-500",
+  }[tone];
+  return <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${palette}`}>{label}</span>;
+}
+
+export function TeamsSettings() {
+  const { t } = useTranslation();
+  const { client, getToken, webuiCapabilities } = useClient();
+  const enabled = webuiCapabilities.includes("teams.async.v1");
+  const [snapshot, setSnapshot] = useState<TeamsSnapshot | null>(null);
+  const [usage, setUsage] = useState<TeamsUsageResponse | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+  const [usageWindow, setUsageWindow] = useState<"7d" | "30d" | "all">("30d");
+  const [edges, setEdges] = useState<TeamsPeerEdge[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [projectFilter, setProjectFilter] = useState("");
+  const [input, setInput] = useState("");
+  const [botChoice, setBotChoice] = useState("");
+  const [submitState, setSubmitState] = useState<string | null>(null);
+  // F09: the operation key binds to the pending business draft. A lost or
+  // failed response keeps the draft so a retry reuses the same key; only a
+  // consumed submission or an edited draft mints a new one.
+  const [draft, setDraft] = useState<{
+    project: string;
+    input: string;
+    bot: string;
+    key: string;
+  } | null>(null);
+  const [submitPending, setSubmitPending] = useState(false);
+  // F08: the result body is fetched through the coordinator's public route,
+  // never with bot service credentials.
+  const [resultView, setResultView] = useState<TeamsTaskResult | null>(null);
+  const [resultError, setResultError] = useState<string | null>(null);
+  const [scaffold, setScaffold] = useState<TeamsScaffoldResult | null>(null);
+  const [scaffoldId, setScaffoldId] = useState("");
+  const [newProject, setNewProject] = useState("");
+  // The whole-workflow stop is one operation at a time; every stop button
+  // stays disabled until the coordinator reports back.
+  const [stopPending, setStopPending] = useState<string | null>(null);
+
+  const tx = useCallback(
+    (key: string, fallback: string, vars?: Record<string, string>) =>
+      t(key, { defaultValue: fallback, ...(vars ?? {}) }),
+    [t],
+  );
+
+  const refresh = useCallback(async () => {
+    if (!enabled) return;
+    try {
+      const data = await fetchTeamsSnapshot(getToken());
+      setSnapshot(data);
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+    try {
+      const usageData = await fetchTeamsUsage(getToken(), usageWindow);
+      setUsage(usageData);
+      setUsageError(null);
+    } catch (reason) {
+      setUsage(null);
+      setUsageError(reason instanceof Error ? reason.message : String(reason));
+    }
+    try {
+      const edgeData = await fetchTeamsPeerEdges(getToken());
+      setEdges(edgeData.edges);
+    } catch {
+      setEdges([]);
+    }
+  }, [enabled, getToken, usageWindow]);
+
+  useEffect(() => {
+    void refresh();
+    if (!enabled) return;
+    const timer = window.setInterval(() => void refresh(), 8000);
+    return () => window.clearInterval(timer);
+  }, [enabled, refresh]);
+
+  const usageRows: TeamsBotUsage[] = usage?.bots ?? [];
+  const hitRateLabel = (entry: TeamsBotUsage): string => {
+    if (!entry.available) return tx("settings.teams.usageUnavailable", "Unavailable");
+    if (entry.totals == null || entry.totals.cache_read_rate == null) {
+      return tx("settings.teams.usageUnreported", "Not reported");
+    }
+    return `${Math.round(entry.totals.cache_read_rate * 100)}%`;
+  };
+  const coverageLabel = (entry: TeamsBotUsage): string => {
+    if (!entry.available || entry.totals == null || entry.totals.coverage == null) {
+      return "—";
+    }
+    return `${Math.round(entry.totals.coverage * 100)}%`;
+  };
+
+  const tasks = useMemo(() => {
+    if (!snapshot) return [];
+    return projectFilter
+      ? snapshot.tasks.filter((task) => task.project_id === projectFilter)
+      : snapshot.tasks;
+  }, [snapshot, projectFilter]);
+
+  if (!enabled) {
+    return (
+      <div className="settings-stack" data-teams-root>
+        <p className="text-sm text-zinc-500">
+          {tx("settings.teams.unavailable", "The async teams workbench is not enabled on this host.")}
+        </p>
+      </div>
+    );
+  }
+
+  const operationKeyFor = (
+    currentProject: string,
+    currentInput: string,
+    currentBot: string,
+  ): string => {
+    if (
+      draft &&
+      draft.project === currentProject &&
+      draft.input === currentInput &&
+      draft.bot === currentBot
+    ) {
+      return draft.key;
+    }
+    const key = newOperationKey();
+    setDraft({ project: currentProject, input: currentInput, bot: currentBot, key });
+    return key;
+  };
+
+  const showResult = async (taskId: string) => {
+    setResultError(null);
+    try {
+      setResultView(await fetchTeamsTaskResult(getToken(), taskId));
+    } catch (reason) {
+      setResultView(null);
+      setResultError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const submitTask = async () => {
+    if (!input.trim() || !botChoice || submitPending) return;
+    setSubmitPending(true);
+    setSubmitState(tx("settings.teams.submitting", "Submitting..."));
+    const project = projectFilter || snapshot?.projects[0]?.project_id || "default";
+    try {
+      const task = await createTeamsTask(client, {
+        project,
+        bot: botChoice,
+        input,
+        operation_key: operationKeyFor(project, input, botChoice),
+      });
+      setDraft(null);
+      setSubmitState(tx("settings.teams.submitted", "Submitted: {{id}}", { id: task.task_id }));
+      setInput("");
+      await refresh();
+    } catch (reason) {
+      // The draft (and its key) is kept: a retry resubmits the same business
+      // operation instead of minting a second one.
+      setSubmitState(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSubmitPending(false);
+    }
+  };
+
+  const stopWorkflow = async (workflowId: string) => {
+    if (stopPending !== null) return;
+    setStopPending(workflowId);
+    try {
+      await stopTeamsWorkflow(client, workflowId);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setStopPending(null);
+      await refresh();
+    }
+  };
+
+  const doScaffold = async () => {
+    if (!scaffoldId.trim()) return;
+    try {
+      const result = await scaffoldTeamsBot(client, { bot_id: scaffoldId.trim() });
+      setScaffold(result);
+      setScaffoldId("");
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const addProject = async () => {
+    if (!newProject.trim()) return;
+    try {
+      await createTeamsProject(client, newProject.trim(), newProject.trim());
+      setNewProject("");
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  return (
+    <div className="settings-stack" data-teams-root>
+      <h2 className="text-lg font-semibold">{tx("settings.teams.title", "Teams workbench")}</h2>
+      {error ? <p role="alert" className="text-sm text-red-500">{error}</p> : null}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="text-sm" htmlFor="teams-project-filter">
+          {tx("settings.teams.project", "Project")}
+        </label>
+        <select
+          id="teams-project-filter"
+          value={projectFilter}
+          onChange={(event) => setProjectFilter(event.target.value)}
+          className="rounded border border-zinc-300 bg-transparent px-2 py-1 text-sm dark:border-zinc-700"
+        >
+          <option value="">{tx("settings.teams.allProjects", "All projects")}</option>
+          {snapshot?.projects.map((project) => (
+            <option key={project.project_id} value={project.project_id}>
+              {project.display_name}
+            </option>
+          ))}
+        </select>
+        <input
+          aria-label={tx("settings.teams.newProject", "New project id")}
+          value={newProject}
+          onChange={(event) => setNewProject(event.target.value)}
+          placeholder={tx("settings.teams.newProject", "New project id")}
+          className="w-40 rounded border border-zinc-300 bg-transparent px-2 py-1 text-sm dark:border-zinc-700"
+        />
+        <button type="button" onClick={() => void addProject()} className="rounded border px-2 py-1 text-sm">
+          {tx("settings.teams.createProject", "Create project")}
+        </button>
+        <button type="button" onClick={() => void refresh()} className="rounded border px-2 py-1 text-sm">
+          {tx("settings.teams.refresh", "Refresh")}
+        </button>
+      </div>
+
+      <section aria-label={tx("settings.teams.bots", "Bots")} className="rounded border p-3 dark:border-zinc-800">
+        <h3 className="mb-2 font-medium">{tx("settings.teams.bots", "Bots")}</h3>
+        <ul className="mb-2 space-y-1 text-sm">
+          {snapshot?.bots.map((bot) => (
+            <li key={bot.bot_id} data-bot-id={bot.bot_id}>
+              <span className="font-medium">{bot.display_name}</span>{" "}
+              <span className="text-zinc-400">{bot.endpoint}</span>{" "}
+              {bot.instance_id ? <StateChip label={bot.instance_id.slice(0, 12)} tone="idle" /> : null}
+            </li>
+          ))}
+          {!snapshot?.bots.length ? (
+            <li className="text-zinc-400">{tx("settings.teams.noBots", "No bots registered yet.")}</li>
+          ) : null}
+        </ul>
+        <div className="flex items-center gap-2">
+          <input
+            aria-label={tx("settings.teams.scaffoldId", "New bot id")}
+            value={scaffoldId}
+            onChange={(event) => setScaffoldId(event.target.value)}
+            className="w-40 rounded border border-zinc-300 bg-transparent px-2 py-1 text-sm dark:border-zinc-700"
+          />
+          <button type="button" onClick={() => void doScaffold()} className="rounded border px-2 py-1 text-sm">
+            {tx("settings.teams.scaffold", "Generate bot home")}
+          </button>
+        </div>
+        {scaffold ? (
+          <div data-scaffold-result className="mt-2 rounded bg-zinc-100 p-2 text-xs dark:bg-zinc-900">
+            <p>{tx("settings.teams.scaffoldHint", "Start the bot manually with:")}</p>
+            <code className="block whitespace-pre-wrap">{scaffold.start_command}</code>
+            <p className="mt-1">
+              {tx(
+                "settings.teams.scaffoldKeyFile",
+                "Service key (operator-local, never shown here):",
+              )}{" "}
+              <code data-scaffold-key-file>{scaffold.key_file}</code>
+            </p>
+            <p className="mt-1">
+              {tx("settings.teams.scaffoldRequiredEnv", "Set these environment variables on both the bot and the coordinator:")}{" "}
+              <code data-scaffold-required-env>{scaffold.required_env.join(", ")}</code>
+            </p>
+            <p className="text-zinc-400">
+              {tx("settings.teams.notStarted", "The bot is not started yet.")}
+            </p>
+          </div>
+        ) : null}
+      </section>
+
+      <section
+        aria-label={tx("settings.teams.usage", "Per-bot usage")}
+        className="rounded border p-3 dark:border-zinc-800"
+        data-teams-usage
+      >
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <h3 className="font-medium">{tx("settings.teams.usage", "Per-bot usage")}</h3>
+          <select
+            aria-label={tx("settings.teams.usageWindow", "Window")}
+            value={usageWindow}
+            onChange={(event) => setUsageWindow(event.target.value as "7d" | "30d" | "all")}
+            className="rounded border border-zinc-300 bg-transparent px-2 py-0.5 text-xs dark:border-zinc-700"
+          >
+            <option value="7d">7d</option>
+            <option value="30d">30d</option>
+            <option value="all">{tx("settings.teams.usageAll", "All time")}</option>
+          </select>
+          <span
+            className="text-xs text-zinc-400"
+            title={tx(
+              "settings.teams.usageDenominator",
+              "Hit rate = cache-read tokens / input tokens of calls that reported cache fields; coverage shows how much input that covers.",
+            )}
+          >
+            {tx("settings.teams.usageDenominatorShort", "Denominator: cache-reported input")}
+          </span>
+        </div>
+        {usageError ? (
+          <p role="alert" data-usage-error className="text-sm text-red-500">{usageError}</p>
+        ) : null}
+        <table className="w-full text-left text-sm">
+          <thead className="text-xs uppercase text-zinc-400">
+            <tr>
+              <th className="py-1">{tx("settings.teams.usageBot", "Bot")}</th>
+              <th>{tx("settings.teams.usageRequests", "Requests")}</th>
+              <th>{tx("settings.teams.usageInput", "Input tokens")}</th>
+              <th>{tx("settings.teams.usageCacheRead", "Cache read")}</th>
+              <th>{tx("settings.teams.usageHitRate", "Hit rate")}</th>
+              <th>{tx("settings.teams.usageCoverage", "Coverage")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {usageRows.map((entry) => (
+              <tr key={entry.bot_id} data-usage-bot={entry.bot_id}>
+                <td className="py-1 font-medium">{entry.display_name}</td>
+                {entry.available && entry.totals ? (
+                  <>
+                    <td>{entry.totals.requests}</td>
+                    <td>{entry.totals.input_tokens}</td>
+                    <td>{entry.totals.cache_read_tokens}</td>
+                    <td data-usage-rate>{hitRateLabel(entry)}</td>
+                    <td data-usage-coverage>{coverageLabel(entry)}</td>
+                  </>
+                ) : (
+                  <td colSpan={5} className="py-1 text-zinc-400">
+                    {tx("settings.teams.usageUnavailableReason", "Unavailable: {{reason}}", {
+                      reason: entry.reason ?? "",
+                    })}
+                  </td>
+                )}
+              </tr>
+            ))}
+            {!usageRows.length ? (
+              <tr>
+                <td colSpan={6} className="py-2 text-zinc-400">
+                  {tx("settings.teams.usageEmpty", "No usage data yet.")}
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </section>
+
+      <section
+        aria-label={tx("settings.teams.peerGraph", "Bot graph")}
+        className="rounded border p-3 dark:border-zinc-800"
+        data-teams-edges
+      >
+        <h3 className="mb-2 font-medium">{tx("settings.teams.peerGraph", "Bot graph")}</h3>
+        <ul className="space-y-1 text-sm">
+          {(edges ?? []).map((edge) => (
+            <li key={`${edge.from_bot_id}->${edge.to_bot_id}`} data-peer-edge={`${edge.from_bot_id}->${edge.to_bot_id}`}>
+              <span className="font-medium">{edge.from_bot_id}</span>
+              <span className="mx-1 text-zinc-400">→</span>
+              <span className="font-medium">{edge.to_bot_id}</span>
+            </li>
+          ))}
+          {!edges?.length ? (
+            <li className="text-zinc-400">
+              {tx("settings.teams.noEdges", "No explicit peer edges yet; planner delegations stay implicit.")}
+            </li>
+          ) : null}
+        </ul>
+      </section>
+
+      <section aria-label={tx("settings.teams.newTask", "New task")} className="rounded border p-3 dark:border-zinc-800">
+        <h3 className="mb-2 font-medium">{tx("settings.teams.newTask", "New task")}</h3>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <select
+            aria-label={tx("settings.teams.bot", "Bot")}
+            value={botChoice}
+            onChange={(event) => setBotChoice(event.target.value)}
+            className="rounded border border-zinc-300 bg-transparent px-2 py-1 text-sm dark:border-zinc-700"
+          >
+            <option value="">{tx("settings.teams.chooseBot", "Choose a bot")}</option>
+            {snapshot?.bots.map((bot) => (
+              <option key={bot.bot_id} value={bot.bot_id}>{bot.display_name}</option>
+            ))}
+          </select>
+          <textarea
+            aria-label={tx("settings.teams.input", "Task input")}
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            rows={2}
+            className="flex-1 rounded border border-zinc-300 bg-transparent px-2 py-1 text-sm dark:border-zinc-700"
+          />
+          <button
+            type="button"
+            onClick={() => void submitTask()}
+            disabled={!input.trim() || !botChoice || submitPending}
+            className="self-start rounded border px-3 py-1 text-sm disabled:opacity-50"
+          >
+            {tx("settings.teams.submit", "Submit task")}
+          </button>
+        </div>
+        {submitState ? <p className="mt-1 text-sm text-zinc-500" data-submit-state>{submitState}</p> : null}
+      </section>
+
+      <section aria-label={tx("settings.teams.tasks", "Tasks")} className="rounded border p-3 dark:border-zinc-800">
+        <h3 className="mb-2 font-medium">{tx("settings.teams.tasks", "Tasks")}</h3>
+        <table className="w-full text-left text-sm">
+          <thead className="text-xs uppercase text-zinc-400">
+            <tr>
+              <th className="py-1">{tx("settings.teams.task", "Task")}</th>
+              <th>{tx("settings.teams.route", "Route")}</th>
+              <th>{tx("settings.teams.dispatch", "Dispatch")}</th>
+              <th>{tx("settings.teams.run", "Run")}</th>
+              <th>{tx("settings.teams.cancel", "Cancel")}</th>
+              <th>{tx("settings.teams.delivery", "Delivery")}</th>
+              <th>{tx("settings.teams.result", "Result")}</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {tasks.map((task) => (
+              <tr key={task.task_id} data-task-id={task.task_id}>
+                <td className="py-1 font-mono text-xs">{task.task_id.slice(0, 16)}…</td>
+                <td data-task-route>
+                  {task.kind === "peer" ? (
+                    <span className="text-xs">
+                      {task.caller_principal.replace(/^bot:/, "")}
+                      <span className="mx-1 text-zinc-400">→</span>
+                      {task.bot_id}
+                      <span className="ml-1 text-zinc-400">hop {task.hop}</span>
+                    </span>
+                  ) : (
+                    <span className="text-xs text-zinc-400">
+                      {tx("settings.teams.routePlanner", "planner")} → {task.bot_id}
+                    </span>
+                  )}
+                </td>
+                <td><StateChip label={task.dispatch_state} tone={task.dispatch_state === "accepted" ? "ok" : task.dispatch_state === "indeterminate" ? "bad" : "idle"} /></td>
+                <td><StateChip label={task.run_state} tone={task.run_state === "succeeded" ? "ok" : task.run_state === "failed" ? "bad" : "idle"} /></td>
+                <td>
+                  {task.cancel_state === "none" ? (
+                    <span className="text-zinc-400">—</span>
+                  ) : (
+                    <StateChip
+                      label={task.cancel_state}
+                      tone={task.cancel_state === "confirmed" ? "ok" : task.cancel_state === "unconfirmed" ? "bad" : "warn"}
+                    />
+                  )}
+                </td>
+                <td><StateChip label={task.delivery_state} tone={task.delivery_state === "injected" ? "ok" : "idle"} /></td>
+                <td>
+                  {task.result_available ? (
+                    <button
+                      type="button"
+                      data-result-view={task.task_id}
+                      className="rounded border px-2 py-0.5 text-xs"
+                      onClick={() => void showResult(task.task_id)}
+                    >
+                      {tx("settings.teams.viewResult", "View result")}
+                    </button>
+                  ) : (
+                    <span className="text-zinc-400">—</span>
+                  )}
+                </td>
+                <td>
+                  {(task.dispatch_state === "pending" || task.dispatch_state === "accepted") &&
+                  task.run_state !== "succeeded" &&
+                  task.run_state !== "failed" &&
+                  task.run_state !== "cancelled" &&
+                  task.run_state !== "interrupted" ? (
+                    <div className="flex gap-1">
+                      <button
+                        type="button"
+                        className="rounded border px-2 py-0.5 text-xs"
+                        onClick={async () => {
+                          await cancelTeamsTask(client, task.task_id);
+                          await refresh();
+                        }}
+                      >
+                        {tx("settings.teams.cancelAction", "Request cancel")}
+                      </button>
+                      <button
+                        type="button"
+                        data-stop-workflow={task.workflow_id}
+                        className="rounded border px-2 py-0.5 text-xs disabled:opacity-50"
+                        disabled={stopPending !== null}
+                        onClick={() => void stopWorkflow(task.workflow_id)}
+                      >
+                        {tx("settings.teams.stopWorkflow", "Stop workflow")}
+                      </button>
+                    </div>
+                  ) : null}
+                </td>
+              </tr>
+            ))}
+            {!tasks.length ? (
+              <tr><td colSpan={8} className="py-2 text-zinc-400">{tx("settings.teams.noTasks", "No tasks yet.")}</td></tr>
+            ) : null}
+          </tbody>
+        </table>
+        {resultError ? <p role="alert" className="mt-2 text-xs text-red-500">{resultError}</p> : null}
+        {resultView ? (
+          <div data-task-result className="mt-2 rounded bg-zinc-100 p-2 text-xs dark:bg-zinc-900">
+            <p className="font-medium">
+              {tx("settings.teams.resultFor", "Result of {{id}}", { id: resultView.task_id })}{" "}
+              {resultView.result_truncated ? (
+                <span>({tx("settings.teams.truncated", "truncated")})</span>
+              ) : null}
+            </p>
+            <pre className="mt-1 whitespace-pre-wrap font-mono">{resultView.result_text}</pre>
+            <button
+              type="button"
+              className="mt-1 rounded border px-2 py-0.5 text-xs"
+              onClick={() => setResultView(null)}
+            >
+              {tx("settings.teams.closeResult", "Close")}
+            </button>
+          </div>
+        ) : null}
+        {snapshot && Object.keys(snapshot.quarantines).length ? (
+          <p role="alert" className="mt-2 text-xs text-amber-500">
+            {tx("settings.teams.quarantined", "Some instances are quarantined pending operator review.")}
+          </p>
+        ) : null}
+      </section>
+    </div>
+  );
+}

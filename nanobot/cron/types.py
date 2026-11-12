@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, overload
+from uuid import uuid4
 
 from nanobot.utils.dict_keys import get_camel_snake
 
@@ -47,7 +48,7 @@ class CronSchedule:
 @dataclass
 class CronPayload:
     """What to do when the job runs."""
-    kind: Literal["system_event", "agent_turn"] = "agent_turn"
+    kind: Literal["system_event", "agent_turn", "teams_task"] = "agent_turn"
     message: str = ""
     # Legacy delivery fields used by pre-session-bound cron jobs.
     deliver: bool = False
@@ -87,6 +88,21 @@ class CronRunResult:
 
     run_id: str
     response: str
+
+
+@dataclass(frozen=True)
+class CronInvocation:
+    """Identity of one scheduled fire or one independent manual request."""
+
+    trigger_id: str
+
+    @classmethod
+    def scheduled(cls, job_id: str, slot_ms: int) -> CronInvocation:
+        return cls(trigger_id=f"{job_id}:{slot_ms}")
+
+    @classmethod
+    def manual(cls, job_id: str) -> CronInvocation:
+        return cls(trigger_id=f"{job_id}:manual:{uuid4()}")
 
 
 @dataclass

@@ -1,0 +1,24 @@
+{
+  "head": "2e9c28cf404b7738c511ae4e08ef6408d2009266",
+  "review_scope": "current working tree; original dirty edits preserved",
+  "sha256": {
+    "nanobot-teams/src/nanobot_teams/async_mcp.py": "b0deca22ad56f281bb1edde964735938c07d4ef05fb6d0cdb2df64d4a38b584a",
+    "nanobot-teams/src/nanobot_teams/coordinator/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "nanobot-teams/src/nanobot_teams/coordinator/client.py": "1d37b387472803fa749e265b52c5422171c8b7855b61a091ae830d706a083277",
+    "nanobot-teams/src/nanobot_teams/coordinator/config.py": "acf797b9a7a441b55e4864857b68cc87e8a855af906db694edf581ca9e8889ba",
+    "nanobot-teams/src/nanobot_teams/coordinator/http_api.py": "8f0c0d2a5853d3ce0098beac82de71c7a72f5541e6fd1decf63c808cbd1c8f84",
+    "nanobot-teams/src/nanobot_teams/coordinator/models.py": "25e6749b0a7cd492b8d65ad0c5d0b031c9f3d8ba89128afdbacda258ad2d3524",
+    "nanobot-teams/src/nanobot_teams/coordinator/service.py": "9b959afcf59aaba43b4892163db7486b3fcf0138dade51a2694fadda250e3cf7",
+    "nanobot-teams/src/nanobot_teams/coordinator/store.py": "8c6e250d12acd385921125b7fd5feba682f1adb7b73aecb6a99891e203a16607",
+    "nanobot-teams/src/nanobot_teams/coordinator/worker.py": "f41b5eb31831906fea8e8f2f655a8d3f5d02ba64735e08d46861522c70c9732d",
+    "nanobot/api/agent_inbox.py": "3c43aa7f66b266ef306b28fa1c7fced4bb60acf224a2e8166a19dd89ce48902a",
+    "nanobot/api/agent_runs.py": "8345dd9780f93c344f7af5aee5ee18fbb22643d769c7cdf89ee8040cd8ca7353",
+    "nanobot/runs/__init__.py": "502c52045de16932796e2658af28ba36467e8cf45982f2c63f6f702bad731077",
+    "nanobot/runs/executor.py": "226e95bb1ae0cee614d2626d1414f6816c88223894253a4432f54ae66ff24140",
+    "nanobot/runs/service.py": "121ab50505ab0b955d713165db7e048a60ef86b26bede6e1b7cad164db27d4d6",
+    "nanobot/runs/store.py": "00f93d1ebf6217601eb859292a9b8e943613486474b6020dbab5f7ba907eb1d6",
+    "nanobot/runs/types.py": "84cf0aa8cccf93249ea658e7df78c448edc49f4674dd75157a414643599fba7e",
+    "nanobot/session/external_inbox.py": "e7cc5b4fb7d2d05cac5a64ced0f55ce07cdc3acb4b59353bfb241c8d2ea68fe4",
+    "webui/src/components/teams/TeamsSettings.tsx": "33bdc77935953dddcb35832db550b4c8a0fd6843b7d93fc943ce9c9bf8f960bf"
+  }
+}

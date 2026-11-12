@@ -1,0 +1,125 @@
+"""A24: CronService executes teams_task jobs; duplicate fires submit once."""
+
+from __future__ import annotations
+
+from nanobot.cron.service import CronService
+from nanobot.cron.teams_jobs import run_teams_cron_job
+from nanobot.cron.types import CronInvocation, CronJob, CronPayload, CronSchedule, CronStore
+
+
+class FakeProxy:
+    def __init__(self):
+        self.submissions = {}
+        self.enabled = True
+
+    async def forward(self, method, path, body=None):
+        body = body or {}
+        if body["operation_key"] in self.submissions:
+            return _Result(200, self.submissions[body["operation_key"]])
+        record = {"task_id": f"task_{len(self.submissions) + 1}", **body}
+        self.submissions[body["operation_key"]] = record
+        return _Result(201, record)
+
+
+class _Result:
+    def __init__(self, status, payload):
+        self.status = status
+        self.payload = payload
+
+
+def make_job(job_id="cron-1"):
+    payload = CronPayload(
+        kind="teams_task",
+        message="nightly digest",
+        origin_metadata={"teams_project": "ops", "teams_bot": "research"},
+    )
+    return CronJob(id=job_id, name="digest",
+                   schedule=CronSchedule(kind="every"), payload=payload)
+
+
+async def test_cron_service_runs_teams_job_and_dedupes_fire(tmp_path):
+    proxy = FakeProxy()
+    service = CronService(tmp_path / "cron" / "jobs.json")
+
+    async def on_job(job, invocation):
+        return await run_teams_cron_job(job, proxy, invocation=invocation)
+
+    service.on_job = on_job
+    job = make_job()
+    slot = 1_770_000_000_000
+    job.state.next_run_at_ms = slot
+    await service._execute_job(job, CronInvocation.scheduled(job.id, slot))
+    assert job.state.last_status == "ok"
+    first_run_id = job.state.run_history[-1].run_id
+
+    # The advanced schedule did not persist (crash before the store save), so
+    # the scheduler delivers the same slot again: one task, a second run record.
+    job.state.next_run_at_ms = slot
+    await service._execute_job(job, CronInvocation.scheduled(job.id, slot))
+    assert job.state.last_status == "ok"
+    assert len(proxy.submissions) == 1
+    assert first_run_id != job.state.run_history[-1].run_id
+
+
+async def test_teams_job_without_proxy_marks_error(tmp_path):
+    service = CronService(tmp_path / "cron" / "jobs.json")
+
+    async def on_job(job, invocation):
+        return await run_teams_cron_job(job, None, invocation=invocation)
+
+    service.on_job = on_job
+    job = make_job()
+    await service._execute_job(job, CronInvocation.manual(job.id))
+    assert job.state.last_status == "error"
+    assert "coordinator" in (job.state.last_error or "")
+
+
+async def test_manual_teams_runs_each_submit_a_new_task(tmp_path, monkeypatch):
+    now_ms = 1_767_268_800_000
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now_ms)
+    proxy = FakeProxy()
+
+    async def on_job(job, invocation):
+        return await run_teams_cron_job(job, proxy, invocation=invocation)
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=on_job)
+    job = make_job()
+    job.schedule = CronSchedule(kind="cron", expr="0 0 * * *", tz="UTC")
+    job.state.next_run_at_ms = 1_767_312_000_000
+    service._store = CronStore(jobs=[job])
+    service._save_store()
+
+    for _ in range(3):
+        assert await service.run_job(job.id) is True
+
+    saved = service.get_job(job.id)
+    assert saved is not None
+    assert len(saved.state.run_history) == 3
+    assert len(proxy.submissions) == 3
+
+
+async def test_manual_teams_run_does_not_consume_the_next_scheduled_fire(
+    tmp_path, monkeypatch
+):
+    now_ms = 1_767_268_800_000
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now_ms)
+    proxy = FakeProxy()
+
+    async def on_job(job, invocation):
+        return await run_teams_cron_job(job, proxy, invocation=invocation)
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=on_job)
+    job = make_job()
+    job.schedule = CronSchedule(kind="cron", expr="0 0 * * *", tz="UTC")
+    job.state.next_run_at_ms = 1_767_312_000_000
+    service._store = CronStore(jobs=[job])
+    service._save_store()
+
+    assert await service.run_job(job.id) is True
+    now_ms = 1_767_312_000_000
+    await service._on_timer()
+
+    saved = service.get_job(job.id)
+    assert saved is not None
+    assert len(saved.state.run_history) == 2
+    assert len(proxy.submissions) == 2

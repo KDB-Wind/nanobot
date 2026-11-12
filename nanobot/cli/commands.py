@@ -65,6 +65,7 @@ from nanobot.utils.helpers import sanitize_surrogates as _sanitize_surrogates  #
 from nanobot.utils.helpers import (  # noqa: E402
     sync_workspace_templates,
 )
+from nanobot.webui.context_source_hook import create_context_source_hook  # noqa: E402
 
 # Backward-compatible import for callers that used the former module location.
 SafeFileHistory = cli_terminal.SafeFileHistory
@@ -381,13 +382,16 @@ def serve(
         build_unconfigured_provider_snapshot(runtime_config, setup_error).provider
         if setup_error else None
     )
+    from nanobot.goal.assembly import install_goal
+
     try:
         agent_loop = AgentLoop.from_config(
             runtime_config, bus,
             provider=unconfigured_provider,
             session_manager=session_manager,
-            hook_factories=[create_file_edit_activity_hook],
+            hook_factories=[create_file_edit_activity_hook, create_context_source_hook],
             tool_registry=tools,
+            builtin_assembly=install_goal,
         )
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")
@@ -406,20 +410,104 @@ def serve(
         )
     console.print()
 
+    runs_service: Any | None = None
+    runs_store: Any | None = None
+    if api_cfg.runs.enabled:
+        from nanobot.config.paths import get_runtime_subdir
+        from nanobot.runs.executor import AgentLoopRunExecutor
+        from nanobot.runs.service import RunService
+        from nanobot.runs.store import RunStore
+
+        runs_store = RunStore(get_runtime_subdir("runs") / "runs.sqlite3")
+        # Bounded wait: a hard-killed predecessor's OS lock may clear a moment
+        # after death. Failing here happens before any port bind or recovery,
+        # so a competing serve can never disturb existing runs.
+        runs_store.open(lock_wait_s=10.0)
+        runs_service = RunService(
+            runs_store,
+            AgentLoopRunExecutor(
+                agent_loop,
+                durable_peer_sessions=api_cfg.runs.inbox_enabled,
+            ),
+            max_active=api_cfg.runs.max_concurrent,
+        )
+        console.print(
+            f"  [cyan]Agent runs[/cyan]: enabled (principal {api_cfg.runs.principal_id}"
+            f"{', exclusive' if api_cfg.runs.exclusive_execution else ''})"
+        )
+
     api_app = create_app(
         agent_loop, model_name=model_name, request_timeout=timeout,
         api_key=api_key,
         prepare_agent=mcp_provider.connect,
+        runs_service=runs_service,
+        runs_config=api_cfg.runs if api_cfg.runs.enabled else None,
     )
 
+    inbox_pump: Any | None = None
+    inbox_tasks: tuple[asyncio.Task[None], ...] = ()
+    if api_cfg.runs.enabled and api_cfg.runs.inbox_enabled and runs_service is not None:
+        from nanobot.cli.serve_inbox import mount_serve_inbox
+
+        inbox_pump = mount_serve_inbox(
+            api_app,
+            agent_loop=agent_loop,
+            runs_config=api_cfg.runs,
+        )
+        console.print(
+            f"  [cyan]Inbox[/cyan]     : enabled on the API listener "
+            f"(principal {api_cfg.runs.principal_id})"
+        )
+
     async def on_startup(_app: Any) -> None:
+        nonlocal inbox_tasks
         await mcp_provider.connect()
+        # Record per-bot usage exactly like the gateway does, so worker homes
+        # carry their own llm_usage.sqlite3 for the coordinator's reader.
+        from nanobot.llm_usage import record_llm_call
+
+        try:
+            agent_loop.provider.set_llm_call_observer(record_llm_call)
+        except Exception:
+            logger.warning("could not attach the llm usage observer", exc_info=True)
+        if runs_service is not None:
+            interrupted = await runs_service.start()
+            if interrupted:
+                logger.warning(
+                    "agent runs: {} run(s) interrupted by the previous shutdown",
+                    len(interrupted),
+                )
+        if inbox_pump is not None:
+            inbox_tasks = (
+                asyncio.create_task(inbox_pump.run_forever(), name="nanobot-inbox-wake"),
+                asyncio.create_task(agent_loop.run(), name="nanobot-inbox-agent"),
+            )
 
     async def on_cleanup(_app: Any) -> None:
         try:
-            await agent_loop.aclose()
+            if inbox_tasks:
+                wake_task = inbox_tasks[0]
+                wake_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await wake_task
         finally:
-            await mcp_provider.aclose()
+            try:
+                if runs_service is not None:
+                    await runs_service.aclose()
+            finally:
+                try:
+                    if inbox_tasks:
+                        agent_task = inbox_tasks[1]
+                        agent_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await agent_task
+                finally:
+                    try:
+                        await agent_loop.aclose()
+                    finally:
+                        if runs_store is not None:
+                            runs_store.close()
+                        await mcp_provider.aclose()
 
     api_app.on_startup.append(on_startup)
     api_app.on_cleanup.append(on_cleanup)

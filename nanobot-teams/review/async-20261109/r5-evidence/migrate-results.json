@@ -1,0 +1,42 @@
+[
+  {
+    "check": "migrate: project created",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "migrate: bot research registered",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "migrate: bot writer registered",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "migrate: coordinator restarted",
+    "ok": true,
+    "detail": "port=31214"
+  },
+  {
+    "check": "migrate: usage imported",
+    "ok": true,
+    "detail": "{\"usage_delegations\": 1, \"unknown_isolated\": 1}"
+  },
+  {
+    "check": "migrate: unconfirmed quota blocks admission",
+    "ok": true,
+    "detail": "status=422 code=migrated_quota_unconfirmed"
+  },
+  {
+    "check": "migrate: operator confirm unlocks",
+    "ok": true,
+    "detail": "200"
+  },
+  {
+    "check": "migrate: admission after confirm",
+    "ok": true,
+    "detail": "201"
+  }
+]

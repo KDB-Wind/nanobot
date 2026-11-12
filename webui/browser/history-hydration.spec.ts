@@ -181,7 +181,7 @@ test("idle compaction stays singular across live updates, thread refresh and col
   backend.healthy();
 });
 
-test("pre-request compaction precedes the answer in live output and history replay", async ({ page }) => {
+test("pre-request compaction stays in place through retries and precedes the answer in history", async ({ page }) => {
   const { backend, body } = await openFixture(page);
   const base = closedTurn("before-native", "Previous question", "Previous answer.");
   await backend.release(await backend.read(), history(base));
@@ -190,18 +190,89 @@ test("pre-request compaction precedes the answer in live output and history repl
   const compact: ThreadProjectionEvent = { ...at(TURN, 2, "activity"), event: "context_compaction", compaction_id: "native-before-answer", phase: "succeeded" };
   await backend.send(question);
   await backend.send({ event: "context_compaction", chat_id: A, compaction_id: "native-before-answer", phase: "started" });
+  const notice = body.locator("[data-context-compaction]");
+  await expect(notice).toHaveCount(1);
+  await notice.evaluate((element) => { element.setAttribute("data-retry-notice", "original"); });
+  for (const attempt of [1, 2]) {
+    await backend.send({ event: "retry_status", chat_id: A, state: "waiting", attempt,
+      max_attempts: 4, error_kind: "timeout", retry_after_s: 1 });
+    await expect(notice).toHaveCount(1);
+    await expect(notice).toHaveAttribute("data-context-compaction", "started");
+    await expect(notice).toHaveAttribute("data-retry-notice", "original");
+  }
   await backend.send(compact);
+  await expect(notice).toHaveCount(1);
+  await expect(notice).toHaveAttribute("data-context-compaction", "succeeded");
   await backend.send(delta(3, LIVE));
   await backend.send(end(4, LIVE, "live-wire"));
   const complete: ThreadProjectionEvent = { ...at(TURN, 5, "complete"), event: "turn_end" };
   await backend.send(complete);
   await expectBefore(body, "Context compacted", LIVE);
+  const completed = history([...base, question, compact, end(4, LIVE, "live-wire"), complete]);
   backend.refreshThread();
-  await backend.release(await backend.read(A, null, 1), history([...base, question, compact, end(4, LIVE, "live-wire"), complete]));
+  await backend.release(await backend.read(A, null, 1), completed);
+  await expect(body.locator('[data-context-compaction="succeeded"]')).toHaveCount(1);
+  await expectBefore(body, "Context compacted", LIVE);
+  await page.reload();
+  await backend.ready();
+  await backend.release(await backend.read(A, null, 2), completed);
+  await expect(body.locator("[data-context-compaction]")).toHaveCount(1);
   await expect(body.locator('[data-context-compaction="succeeded"]')).toHaveCount(1);
   await expectBefore(body, "Context compacted", LIVE);
   backend.healthy();
 });
+
+for (const inputMethod of ["wheel", "touch"] as const) {
+  test(`keeps unresolved history retryable after live-first delivery (${inputMethod})`, async ({ page }) => {
+    const { backend, body } = await openFixture(page, inputMethod === "touch" ? 390 : 1440);
+    const initial = await backend.read();
+    await backend.send(delta(5, LIVE));
+    await expect(body.getByText(LIVE, { exact: true })).toBeVisible();
+
+    if (inputMethod === "touch") {
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
+      const bounds = (await body.boundingBox())!;
+      const x = bounds.x + bounds.width / 2;
+      const y = bounds.y + 80;
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y }] });
+      for (const travel of [40, 80, 120, 200]) {
+        await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x, y: y + travel }] });
+      }
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+      await cdp.detach();
+    } else {
+      await body.hover();
+      await page.mouse.wheel(0, -120);
+    }
+    await expect(page.getByText("No earlier messages", { exact: true })).toHaveCount(0);
+    await expect(page.locator('.thread-history-status[data-state="loading"]')).toBeVisible();
+    expect(backend.reads).toHaveLength(1);
+
+    await initial.route.fulfill({ status: 503, body: "Synthetic history unavailable" });
+    const retry = page.getByRole("button", { name: "Loading failed. Retry" });
+    await expect(retry).toBeVisible();
+    await expect(page.getByText("No earlier messages", { exact: true })).toHaveCount(0);
+    await expect(body.getByText(LIVE, { exact: true })).toBeVisible();
+    await retry.click();
+    const retried = await backend.read(A, null, 1);
+    await expect(page.locator('.thread-history-status[data-state="loading"]')).toBeVisible();
+    await backend.release(retried, liveFirstHistory());
+    await expect(body.getByText("Historical prefix question", { exact: true })).toBeAttached();
+    await expect(body.getByText(LIVE, { exact: true })).toHaveCount(1);
+    await expect(page.getByText("No earlier messages", { exact: true })).toHaveCount(0);
+
+    const older = await requestOlder(page, backend, body, "nan311-before-2");
+    await backend.release(older, history(closedTurn("first-turn", "First question", "First answer.")));
+    await expect(body.getByText("First question", { exact: true })).toBeAttached();
+    await body.hover();
+    await page.mouse.wheel(0, -10_000);
+    await expect.poll(() => body.evaluate((node) => node.scrollTop)).toBeLessThanOrEqual(1);
+    await page.mouse.wheel(0, -120);
+    await expect(page.getByText("No earlier messages", { exact: true })).toBeVisible();
+    backend.healthy();
+  });
+}
 
 for (const width of [1440, 390]) {
   test(`synthetic live-first latest admits its prefix without refresh, then prepends two cursor pages (${width}px)`, async ({ page }) => {
@@ -267,6 +338,59 @@ test("synthetic HTTP-first cumulative text suppresses delayed covered chunks but
   await expect(body.getByText(`${continued} after delayed end`, { exact: true })).toHaveCount(1);
   await expect(body.getByText(canonical, { exact: true })).toHaveCount(0);
   expect(backend.reads).toHaveLength(1);
+  backend.healthy();
+});
+
+test("the open context sidebar keeps its slot through hydration and empty conversation transitions", async ({ page }) => {
+  const { backend } = await openFixture(page);
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  const contextHistory = (chatId: string, name: string, tokens: number) => {
+    const turn = `${chatId}-context`;
+    return history([
+      input(turn, `Inspect ${name}`, chatId),
+      { ...at(turn, 1, "activity", chatId), event: "model_request", request_id: `${turn}-request`,
+        run_id: turn, sequence: 1, phase: "completed", context_window_tokens: 10000,
+        usage: { prompt_tokens: tokens, context_tokens: tokens },
+        request_usage: { prompt_tokens: tokens, context_tokens: tokens },
+        context_graph: { nodes: [{ path: `/${name}`, name, state: "loaded", tokens: 100 }], edges: [] } },
+      { ...at(turn, 2, "answer", chatId), event: "message", text: `Inspected ${name}.` },
+      { ...at(turn, 3, "complete", chatId), event: "turn_end" },
+    ], { chatId });
+  };
+  await backend.release(await backend.read(), contextHistory(A, "first.md", 1000));
+  await page.getByTestId("composer-context-usage").click();
+  const sidebar = page.getByTestId("context-sidebar");
+  await expect(sidebar.getByRole("button", { name: "first.md", exact: true })).toBeVisible();
+  await expect(sidebar.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "10");
+  await sidebar.evaluate((node) => node.setAttribute("data-session-slot", "retained"));
+  const expectSlot = async () => {
+    await page.locator(".thread-layout").evaluate(async (node) => {
+      await Promise.all(node.getAnimations().map((animation) => animation.finished));
+    });
+    await expect(sidebar).toHaveAttribute("data-session-slot", "retained");
+    await expect.poll(() => sidebar.evaluate((node) => node.getBoundingClientRect().width)).toBe(420);
+    await expect.poll(() => sidebar.locator(".file-preview-content").evaluate((node) => {
+      const surface = document.querySelector(".thread-composer-surface")!;
+      return Math.abs(node.getBoundingClientRect().bottom - surface.getBoundingClientRect().bottom);
+    })).toBeLessThan(1);
+    expect((await sidebar.locator(".file-preview-content").boundingBox())!.height).toBeGreaterThan(300);
+  };
+  await expectSlot();
+
+  await page.getByRole("button", { name: "Conversation B", exact: true }).click();
+  const target = await backend.read(B);
+  // The pane stays open with unknown usage, never the outgoing session's graph.
+  await expect(sidebar.getByRole("button", { name: "first.md", exact: true })).toHaveCount(0);
+  await expect(sidebar.getByRole("progressbar")).not.toHaveAttribute("aria-valuenow");
+  await expectSlot();
+
+  await backend.release(target, history([], { chatId: B }));
+  await expect(page.locator('.thread-layout[data-layout="hero"]')).toBeVisible();
+  await expectSlot();
+  for (const event of contextHistory(B, "second.md", 2000).events) await backend.send(event);
+  await expect(sidebar.getByRole("button", { name: "second.md", exact: true })).toBeVisible();
+  await expect(sidebar.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "20");
+  await expectSlot();
   backend.healthy();
 });
 

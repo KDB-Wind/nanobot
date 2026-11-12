@@ -16,6 +16,7 @@ from loguru import logger
 from nanobot.cron.binding import CronBinding, CronBindingError, binding_revision
 from nanobot.cron.session_turns import is_bound_cron_job
 from nanobot.cron.types import (
+    CronInvocation,
     CronJob,
     CronJobState,
     CronPayload,
@@ -195,7 +196,7 @@ class CronService:
     def __init__(
         self,
         store_path: Path,
-        on_job: Callable[[CronJob], Coroutine[Any, Any, str | CronRunResult | None]] | None = None,
+        on_job: Callable[[CronJob, CronInvocation], Coroutine[Any, Any, str | CronRunResult | None]] | None = None,
         max_sleep_ms: int = 300_000,
         *,
         admission: RuntimeAdmission | None = None,
@@ -571,7 +572,8 @@ class CronService:
                     or job.state.next_run_at_ms > _now_ms()
                 ):
                     continue
-                await self._execute_job(job)
+                invocation = CronInvocation.scheduled(job.id, job.state.next_run_at_ms)
+                await self._execute_job(job, invocation)
 
             self._save_store()
         except Exception:
@@ -590,7 +592,7 @@ class CronService:
             # single bad tick cannot silently stop all future jobs.
             self._arm_timer()
 
-    async def _execute_job(self, job: CronJob) -> None:
+    async def _execute_job(self, job: CronJob, invocation: CronInvocation) -> None:
         schedule = job.schedule
         start_ms = _now_ms()
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
@@ -598,7 +600,7 @@ class CronService:
 
         try:
             if self.on_job:
-                result = await self.on_job(job)
+                result = await self.on_job(job, invocation)
 
             job.state.last_status = "ok"
             job.state.last_error = None
@@ -938,7 +940,7 @@ class CronService:
                         return False
                     if not force and not job.enabled:
                         return False
-                    await self._execute_job(job)
+                    await self._execute_job(job, CronInvocation.manual(job.id))
                     self._save_store()
                     return True
             return False

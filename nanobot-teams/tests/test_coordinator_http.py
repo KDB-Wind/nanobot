@@ -1,0 +1,585 @@
+"""Coordinator HTTP API: role auth, admission, catalog writes, snapshot, SSE."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from urllib.parse import quote
+
+import pytest
+from aiohttp.test_utils import TestClient, TestServer
+
+from nanobot_teams.coordinator.config import CoordinatorConfig, PlannerBinding
+from nanobot_teams.coordinator.http_api import build_app
+from nanobot_teams.coordinator.store import CoordinatorStore
+
+try:
+    import aiohttp  # noqa: F401
+
+    HAS_AIOHTTP = True
+except ImportError:  # pragma: no cover
+    HAS_AIOHTTP = False
+
+pytest_plugins = ("pytest_asyncio",)
+
+ADMIN = "admin-secret-token"
+PLANNER = "planner-secret-token"
+
+
+def make_config(tmp_path) -> CoordinatorConfig:
+    return CoordinatorConfig(
+        control_dir=tmp_path / "control",
+        planner=PlannerBinding(
+            inbox_url="http://127.0.0.1:8765", instance_id="planner-inst", principal_id="planner"
+        ),
+    )
+
+
+@pytest.fixture
+def store(tmp_path):
+    s = CoordinatorStore(tmp_path / "coord.sqlite3")
+    s.open()
+    yield s
+    s.close()
+
+
+@pytest.fixture
+async def client(tmp_path, store):
+    app = build_app(store, make_config(tmp_path), {"operator": ADMIN, "planner": PLANNER})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    yield test_client, store
+    await test_client.close()
+
+
+def planner_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {PLANNER}"}
+
+
+def admin_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {ADMIN}"}
+
+
+async def seed_catalog(client):
+    test_client, store = client
+    await test_client.post(
+        "/v1/teams/projects",
+        headers=admin_headers(),
+        json={"project_id": "proj", "display_name": "Main"},
+    )
+    store.upsert_bot(
+        __import__("nanobot_teams.coordinator.models", fromlist=["Bot"]).Bot(
+            bot_id="research",
+            display_name="Research",
+            role="research",
+            endpoint="http://127.0.0.1:8921",
+            secret_env="TEAMS_BOT_KEY",
+        )
+    )
+
+
+def task_body(**overrides) -> dict:
+    body = {
+        "project": "proj",
+        "bot": "research",
+        "input": "go research",
+        "operation_key": str(uuid.uuid4()),
+        "workflow": "wf-1",
+    }
+    body.update(overrides)
+    return body
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_role_authentication(client):
+    test_client, _ = client
+    no_token = await test_client.get("/v1/teams/capabilities")
+    assert no_token.status == 401
+    wrong = await test_client.get(
+        "/v1/teams/capabilities", headers={"Authorization": "Bearer nope"}
+    )
+    assert wrong.status == 401
+    ok = await test_client.get("/v1/teams/capabilities", headers=planner_headers())
+    assert ok.status == 200
+    assert (await ok.json())["protocol"] == 1
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_planner_cannot_write_catalog_but_operator_can(client):
+    test_client, _ = client
+    denied = await test_client.post(
+        "/v1/teams/projects", headers=planner_headers(), json={"project_id": "p2"}
+    )
+    assert denied.status == 403
+    created = await test_client.post(
+        "/v1/teams/projects", headers=admin_headers(), json={"project_id": "p2"}
+    )
+    assert created.status == 201
+    bots_denied = await test_client.post(
+        "/v1/teams/bots",
+        headers=planner_headers(),
+        json={"bot_id": "x", "endpoint": "http://127.0.0.1:1", "secret_env": "E"},
+    )
+    assert bots_denied.status == 403
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_bot_registration_rejects_raw_secrets_and_non_loopback(client):
+    test_client, _ = client
+    raw = await test_client.post(
+        "/v1/teams/bots",
+        headers=admin_headers(),
+        json={
+            "bot_id": "x",
+            "endpoint": "http://127.0.0.1:8921",
+            "secret_env": "E",
+            "api_key": "super-secret",
+        },
+    )
+    assert raw.status == 400
+    assert (await raw.json())["code"] == "secret_rejected"
+    remote = await test_client.post(
+        "/v1/teams/bots",
+        headers=admin_headers(),
+        json={"bot_id": "x", "endpoint": "http://10.0.0.5:8921", "secret_env": "E"},
+    )
+    assert remote.status == 400
+    good = await test_client.post(
+        "/v1/teams/bots",
+        headers=admin_headers(),
+        json={"bot_id": "x", "endpoint": "http://127.0.0.1:8921", "secret_env": "E"},
+    )
+    assert good.status == 201
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_task_admission_idempotent_and_conflict(client):
+    await seed_catalog(client)
+    test_client, _ = client
+    body = task_body()
+    first = await test_client.post("/v1/teams/tasks", headers=planner_headers(), json=body)
+    assert first.status == 201
+    task = await first.json()
+    assert task["dispatch_state"] == "pending"
+    replay = await test_client.post("/v1/teams/tasks", headers=planner_headers(), json=body)
+    assert replay.status == 200
+    assert (await replay.json())["task_id"] == task["task_id"]
+    conflict = await test_client.post(
+        "/v1/teams/tasks", headers=planner_headers(), json=task_body(
+            operation_key=body["operation_key"], input="different"
+        )
+    )
+    assert conflict.status == 409
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_auto_resume_requires_capability_until_p4(client):
+    await seed_catalog(client)
+    test_client, _ = client
+    response = await test_client.post(
+        "/v1/teams/tasks",
+        headers=planner_headers(),
+        json=task_body(delivery_mode="auto_resume"),
+    )
+    assert response.status == 422
+    assert (await response.json())["code"] == "origin_required"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_lookup_static_route_takes_precedence(client):
+    await seed_catalog(client)
+    test_client, _ = client
+    body = task_body()
+    created = await test_client.post("/v1/teams/tasks", headers=planner_headers(), json=body)
+    task_id = (await created.json())["task_id"]
+    found = await test_client.get(
+        f"/v1/teams/tasks/lookup?operation_key={body['operation_key']}",
+        headers=planner_headers(),
+    )
+    assert found.status == 200
+    assert (await found.json())["task_id"] == task_id
+    missing = await test_client.get(
+        f"/v1/teams/tasks/lookup?operation_key={uuid.uuid4()}",
+        headers=planner_headers(),
+    )
+    assert missing.status == 404
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_cancel_and_states_flow_through_http(client):
+    await seed_catalog(client)
+    test_client, _ = client
+    created = await test_client.post(
+        "/v1/teams/tasks", headers=planner_headers(), json=task_body()
+    )
+    task_id = (await created.json())["task_id"]
+    cancel = await test_client.post(
+        f"/v1/teams/tasks/{task_id}/cancel", headers=planner_headers()
+    )
+    assert cancel.status == 202
+    payload = await cancel.json()
+    assert payload["cancel_state"] in ("requested", "confirmed")
+    fetched = await test_client.get(f"/v1/teams/tasks/{task_id}", headers=planner_headers())
+    assert fetched.status == 200
+    forbidden = await test_client.get("/v1/teams/tasks/task_nope", headers=planner_headers())
+    assert forbidden.status == 404
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_snapshot_lists_catalog_without_secrets(client):
+    await seed_catalog(client)
+    test_client, _ = client
+    await test_client.post("/v1/teams/tasks", headers=planner_headers(), json=task_body())
+    snapshot = await test_client.get("/v1/teams/snapshot", headers=planner_headers())
+    assert snapshot.status == 200
+    payload = await snapshot.json()
+    assert payload["projects"] and payload["bots"] and payload["tasks"]
+    assert "secret_env" not in payload["bots"][0]
+    text = json.dumps(payload)
+    assert "Bearer" not in text and "secret" not in text.lower().replace("secret_env", "")
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_events_stream_emits_task_lifecycle(client):
+    await seed_catalog(client)
+    test_client, _ = client
+    created = await test_client.post(
+        "/v1/teams/tasks", headers=planner_headers(), json=task_body()
+    )
+    task_id = (await created.json())["task_id"]
+    resp = await test_client.get("/v1/teams/events?after=0", headers=planner_headers())
+    assert resp.status == 200
+    collected = b""
+    seen = False
+    while len(collected) < 65536:
+        chunk = await resp.content.readany()
+        if not chunk:
+            break
+        collected += chunk
+        text = collected.decode("utf-8", errors="ignore")
+        if "task_created" in text and task_id in text:
+            seen = True
+            break
+    assert seen, collected.decode("utf-8", errors="ignore")
+    resp.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_scaffold_creates_home_and_returns_manual_command(tmp_path, store):
+    """F12/F13: the scaffold contract on the shared HTTP surface — loadable
+    JSON config, env-ref credentials, and no raw service key in the response."""
+    from nanobot_teams.coordinator.config import CoordinatorConfig
+
+    user_config = tmp_path / "user-config.json"
+    user_config.write_text(
+        json.dumps(
+            {
+                "modelPresets": {
+                    "http-preset": {"model": "m", "provider": "p", "apiKey": "sk-live"}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = CoordinatorConfig(
+        control_dir=tmp_path / "control",
+        bot_homes_root=tmp_path / "homes",
+        scaffold_model_preset="http-preset",
+        scaffold_user_config=user_config,
+    )
+    app = build_app(store, config, {"operator": ADMIN, "planner": PLANNER})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        created = await test_client.post(
+            "/v1/teams/bots/scaffold",
+            headers=admin_headers(),
+            json={"bot_id": "writer", "role": "writing"},
+        )
+        assert created.status == 201, await created.text()
+        payload = await created.json()
+        assert payload["started"] is False
+        assert payload["start_command"].startswith('nanobot serve --config "')
+        assert "api_key" not in payload, "the raw key never reaches the browser"
+        home = tmp_path / "homes" / "writer"
+        config_text = (home / "config.json").read_text(encoding="utf-8")
+        assert '"runs"' in config_text
+        assert (home / "workspace").is_dir()
+        assert store.get_bot("writer") is not None
+        assert (home / "service-key.env").exists()
+        assert "sk-live" not in config_text, "preset credentials stay env-referenced"
+        # The same home is never overwritten.
+        repeat = await test_client.post(
+            "/v1/teams/bots/scaffold",
+            headers=admin_headers(),
+            json={"bot_id": "writer"},
+        )
+        assert repeat.status == 409
+        escape = await test_client.post(
+            "/v1/teams/bots/scaffold",
+            headers=admin_headers(),
+            json={"bot_id": "../evil"},
+        )
+        assert escape.status == 400
+        # Planner cannot scaffold.
+        denied = await test_client.post(
+            "/v1/teams/bots/scaffold",
+            headers=planner_headers(),
+            json={"bot_id": "other"},
+        )
+        assert denied.status == 403
+    finally:
+        await test_client.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_bot_with_open_tasks_rejects_edits(client):
+    await seed_catalog(client)
+    test_client, store = client
+    await test_client.post("/v1/teams/tasks", headers=planner_headers(), json=task_body())
+    edit = await test_client.post(
+        "/v1/teams/bots",
+        headers=admin_headers(),
+        json={
+            "bot_id": "research",
+            "endpoint": "http://127.0.0.1:9999",
+            "secret_env": "TEAMS_BOT_KEY",
+        },
+    )
+    assert edit.status == 409
+    assert (await edit.json())["code"] == "bot_has_open_tasks"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_q1b_ssrf_endpoint_variants_rejected(client):
+    test_client, _ = client
+    for endpoint in (
+        "http://127.0.0.1.evil.com",
+        "http://127.0.0.1@attacker.host",
+        "http://localhost:80@evil",
+        "https://127.0.0.1",
+    ):
+        response = await test_client.post(
+            "/v1/teams/bots",
+            headers=admin_headers(),
+            json={"bot_id": "s", "endpoint": endpoint, "secret_env": "E"},
+        )
+        assert response.status == 400, endpoint
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_q1b_replay_wins_over_capability_validation(client):
+    await seed_catalog(client)
+    test_client, store = client
+    body = task_body()
+    first = await test_client.post("/v1/teams/tasks", headers=planner_headers(), json=body)
+    assert first.status == 201
+    # A workbench_only retry never touches the planner anyway; assert the
+    # replay path returns 200 with the original task id.
+    replay = await test_client.post("/v1/teams/tasks", headers=planner_headers(), json=body)
+    assert replay.status == 200
+    assert (await replay.json())["task_id"] == (await first.json())["task_id"]
+    different = await test_client.post(
+        "/v1/teams/tasks",
+        headers=planner_headers(),
+        json={**body, "input": "different"},
+    )
+    assert different.status == 409
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_stop_workflow_revokes_grant_before_cancelling(
+    tmp_path, store, monkeypatch
+):
+    """T5: the planner grant is withdrawn before any cancel is requested."""
+    from aiohttp import web
+
+    monkeypatch.setenv("TEAMS_PLANNER_INBOX_KEY", "planner-inbox-secret")
+    seen: dict[str, object] = {}
+    open_ids: list[str] = []
+
+    async def fake_revoke(request):
+        workflow = request.match_info["workflow_id"]
+        seen["workflow"] = workflow
+        seen["auth"] = request.headers.get("Authorization", "")
+        seen["states_at_revoke"] = [
+            store.get_task(task_id).cancel_state.value for task_id in open_ids
+        ]
+        return web.json_response({"workflow_id": workflow, "revoked": True})
+
+    inbox_app = web.Application()
+    inbox_app.router.add_post(
+        "/v1/agent-inbox/workflows/{workflow_id}/revoke", fake_revoke
+    )
+    inbox_server = TestServer(inbox_app)
+    await inbox_server.start_server()
+    config = CoordinatorConfig(
+        control_dir=tmp_path / "control",
+        planner=PlannerBinding(
+            inbox_url=str(inbox_server.make_url("/")).rstrip("/"),
+            instance_id="planner-inst",
+            principal_id="planner",
+        ),
+    )
+    app = build_app(store, config, {"operator": ADMIN, "planner": PLANNER})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await seed_catalog((test_client, store))
+        stopped: list[str] = []
+        for _ in range(2):
+            created = await test_client.post(
+                "/v1/teams/tasks",
+                headers=planner_headers(),
+                json=task_body(workflow="wf-stop"),
+            )
+            assert created.status == 201
+            stopped.append((await created.json())["task_id"])
+        open_ids.extend(stopped)
+        other = await test_client.post(
+            "/v1/teams/tasks",
+            headers=planner_headers(),
+            json=task_body(workflow="wf-other"),
+        )
+        other_id = (await other.json())["task_id"]
+
+        response = await test_client.post(
+            "/v1/teams/workflows/wf-stop/stop", headers=admin_headers()
+        )
+        assert response.status == 200, await response.text()
+        payload = await response.json()
+        assert payload["workflow_id"] == "wf-stop"
+        assert payload["revoked"] is True
+        assert set(payload["cancelled"]) == set(stopped)
+        assert payload["unconfirmed"] == []
+        assert payload["total"] == 2
+        assert seen["workflow"] == "wf-stop"
+        assert seen["auth"] == "Bearer planner-inbox-secret"
+        assert seen["states_at_revoke"] == ["none", "none"]
+        for task_id in stopped:
+            assert store.get_task(task_id).cancel_state.value == "confirmed"
+        assert store.get_task(other_id).cancel_state.value == "none"
+
+        # The planner principal may stop too; its own workflow's task cancels.
+        planner_stop = await test_client.post(
+            "/v1/teams/workflows/wf-other/stop", headers=planner_headers()
+        )
+        assert planner_stop.status == 200, await planner_stop.text()
+        other_payload = await planner_stop.json()
+        assert other_payload["cancelled"] == [other_id]
+    finally:
+        await test_client.close()
+        await inbox_server.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_stop_workflow_cancels_tasks_when_grant_cannot_be_revoked(
+    tmp_path, store, monkeypatch
+):
+    """A missing planner key reports revoked=false and still stops the tasks."""
+    monkeypatch.delenv("TEAMS_PLANNER_INBOX_KEY", raising=False)
+    config = make_config(tmp_path)
+    app = build_app(store, config, {"operator": ADMIN, "planner": PLANNER})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await seed_catalog((test_client, store))
+        created = await test_client.post(
+            "/v1/teams/tasks",
+            headers=planner_headers(),
+            json=task_body(workflow="wf-nokey"),
+        )
+        task_id = (await created.json())["task_id"]
+        response = await test_client.post(
+            "/v1/teams/workflows/wf-nokey/stop", headers=admin_headers()
+        )
+        assert response.status == 200, await response.text()
+        payload = await response.json()
+        assert payload["revoked"] is False
+        assert payload["cancelled"] == [task_id]
+        assert payload["total"] == 1
+        assert store.get_task(task_id).cancel_state.value == "confirmed"
+    finally:
+        await test_client.close()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_stop_workflow_keeps_the_planner_task_ownership_boundary(client):
+    """P16-01: the aggregate entry may not cancel another principal's tasks."""
+    await seed_catalog(client)
+    test_client, store = client
+    created = await test_client.post(
+        "/v1/teams/tasks",
+        headers=admin_headers(),
+        json=task_body(workflow="wf-operator-owned"),
+    )
+    assert created.status == 201, await created.text()
+    task_id = (await created.json())["task_id"]
+    stopped = await test_client.post(
+        "/v1/teams/workflows/wf-operator-owned/stop", headers=planner_headers()
+    )
+    assert stopped.status == 403, await stopped.text()
+    assert (await stopped.json())["code"] == "forbidden"
+    assert store.get_task(task_id).cancel_state.value == "none"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_resolve_quarantine_is_operator_only_and_records_actor(client):
+    test_client, store = client
+    key = "legacy:http://127.0.0.1:8921"
+    store.quarantine_instance(key, "stop unconfirmed for the imported instance")
+    route = f"/v1/teams/quarantine/{quote(key, safe='')}/resolve"
+    denied = await test_client.post(
+        route, headers=planner_headers(), json={"actor": "planner", "note": "ok"}
+    )
+    assert denied.status == 403
+    empty = await test_client.post(
+        route, headers=admin_headers(), json={"actor": " ", "note": ""}
+    )
+    assert empty.status == 400
+    assert (await empty.json())["code"] == "invalid_field"
+    resolved = await test_client.post(
+        route,
+        headers=admin_headers(),
+        json={"actor": "operator-7", "note": "reviewed logs and closed the run"},
+    )
+    assert resolved.status == 200, await resolved.text()
+    assert await resolved.json() == {"key": key, "resolved": True}
+    assert key not in store.active_quarantines()
+    events = [
+        event
+        for event in store.events_after(0, limit=100)
+        if event.type == "quarantine_resolved"
+    ]
+    assert events
+    assert events[-1].data == {
+        "instance": key,
+        "actor": "operator-7",
+        "note": "reviewed logs and closed the run",
+    }
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp is not installed")
+async def test_q1b_planner_snapshot_is_scoped_and_operator_cannot_auto_resume(client):
+    await seed_catalog(client)
+    test_client, store = client
+    # Operator-created task stays invisible to the planner snapshot.
+    await test_client.post(
+        "/v1/teams/tasks",
+        headers=admin_headers(),
+        json=task_body(operation_key=str(__import__("uuid").uuid4())),
+    )
+    snapshot = await test_client.get("/v1/teams/snapshot", headers=planner_headers())
+    tasks = (await snapshot.json())["tasks"]
+    assert all(t["caller_principal"] == "planner" for t in tasks)
+    # Operator may not request auto-resume delivery.
+    response = await test_client.post(
+        "/v1/teams/tasks",
+        headers=admin_headers(),
+        json=task_body(delivery_mode="auto_resume"),
+    )
+    assert response.status == 403

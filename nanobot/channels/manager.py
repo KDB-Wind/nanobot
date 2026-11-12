@@ -63,6 +63,7 @@ def _default_webui_dist() -> Path | None:
 _SEND_RETRY_DELAYS = (1, 2, 4)
 _OUTBOUND_CONCURRENCY = 32
 _OUTBOUND_PENDING_LIMIT = 256
+_OUTBOUND_BATCH_LIMIT = 32
 _RESTART_NOTICE_START_TIMEOUT_S = 30.0
 _RESTART_NOTICE_START_POLL_S = 0.25
 ORIGIN_REPLY_FINGERPRINTS_MAX_SIZE = 1000
@@ -142,6 +143,18 @@ class ChannelManager:
         self._webui_skill_state_action = webui_skill_state_action
         self._webui_recovery_action = webui_recovery_action
         self._webui_subagent_manager = webui_subagent_manager
+        from nanobot.webui.teams_proxy import TeamsProxy
+
+        teams_cfg = getattr(self.config, "teams", None)
+        self._teams_proxy = (
+            TeamsProxy(teams_cfg.coordinator_url, teams_cfg.coordinator_token_env)
+            if teams_cfg is not None and teams_cfg.coordinator_url
+            else None
+        )
+        self._teams_event_relay: Any | None = None
+        import nanobot.cli.gateway_runtime as _gr
+        if self._teams_proxy is not None:
+            _gr.register_pending_teams_proxy(self._teams_proxy)
         self._webui_discard_session = webui_discard_session
         self.channels: dict[str, BaseChannel] = {}
         self._channel_owners: dict[str, str] = {}
@@ -152,6 +165,7 @@ class ChannelManager:
         self._restart_notice_task: asyncio.Task[None] | None = None
         self._outbound_tasks: dict[asyncio.Task[None], tuple[str, str]] = {}
         self._outbound_tails: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._outbound_batches: dict[tuple[str, str], list[OutboundMessage]] = {}
         self._outbound_pending: list[OutboundMessage] = []
         self._outbound_dispatching = False
         self._outbound_slots = asyncio.Semaphore(_OUTBOUND_PENDING_LIMIT)
@@ -234,6 +248,7 @@ class ChannelManager:
                 recovery_action=self._webui_recovery_action,
                 subagent_manager=self._webui_subagent_manager,
                 discard_session=self._webui_discard_session,
+                teams_proxy=self._teams_proxy,
                 logger=logger,
             )
             kwargs["gateway"] = gateway
@@ -690,6 +705,10 @@ class ChannelManager:
         )
 
     async def stop_all(self) -> None:
+        if self._teams_event_relay is not None:
+            self._teams_event_relay.cancel()
+            self._teams_event_relay = None
+
         """Stop all channels and the dispatcher."""
         logger.info("Stopping all channels...")
         self._started = False
@@ -776,9 +795,10 @@ class ChannelManager:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _queue_outbound(self, channel: BaseChannel, msg: OutboundMessage) -> None:
-        """Bound scheduled sends; preserve FIFO per destination, not across chats.
+        """Bound queued envelopes; preserve FIFO per destination, not across chats.
 
         Retry waits retain their destination tail and admission, not a send permit.
+        Only an unscheduled tail still waiting to start can accept a bounded batch.
         Saturation pauses dispatch rather than creating unbounded tasks or dropping messages.
         """
         if msg.delivery_id in self._scheduled_deliveries:
@@ -790,14 +810,35 @@ class ChannelManager:
             self._outbound_slots.release()
             return
         key = (msg.channel, msg.chat_id)
+        pending = self._outbound_batches.get(key)
+        if (
+            pending is not None
+            and msg.delivery_id is None
+            and len(pending) < _OUTBOUND_BATCH_LIMIT
+            and channel.can_batch_send(pending[-1], msg) is True
+        ):
+            pending.append(msg)
+            return
+
         previous = self._outbound_tails.get(key)
+        messages = [msg]
         if msg.delivery_id is not None:
             self._scheduled_deliveries.add(msg.delivery_id)
+            self._outbound_batches.pop(key, None)
+        else:
+            self._outbound_batches[key] = messages
 
         async def send() -> None:
             if previous is not None:
                 await asyncio.shield(asyncio.gather(previous, return_exceptions=True))
-            if msg.delivery_id is not None:
+            if self._outbound_batches.get(key) is messages:
+                self._outbound_batches.pop(key, None)
+            batch = tuple(messages)
+            if len(batch) > 1:
+                async with self._outbound_sends:
+                    # Partial delivery must never cause a blind replay of the batch.
+                    await channel.send_batch(batch)
+            elif msg.delivery_id is not None:
                 # Acquire before claiming: queued cancellation must remain pending.
                 async with self._outbound_sends:
                     await self._send_scheduled(channel, msg)
@@ -814,7 +855,10 @@ class ChannelManager:
                 self._scheduled_deliveries.discard(msg.delivery_id)
             if self._outbound_tails.get(key) is done:
                 self._outbound_tails.pop(key, None)
-            self._outbound_slots.release()
+            if self._outbound_batches.get(key) is messages:
+                self._outbound_batches.pop(key, None)
+            for _ in messages:
+                self._outbound_slots.release()
             if not done.cancelled() and (error := done.exception()) is not None:
                 logger.error("Outbound delivery to {}:{} failed: {}", *key, error)
 

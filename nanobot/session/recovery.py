@@ -14,6 +14,7 @@ from nanobot.session.manager import Session
 
 RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
 PENDING_USER_TURN_KEY = "pending_user_turn"
+PENDING_USER_TURN_OWNER_KEY = "pending_user_turn_owner"
 REQUEST_ORIGIN_METADATA_KEY = "request_origin"
 RECOVERY_METADATA_KEY = "webui_recovery"
 RECOVERY_INBOUND_METADATA_KEY = "_webui_recovery_id"
@@ -25,7 +26,7 @@ PROVIDER_STATE_CHECKPOINT_VERSION = "v1"
 _RECOVERY_STATUSES = frozenset({"resuming", "awaiting_user", "recovered", "failed"})
 UNCERTAIN_TOOL_PHASES = frozenset({"awaiting_tools"})
 KNOWN_CHECKPOINT_PHASES = frozenset(
-    {"final_response", "tools_completed", "awaiting_tools", "error"}
+    {"model_input", "final_response", "tools_completed", "awaiting_tools", "error"}
 )
 
 
@@ -251,6 +252,14 @@ def runtime_checkpoint_is_well_formed(checkpoint: Mapping[str, Any]) -> bool:
     """
     if not _checkpoint_prefix_is_complete(checkpoint.get("preceding_messages", [])):
         return False
+    if checkpoint.get("phase") == "model_input":
+        return (
+            checkpoint.get(PROVIDER_STATE_CHECKPOINT_VERSION_KEY)
+            == PROVIDER_STATE_CHECKPOINT_VERSION
+            and checkpoint.get("assistant_message") is None
+            and checkpoint.get("completed_tool_results") == []
+            and checkpoint.get("pending_tool_calls") == []
+        )
     assistant_value = cast(object, checkpoint.get("assistant_message"))
     if not isinstance(assistant_value, dict):
         return False
@@ -310,8 +319,8 @@ def restore_runtime_checkpoint(session: Session) -> bool:
     """Materialize the durable checkpoint exactly once and clear it.
 
     Pending tool calls become explicit interrupted tool results.  They are
-    never executed here.  Provider-native state is retained only for the two
-    checkpoint shapes known to be synchronized with persisted history.
+    never executed here. Provider-native state is retained only for checkpoint
+    shapes known to be synchronized with persisted history.
     """
     checkpoint = cast(object, session.metadata.get(RUNTIME_CHECKPOINT_KEY))
     if not isinstance(checkpoint, dict):
@@ -409,10 +418,12 @@ def restore_runtime_checkpoint(session: Session) -> bool:
         and assistant_data.get("role") == "assistant"
         and not data.get("pending_tool_calls")
     )
-    if not (synchronized and (exact_final or exact_tools)):
+    exact_input = phase == "model_input" and runtime_checkpoint_is_well_formed(data)
+    if not (synchronized and (exact_input or exact_final or exact_tools)):
         session.provider_state = None
 
     session.metadata.pop(PENDING_USER_TURN_KEY, None)
+    session.metadata.pop(PENDING_USER_TURN_OWNER_KEY, None)
     session.metadata.pop(RUNTIME_CHECKPOINT_KEY, None)
     session.updated_at = datetime.now()
     return True
@@ -449,6 +460,7 @@ def restore_pending_interruption(session: Session, *, superseded: bool = False) 
         session.provider_state = None
         session.updated_at = datetime.now()
     session.metadata.pop(PENDING_USER_TURN_KEY, None)
+    session.metadata.pop(PENDING_USER_TURN_OWNER_KEY, None)
     return True
 
 

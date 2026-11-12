@@ -1,0 +1,77 @@
+runs recovered after restart, interrupted: run_61c7d95d-8d2d-42d7-9d44-2615abba2eaa
+runs recovered after restart, interrupted: run_5f3a6498-38d8-4960-be07-20f358ab7366
+Error handling request from 127.0.0.1
+Traceback (most recent call last):
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\nanobot\api\agent_runs.py", line 107, in parse_protocol_json
+    parsed: Any = json.loads(
+                  ^^^^^^^^^^^
+  File "C:\software\Python311\Lib\json\__init__.py", line 359, in loads
+    return cls(**kw).decode(s)
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\software\Python311\Lib\json\decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\software\Python311\Lib\json\decoder.py", line 353, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ^^^^^^^^^^^^^^^^^^^^^^
+json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\.venv-nanobot\Lib\site-packages\aiohttp\web_protocol.py", line 577, in _handle_request
+    resp = await request_handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\.venv-nanobot\Lib\site-packages\aiohttp\web_app.py", line 563, in _handle
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\nanobot\api\agent_runs.py", line 208, in handle_submit
+    body = await parse_protocol_json(request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\nanobot\api\agent_runs.py", line 112, in parse_protocol_json
+    except protocol_error:
+TypeError: catching classes that do not inherit from BaseException is not allowed
+Error handling request from 127.0.0.1
+Traceback (most recent call last):
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\nanobot\api\agent_runs.py", line 107, in parse_protocol_json
+    parsed: Any = json.loads(
+                  ^^^^^^^^^^^
+  File "C:\software\Python311\Lib\json\__init__.py", line 359, in loads
+    return cls(**kw).decode(s)
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\software\Python311\Lib\json\decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\software\Python311\Lib\json\decoder.py", line 353, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\nanobot\api\agent_runs.py", line 99, in _pairs
+    raise protocol_error(400, "duplicate_key", f"Duplicate object key: {key}")
+aiohttp.web_exceptions.HTTPBadRequest: Bad Request
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\.venv-nanobot\Lib\site-packages\aiohttp\web_protocol.py", line 577, in _handle_request
+    resp = await request_handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\.venv-nanobot\Lib\site-packages\aiohttp\web_app.py", line 563, in _handle
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\nanobot\api\agent_runs.py", line 208, in handle_submit
+    body = await parse_protocol_json(request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\KDB\orca\workspaces\nanobot\nanobot-teams-mvp\nanobot\api\agent_runs.py", line 112, in parse_protocol_json
+    except protocol_error:
+TypeError: catching classes that do not inherit from BaseException is not allowed
+{"source": "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\nanobot\\runs\\service.py", "python": "C:\\Users\\KDB\\orca\\workspaces\\nanobot\\nanobot-teams-mvp\\.venv-nanobot\\Scripts\\python.exe"}
+{"probe": "recovery", "crashed_state": "interrupted", "crashed_effects_uncertain": true, "isolation": [false, ""], "queued_executed": true}
+{"probe": "two-writers", "second_open_accepted": true, "same_instance": true, "first_process_still_alive": true, "first_run_interrupted_by_second": true, "second_executed": true}
+{"probe": "false-stop", "executor_stop_confirmed": false, "stored_state": "cancelled", "stored_stop_confirmed": true, "isolated": false}
+{"next_run_state": "succeeded", "cancelled_original_state": "succeeded", "probe": "empty", "state": "succeeded", "stop_confirmed": true, "effects_uncertain": false, "outcome": "succeeded", "text": "I completed the tool steps but couldn't produce a final answer. Please try again or narrow the task.", "live_owned_processes": [], "provider_calls": 6}
+{"next_run_state": "succeeded", "cancelled_original_state": "succeeded", "probe": "background", "state": "succeeded", "stop_confirmed": true, "effects_uncertain": false, "outcome": "succeeded", "text": "Done", "live_owned_processes": [{"session_id": "267f1bd73d00", "returncode": null}], "provider_calls": 3}
+{"probe": "invalid-json", "status": 500, "content_type": "text/plain", "body": "500 Internal Server Error\n\nServer got itself in trouble"}
+{"probe": "duplicate-key", "status": 500, "content_type": "text/plain", "body": "500 Internal Server Error\n\nServer got itself in trouble"}
+{"probe": "expired-sse", "status": 200, "body": "event: cursor_expired\ndata: {\"code\":\"event_cursor_expired\"}\n\n"}
+{"probe": "cleaned-result", "status_result_available": true, "result_http_status": 410}
+{"probe": "retention-unconfirmed", "deleted_unconfirmed_run": true, "counts": {"result_bodies": 1, "events": 3, "runs": 1}}

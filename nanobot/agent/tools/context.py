@@ -48,6 +48,9 @@ class RequestContext:
     persist_session: bool = True
     # Effective tool scope; injected inputs retain the active run's scope.
     workspace_scope: WorkspaceScope | None = None
+    # Workflow root this turn continues; set by async report continuations so
+    # minted capabilities keep the original workflow instead of deriving one.
+    source_workflow: str | None = None
 
 
 @runtime_checkable
@@ -76,6 +79,37 @@ def request_context(ctx: RequestContext):
 
 def current_request_context() -> RequestContext | None:
     return _CURRENT_REQUEST_CONTEXT.get()
+
+
+@dataclass(frozen=True)
+class PeerConversationBinding:
+    """The durable conversation session a peer-capable run belongs to.
+
+    Runs execute in ephemeral sessions that vanish when the run ends, so a
+    reply capability must instead target this durable ``peer:<workflow>``
+    session on the same host; wakes and continuation turns land there.
+    """
+
+    session_key: str
+    session_generation: str
+    workflow_id: str
+
+
+_PEER_CONVERSATION: ContextVar[PeerConversationBinding | None] = ContextVar(
+    "nanobot_peer_conversation", default=None
+)
+
+
+def current_peer_conversation() -> PeerConversationBinding | None:
+    return _PEER_CONVERSATION.get()
+
+
+def bind_peer_conversation(binding: PeerConversationBinding) -> Token[PeerConversationBinding | None]:
+    return _PEER_CONVERSATION.set(binding)
+
+
+def reset_peer_conversation(token: Token[PeerConversationBinding | None]) -> None:
+    _PEER_CONVERSATION.reset(token)
 
 
 def tool_log_content_allowed() -> bool:

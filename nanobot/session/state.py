@@ -12,11 +12,12 @@ from datetime import datetime
 from typing import Any, TypeVar, cast
 
 from nanobot.bus.events import InboundMessage
-from nanobot.session.display_history import HistoryFact, HistoryKind, HistoryReader
+from nanobot.session.display_history import HistoryFact, HistoryImport, HistoryKind, HistoryReader
 from nanobot.session.keys import is_dream_session
 from nanobot.session.manager import (
     Session,
     SessionIdentity,
+    SessionInfo,
     SessionPolicy,
     fork_session,
 )
@@ -27,8 +28,11 @@ from nanobot.utils.cancellation import shield_and_drain
 
 _T = TypeVar("_T")
 _PENDING_KEY = "pending_user_turn"
+_PENDING_OWNER_KEY = "pending_user_turn_owner"
 _CHECKPOINT_KEY = "runtime_checkpoint"
-_RESERVED_KEYS = frozenset({_PENDING_KEY, _CHECKPOINT_KEY, "pending_user_followups"})
+_RESERVED_KEYS = frozenset({
+    _PENDING_KEY, _PENDING_OWNER_KEY, _CHECKPOINT_KEY, "pending_user_followups",
+})
 _DEFAULT_CAPACITY = 64
 _DEFAULT_WORKERS = 4
 
@@ -53,12 +57,16 @@ class SessionState:
         workers: int = _DEFAULT_WORKERS,
         on_delete: Callable[[str], None] | None = None,
         types: SessionTypes | None = None,
+        generation_exclusions: set[str] | None = None,
     ) -> None:
         if capacity < 1:
             raise ValueError("session operation capacity must be positive")
         if workers < 1:
             raise ValueError("session operation worker count must be positive")
         self._types = types if types is not None else SessionTypes()
+        self._generation_exclusions: set[str] = (
+            generation_exclusions if generation_exclusions is not None else set()
+        )
         self._store = store
         self._on_delete = on_delete
         self._snapshots: dict[str, Session] = {}
@@ -83,6 +91,8 @@ class SessionState:
             thread_name_prefix="session-write",
         )
         self._closed = False
+        # Import completion is permanent; archive contents are never cached.
+        self._archives_imported = False
         self._close_task: asyncio.Task[None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -121,12 +131,14 @@ class SessionState:
         *,
         operation_name: str | None = None,
         write: bool = True,
+        barrier: bool = True,
     ) -> _T:
         async def run() -> _T:
             return await self._run_operation(operation, write=write)
 
         return await self._submit(
             key, run, operation_name=operation_name or getattr(operation, "__name__", "session operation"),
+            barrier=barrier,
         )
 
     async def _submit(
@@ -422,6 +434,15 @@ class SessionState:
             return self._draft(session)
         return await self._execute(key, read, write=False)
 
+    async def read_header(self, key: str) -> Session | None:
+        """Read committed identity and metadata without creating a session."""
+        def read() -> Session | None:
+            session = self._load(key, history=False)
+            if session is None:
+                return None
+            return replace(session, messages=[], provider_state=None, _baseline=None)
+        return await self._execute(key, read, write=False)
+
     async def get(self, key: str) -> Session:
         """Read an existing conversation; create missing state on the writer."""
         return await self._get(key, history=True)
@@ -506,7 +527,9 @@ class SessionState:
         for item in fields(Session):
             setattr(draft, item.name, getattr(fresh, item.name))
 
-    def _apply_turn(self, draft: Session) -> tuple[Session, int]:
+    def _apply_turn(
+        self, draft: Session, *, pending_turn_owner: str | None = None
+    ) -> tuple[Session, int]:
         from nanobot.session.recovery import PENDING_FOLLOWUPS_KEY, acknowledge_pending_followups
 
         baseline = draft._baseline  # pyright: ignore[reportPrivateUsage]
@@ -521,6 +544,18 @@ class SessionState:
             current.generation != baseline.generation
         ):
             raise SessionConflictError("session was reset")
+        if pending_turn_owner is not None:
+            owner = current.metadata.get(_PENDING_OWNER_KEY)
+            if (
+                current.metadata.get(_PENDING_KEY)
+                and isinstance(owner, dict)
+                and cast(dict[str, object], owner).get("turn_id") == pending_turn_owner
+                and cast(dict[str, object], owner).get("generation") == current.generation
+            ):
+                # This turn accepted the wake that wrote the marker; settle the
+                # obligation. A marker from a newer turn keeps its owner.
+                current.metadata.pop(_PENDING_KEY, None)
+                current.metadata.pop(_PENDING_OWNER_KEY, None)
         for key in baseline.metadata.keys() | draft.metadata.keys():
             if key == PENDING_FOLLOWUPS_KEY:
                 # queue_followup owns this journal; a draft may predate its inputs.
@@ -559,11 +594,15 @@ class SessionState:
         current.updated_at = max(current.updated_at, draft.updated_at)
         return current, self._changed_start(before_messages, current.messages)
 
-    async def _submit_draft(self, draft: Session) -> None:
+    async def _submit_draft(
+        self, draft: Session, *, pending_turn_owner: str | None = None
+    ) -> None:
         def commit() -> Session:
             # The caller owns this draft and awaits settlement before using it again.
             def write() -> Session:
-                current, message_start = self._apply_turn(draft)
+                current, message_start = self._apply_turn(
+                    draft, pending_turn_owner=pending_turn_owner
+                )
                 self._commit(current, message_start=message_start)
                 return current
 
@@ -656,11 +695,16 @@ class SessionState:
         """Commit the prepared input and recovery baseline before external execution."""
         await self._submit_draft(session)
 
-    async def finish_turn(self, session: Session) -> None:
-        """Commit the assembled transcript and clear its recovery markers."""
+    async def finish_turn(
+        self, session: Session, *, pending_turn_owner: str | None = None
+    ) -> None:
+        """Commit the transcript and settle the wake this turn accepted."""
+        # The pair is one fact. A caller that settles without an owner (the
+        # explicit-stop save) must not leave the owner key behind.
         session.metadata.pop(_PENDING_KEY, None)
+        session.metadata.pop(_PENDING_OWNER_KEY, None)
         session.metadata.pop(_CHECKPOINT_KEY, None)
-        await self._submit_draft(session)
+        await self._submit_draft(session, pending_turn_owner=pending_turn_owner)
 
     async def restore_interruption(self, session: Session) -> None:
         """Commit a recovery decision against the version it classified."""
@@ -698,6 +742,13 @@ class SessionState:
             metadata = {**baseline.metadata, _CHECKPOINT_KEY: committed.metadata[_CHECKPOINT_KEY]}
             draft._baseline = replace(baseline, metadata=metadata, provider_state=committed.provider_state)  # pyright: ignore[reportPrivateUsage]
 
+    async def migrate_history(
+        self, name: str, collect: Callable[[list[SessionInfo]], list[HistoryImport]],
+    ) -> None:
+        await self._execute(
+            None, lambda: self._store.migrate_history(name, collect), operation_name="migrate_history",
+        )
+
     async def project_history(
         self, key: str, project: Callable[[HistoryReader], _T],
     ) -> _T:
@@ -708,12 +759,14 @@ class SessionState:
 
     async def append_history(
         self, key: str, facts: Sequence[HistoryFact], *, expected_generation: str | None,
-    ) -> None:
-        """Append to an existing session; None selects its current generation."""
+        skip_invalid: bool = False,
+    ) -> list[str]:
+        """Serialize owned facts in the worker; None selects the current generation."""
         records = list(facts)
-        await self._execute(
+        return await self._execute(
             key,
-            lambda: self._store.append_history(key, deepcopy(records), expected_generation=expected_generation),
+            lambda: self._store.append_history(key, records, expected_generation=expected_generation,
+                                               skip_invalid=skip_invalid),
             operation_name="append_history",
         )
 
@@ -815,6 +868,34 @@ class SessionState:
             lambda: self._store.has_unarchived_messages(key),
             operation_name="has_unarchived_messages",
             write=False,
+        )
+
+    async def archives_imported(self) -> bool:
+        if not self._archives_imported and await self._execute(
+            None, self._store.archives_imported, operation_name="archives_imported",
+            write=False, barrier=False,
+        ):
+            self._archives_imported = True
+        return self._archives_imported
+
+    async def archived_keys(self) -> list[str]:
+        return await self._execute(
+            None, self._store.archived_keys, operation_name="archived_keys",
+            write=False, barrier=False,
+        )
+
+    async def import_archives(self, keys: Sequence[str]) -> list[str]:
+        values = list(keys)
+        imported = await self._execute(
+            None, lambda: self._store.import_archives(values), operation_name="import_archives",
+        )
+        self._archives_imported = True
+        return imported
+
+    async def set_archived_keys(self, keys: Sequence[str]) -> list[str]:
+        values = list(dict.fromkeys(keys))
+        return await self._execute(
+            None, lambda: self._store.set_archived_keys(values), operation_name="set_archived_keys",
         )
 
     async def list_sessions(self) -> list[dict[str, Any]]:
@@ -965,7 +1046,9 @@ class SessionState:
                 source = self._load(source_key)
                 if source is None:
                     return None
-                target = fork_session(source, target_key, before_user_index)
+                target = fork_session(
+                    source, target_key, before_user_index, exclude_metadata=frozenset(self._generation_exclusions),
+                )
                 if target is None:
                     return None
                 if title:
@@ -1113,8 +1196,10 @@ class SessionState:
                     session.metadata = deepcopy(old.metadata)
                 for name in (*_RESERVED_KEYS, "webui_recovery", "_last_summary", "_stopped_at_iteration_limit"):
                     session.metadata.pop(name, None)
+                for name in self._generation_exclusions:
+                    session.metadata.pop(name, None)
                 if session.policy.persist:
-                    self._store.delete(key)
+                    self._store.delete(key, preserve_archive=True)
                 self._commit(session)
                 return session
 

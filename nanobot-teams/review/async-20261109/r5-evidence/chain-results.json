@@ -1,0 +1,62 @@
+[
+  {
+    "check": "chain: project created",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "chain: bot research registered",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "chain: bot writer registered",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "chain: user turn accepted and browser exited",
+    "ok": true,
+    "detail": "socket closed early (browser-exit scenario), marker=R5MARKER-B65AF082"
+  },
+  {
+    "check": "chain: planner model submitted research task",
+    "ok": true,
+    "detail": "count=1"
+  },
+  {
+    "check": "chain: research terminal succeeded",
+    "ok": true,
+    "detail": "run=succeeded fetched=True delivery=injected"
+  },
+  {
+    "check": "chain: report injected into planner session",
+    "ok": true,
+    "detail": "delivery=injected"
+  },
+  {
+    "check": "chain: research result via public route carries the marker",
+    "ok": true,
+    "detail": "len=17"
+  },
+  {
+    "check": "chain: planner model submitted writer task after the wake",
+    "ok": true,
+    "detail": "created=2026-11-10T02:49:29.380000+00:00"
+  },
+  {
+    "check": "chain: writer terminal",
+    "ok": true,
+    "detail": "run=succeeded"
+  },
+  {
+    "check": "chain: writer consumed the research result",
+    "ok": true,
+    "detail": "len=118 marker_in_writer=True"
+  },
+  {
+    "check": "chain: exactly one research task (no driver submissions)",
+    "ok": true,
+    "detail": "tasks=[('writer', 'succeeded'), ('research', 'succeeded')]"
+  }
+]

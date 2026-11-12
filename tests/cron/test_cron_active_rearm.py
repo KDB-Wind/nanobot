@@ -49,7 +49,7 @@ async def test_edit_during_timer_execution_preserves_turn(
         else:
             service.enable_job(other.id, False)
 
-    async def on_job(job: CronJob) -> None:
+    async def on_job(job: CronJob, _invocation) -> None:
         entered.set()
         try:
             if edit_from_callback:
@@ -102,7 +102,7 @@ async def test_due_job_edited_while_waiting_is_skipped(tmp_path: Path, action: s
     release = asyncio.Event()
     calls: list[str] = []
 
-    async def on_job(job: CronJob) -> None:
+    async def on_job(job: CronJob, _invocation) -> None:
         calls.append(job.name)
         if job.name == "first":
             entered.set()

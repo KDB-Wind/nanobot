@@ -44,6 +44,7 @@ from nanobot.config.schema import Config
 from nanobot.gateway.runtime import GatewayHealthIdentity, GatewayInstance, GatewayRuntime
 from nanobot.installation_lock import installation_access
 from nanobot.security.network import is_loopback_host
+from nanobot.session.inbox_wake import InboxWakePump
 from nanobot.session.keys import (
     HEARTBEAT_SESSION_KEY,
     UNIFIED_SESSION_KEY,
@@ -55,12 +56,24 @@ from nanobot.utils.evaluator import evaluate_response, resolve_evaluator_prompt
 from nanobot.utils.helpers import sync_workspace_templates
 from nanobot.utils.token_encoding import warmup_token_encoding
 from nanobot.webui.build import BuildMode
+from nanobot.webui.context_source_hook import create_context_source_hook
 from nanobot.webui.dev import WebUIDevError, WebUIDevServer
-from nanobot.webui.sidebar_state import read_webui_sidebar_state
+from nanobot.webui.sidebar_state import ensure_webui_session_archives
+
+# Set by the inbox sidecar assembly; read once by the startup recovery scan.
+_PENDING_EXTERNAL_INBOX: dict[str, "ExternalInbox"] = {}
+_PENDING_TEAMS_PROXY: dict[str, "TeamsProxy"] = {}
+
+
+def register_pending_teams_proxy(proxy: "TeamsProxy") -> None:
+    """ChannelManager hands its proxy to the gateway assembly through here."""
+    _PENDING_TEAMS_PROXY["proxy"] = proxy
 
 if TYPE_CHECKING:
+    from nanobot.session.external_inbox import ExternalInbox
     from nanobot.update_profiles import ProfileReceipt
     from nanobot.update_restart import GatewayStartup
+    from nanobot.webui.teams_proxy import TeamsProxy
 
 __all__ = ["_run_gateway"]
 
@@ -142,6 +155,68 @@ def _http_endpoint_responding(url: str, *, timeout_s: float = 0.25) -> bool:
         return True
     except (OSError, urllib.error.URLError, TimeoutError, ValueError):
         return False
+
+
+def mint_teams_meta(inbox: Any, principal_id: str) -> dict[str, str]:
+    """Host-minted routing meta for the async Teams MCP tool calls.
+
+    An incapable host cannot honor the background promise a minted capability
+    implies, so it returns no meta and tools operate workbench_only. Report
+    continuation turns carry their original workflow root; only genuine new
+    turns derive a root from their own turn.
+    """
+    from nanobot.agent.tools.context import (
+        current_peer_conversation,
+        current_request_context,
+    )
+
+    peer = current_peer_conversation()
+    if peer is not None:
+        # A peer-capable run: the capability targets the durable conversation
+        # session (the ephemeral run session could never receive a wake).
+        capability = inbox.mint_capability(
+            session_key=peer.session_key,
+            session_generation=peer.session_generation,
+            workflow_id=peer.workflow_id,
+            operation_key="*",
+            bot_id="*",
+            instance_id="*",
+            principal_id=principal_id,
+        )
+        return {
+            "reply_capability": capability.token,
+            "reply_workflow": capability.workflow_id,
+            "coordinator_principal": principal_id,
+        }
+    ctx = current_request_context()
+    if ctx is None or not ctx.persist_session or not ctx.can_receive_background_results:
+        return {}
+    if ctx.session_key is None or ctx.session_generation is None:
+        return {}
+    workflow_id = ctx.source_workflow or f"wf_{ctx.turn_id or ctx.session_generation[:8]}"
+    capability = inbox.mint_capability(
+        session_key=ctx.session_key,
+        session_generation=ctx.session_generation,
+        workflow_id=workflow_id,
+        operation_key="*",
+        bot_id="*",
+        instance_id="*",
+        principal_id=principal_id,
+    )
+    return {
+        "reply_capability": capability.token,
+        "reply_workflow": capability.workflow_id,
+        "coordinator_principal": principal_id,
+    }
+
+
+async def _session_alive(session_manager: Any, session_key: str) -> bool:
+    """Whether the origin session still exists for an inbox wake turn."""
+    try:
+        session = await session_manager.state.read(session_key)
+    except Exception:
+        return False
+    return session is not None
 
 
 async def _watch_webui_dev_server(
@@ -481,9 +556,13 @@ def _run_claimed_gateway(
     from nanobot.channels.manager import ChannelManager
     from nanobot.config.watcher import watch_config_file
     from nanobot.cron.bound_runner import run_bound_cron_job
+    from nanobot.cron.teams_jobs import run_teams_cron_job
+
+    def _teams_proxy():
+        return _PENDING_TEAMS_PROXY.get("proxy")
     from nanobot.cron.service import CronJobSkippedError, CronService
     from nanobot.cron.session_turns import is_bound_cron_job
-    from nanobot.cron.types import CronJob, CronRunResult
+    from nanobot.cron.types import CronInvocation, CronJob, CronRunResult
     from nanobot.llm_usage import record_llm_call
     from nanobot.llm_usage.context import llm_usage_source
     from nanobot.providers.factory import (
@@ -576,6 +655,48 @@ def _run_claimed_gateway(
     cron = CronService(cron_store_path, admission=bus.admission)
     trigger_store = LocalTriggerStore(config.workspace_path)
 
+    runs_cfg = config.api.runs
+    inbox_sidecar_coro = None
+    if runs_cfg.enabled and runs_cfg.inbox_enabled:
+        from nanobot.api.agent_inbox import register_inbox_routes
+        from nanobot.session.external_inbox import ExternalInbox
+
+        external_inbox = ExternalInbox(session_manager.state)
+        _PENDING_EXTERNAL_INBOX["inbox"] = external_inbox
+
+        def _teams_meta_provider(server_name: str):
+            return lambda: mint_teams_meta(
+                external_inbox, runs_cfg.principal_id
+            )
+
+        from nanobot.agent.tools.mcp import set_teams_async_meta_hook
+
+        set_teams_async_meta_hook(_teams_meta_provider)
+
+        async def _run_inbox_sidecar() -> None:
+            from aiohttp import web
+
+            app = web.Application()
+            register_inbox_routes(app, external_inbox, runs_cfg)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(
+                runner, config.api.host, config.api.port, reuse_address=False
+            )
+            try:
+                await site.start()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"The planner inbox sidecar cannot bind "
+                    f"{config.api.host}:{config.api.port}: {exc}"
+                ) from exc
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await runner.cleanup()
+
+        inbox_sidecar_coro = _run_inbox_sidecar
+
     webui_route_policy = WebuiTurnRoutePolicy(session_manager)
     turn_delivery_factory = TurnDeliveryFactory(
         bus,
@@ -593,6 +714,8 @@ def _run_claimed_gateway(
         unified_session=config.agents.defaults.unified_session,
     )
 
+    from nanobot.goal.assembly import install_goal
+
     agent = AgentLoop.from_config(
         config, bus,
         provider=provider_snapshot.provider,
@@ -606,10 +729,18 @@ def _run_claimed_gateway(
         provider_signature=provider_snapshot.signature,
         local_trigger_store=trigger_store,
         hooks=[_MCPReadinessHook(mcp_provider)],
-        hook_factories=[create_file_edit_activity_hook],
+        hook_factories=[create_file_edit_activity_hook, create_context_source_hook],
         tool_registry=tools,
         recovery_admission=recovery,
+        builtin_assembly=install_goal,
     )
+
+    # The loop's user-turn hook reads this attribute to revoke stale
+    # workflow grants; absent (plain getattr) when the feature is off.
+    pending_inbox = _PENDING_EXTERNAL_INBOX.get("inbox")
+    if pending_inbox is not None:
+        agent.external_inbox = pending_inbox
+
     def _schedule_webui_background(awaitable: Awaitable[None]) -> None:
         agent.schedule_background(cast(Coroutine[Any, Any, None], awaitable))
 
@@ -637,7 +768,7 @@ def _run_claimed_gateway(
     if isinstance(message_tool, MessageTool):
         message_tool.set_send_callback(deliver_to_channel)
 
-    async def on_cron_job(job: CronJob) -> str | CronRunResult | None:
+    async def on_cron_job(job: CronJob, invocation: CronInvocation) -> str | CronRunResult | None:
         async def _silent(*_args: Any, **_kwargs: Any) -> None:
             pass
 
@@ -773,6 +904,9 @@ def _run_claimed_gateway(
                 logger.info("Heartbeat: silenced by post-run evaluation")
             return response
 
+        if job.payload.kind == "teams_task":
+            return await run_teams_cron_job(job, teams_proxy=_teams_proxy(), invocation=invocation)
+
         if is_bound_cron_job(job):
             return await run_bound_cron_job(job, agent=agent, cron=cron)
 
@@ -829,7 +963,7 @@ def _run_claimed_gateway(
     )
 
     async def _pick_heartbeat_target() -> tuple[str, str]:
-        sidebar_state = await asyncio.to_thread(read_webui_sidebar_state)
+        archived_keys = await ensure_webui_session_archives(session_manager.state)
         unified_metadata = None
         if config.agents.defaults.unified_session:
             record = await session_manager.state.read_metadata(UNIFIED_SESSION_KEY)
@@ -838,7 +972,7 @@ def _run_claimed_gateway(
         return _pick_heartbeat_target_from_sessions(
             enabled_channels=channels.enabled_channels,
             sessions=await session_manager.state.list_sessions(),
-            archived_keys=sidebar_state.get("archived_keys", []),
+            archived_keys=archived_keys,
             unified_session_metadata=unified_metadata,
         )
 
@@ -1008,6 +1142,15 @@ def _run_claimed_gateway(
             # accepting new input.  That makes a new user message reliably
             # supersede an old recoverable turn instead of racing its queue.
             await recovery.scan()
+            pending_inbox = _PENDING_EXTERNAL_INBOX.get("inbox")
+            if pending_inbox is not None:
+                for delivery_id in pending_inbox.pending_deliveries():
+                    try:
+                        await pending_inbox.apply_pending(delivery_id)
+                    except Exception:
+                        logger.warning(
+                            "external delivery {} failed to apply on recovery", delivery_id
+                        )
             if update_startup is not None:
                 # Recovery may reconstruct queued work, but no consumer or
                 # external listener has started. Keep that work parked too.
@@ -1043,6 +1186,22 @@ def _run_claimed_gateway(
                 ),
                 asyncio.create_task(_run_agent(), name="nanobot-agent-loop"),
                 asyncio.create_task(channels.start_all(), name="nanobot-channels"),
+                *(
+                    []
+                    if pending_inbox is None
+                    else [
+                        asyncio.create_task(
+                            InboxWakePump(
+                                pending_inbox,
+                                bus.publish_inbound,
+                                lambda session_key: _session_alive(
+                                    session_manager, session_key
+                                ),
+                            ).run_forever(),
+                            name="nanobot-inbox-wake",
+                        ),
+                    ]
+                ),
                 asyncio.create_task(
                     run_local_trigger_queue(
                         store=trigger_store,
@@ -1078,6 +1237,26 @@ def _run_claimed_gateway(
                 tasks.append(asyncio.create_task(
                     watch_gateway_stop(update_profile, agent.maintenance, shutdown_event, startup_gate),
                     name="nanobot-update-stop",
+                ))
+            if inbox_sidecar_coro is not None:
+                tasks.append(asyncio.create_task(
+                    inbox_sidecar_coro(),
+                    name="nanobot-teams-inbox-sidecar",
+                ))
+            if _PENDING_TEAMS_PROXY.get("proxy") is not None:
+                from nanobot.webui.teams_events import start_teams_event_relay
+
+                async def _run_teams_relay() -> None:
+                    await channels.start_all()
+                    channel = channels.get_channel("websocket")
+                    if channel is None:
+                        return
+                    await start_teams_event_relay(
+                        _PENDING_TEAMS_PROXY["proxy"], channel
+                    )
+
+                tasks.append(asyncio.create_task(
+                    _run_teams_relay(), name="nanobot-teams-event-relay"
                 ))
             if health_server_enabled:
                 tasks.append(asyncio.create_task(

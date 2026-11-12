@@ -20,7 +20,7 @@ from nanobot.agent.tools.web_config import (
 )
 from nanobot.agent.tools.web_config import WebToolsConfig
 from nanobot.config.home import get_default_workspace
-from nanobot.config.network import NetworkConfig
+from nanobot.config.network import NetworkConfig, migrate_legacy_proxy_config
 from nanobot.config.provider_api_migration import migrate_legacy_provider_api
 from nanobot.config.timezone import detect_system_timezone
 from nanobot.config_base import Base
@@ -380,6 +380,37 @@ class HeartbeatConfig(Base):
     interval_s: int = 30 * 60
 
 
+class ApiRunsConfig(Base):
+    """Public agent-run protocol (v1) configuration. Disabled by default.
+
+    ``api_key`` is a dedicated secret: the plain ``api.api_key`` never grants
+    run-protocol or inbox access. ``principal_id`` is the fixed coordinator
+    identity; rotating the key does not change it.
+    """
+
+    enabled: bool = False
+    api_key: str = Field(default="", repr=False)
+    principal_id: str = "teams-coordinator"
+    execution_enabled: bool = False
+    inbox_enabled: bool = False
+    exclusive_execution: bool = False
+    max_concurrent: int = 1
+
+    @model_validator(mode="after")
+    def enabled_requires_dedicated_key(self) -> "ApiRunsConfig":
+        if not self.enabled:
+            return self
+        if not self.api_key.strip():
+            raise ValueError("api.runs.enabled requires a dedicated api.runs.api_key")
+        if not self.principal_id.strip():
+            raise ValueError("api.runs.principal_id must be a non-empty identity")
+        if self.exclusive_execution and not self.execution_enabled:
+            raise ValueError("api.runs.exclusive_execution requires execution_enabled")
+        if self.max_concurrent < 1:
+            raise ValueError("api.runs.max_concurrent must be at least 1")
+        return self
+
+
 class ApiConfig(Base):
     """OpenAI-compatible API server configuration."""
 
@@ -387,6 +418,7 @@ class ApiConfig(Base):
     port: int = 8900
     timeout: float = 120.0  # Per-request timeout in seconds.
     api_key: str = Field(default="", repr=False)
+    runs: ApiRunsConfig = Field(default_factory=ApiRunsConfig)
 
     @model_validator(mode="after")
     def wildcard_host_requires_auth(self) -> "ApiConfig":
@@ -398,6 +430,14 @@ class ApiConfig(Base):
             "host is 0.0.0.0 (all interfaces) but api_key is not set "
             "- set api.api_key to prevent unauthenticated access"
         )
+
+
+class TeamsWorkbenchConfig(Base):
+    """Async teams workbench: gateway proxy to the resident coordinator."""
+
+    coordinator_url: str = ""  # Empty keeps the workbench hidden.
+    coordinator_token_env: str = "TEAMS_COORDINATOR_PLANNER_TOKEN"
+    bot_homes_root: str = ""
 
 
 class GatewayConfig(Base):
@@ -422,6 +462,7 @@ class MCPServerConfig(Base):
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     use_proxy: bool = False
     tool_timeout: int = 30  # seconds before a tool call is cancelled
+    teams_async: bool = False  # Trusted async-Teams meta channel (host-minted capability)
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all capabilities (tools, resources, prompts); any restriction = only listed tools, no resources/prompts
 
 
@@ -507,6 +548,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
+    teams: TeamsWorkbenchConfig = Field(default_factory=TeamsWorkbenchConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
@@ -514,6 +556,11 @@ class Config(BaseSettings):
         validation_alias=AliasChoices("modelPresets", "model_presets"),
         serialization_alias="modelPresets",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_proxy_config(cls, value: Any) -> Any:
+        return migrate_legacy_proxy_config(value)
 
     @classmethod
     def settings_customise_sources(

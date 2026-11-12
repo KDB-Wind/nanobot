@@ -1,0 +1,37 @@
+[
+  {
+    "check": "cancel: project created",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "cancel: bot research registered",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "cancel: bot writer registered",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "cancel: task admitted",
+    "ok": true,
+    "detail": "201"
+  },
+  {
+    "check": "cancel: run observed running",
+    "ok": true,
+    "detail": "run=running"
+  },
+  {
+    "check": "cancel: cancel accepted",
+    "ok": true,
+    "detail": "202"
+  },
+  {
+    "check": "cancel: terminal with honest stop state",
+    "ok": true,
+    "detail": "run=cancelled cancel=confirmed stop_confirmed=True"
+  }
+]

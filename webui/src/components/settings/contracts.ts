@@ -13,6 +13,7 @@ export type SettingsSectionKey =
   | "voice"
   | "browser"
   | "channels"
+  | "teams"
   | "apps"
   | "automations"
   | "memory"
@@ -40,3 +41,4 @@ export type ApplySettingsPayload = (
 ) => void;
 
 export type MaybeRestartHostEngine = (payload: RestartAwarePayload) => Promise<void>;
+export type SettingsFocusTarget = "sandbox" | "sandbox-launcher";

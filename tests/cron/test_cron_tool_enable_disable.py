@@ -18,7 +18,7 @@ def _registry(service: CronService) -> ToolRegistry:
 
 async def test_pause_resume_preserves_job_and_history(tmp_path: Path) -> None:
     store_path = tmp_path / "jobs.json"
-    async def complete(_job: CronJob) -> str:
+    async def complete(_job: CronJob, _invocation) -> str:
         return "Report completed"
 
     service = CronService(store_path, on_job=complete)

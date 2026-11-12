@@ -52,6 +52,7 @@ class GatewayServices:
     cron_pending_job_ids: Callable[[str], set[str]] | None
     local_trigger_pending_ids: Callable[[str], set[str]] | None
     unified_session: bool = False
+    teams_proxy: Any | None = None
 
 
 def build_gateway_services(
@@ -82,6 +83,7 @@ def build_gateway_services(
     recovery_action: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     subagent_manager: SubagentManager | None = None,
     discard_session: Callable[[str], Awaitable[None]] | None = None,
+    teams_proxy: Any | None = None,
     logger: Any = default_logger,
 ) -> GatewayServices:
     settings = WebUISettingsServices.create(
@@ -151,6 +153,7 @@ def build_gateway_services(
         recovery_action=recovery_action,
         subagent_manager=subagent_manager,
         discard_session=discard_session,
+        teams_proxy=teams_proxy,
         log=logger,
     )
     endpoint = WebUIGatewayEndpoint(config=config, http=http, tokens=tokens)

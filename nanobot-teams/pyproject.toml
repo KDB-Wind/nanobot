@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanobot-teams"
+version = "0.6.0"
+description = "Stdio MCP server that lets one nanobot instance delegate a task to another."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.26,<2",
+    "httpx>=0.28,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "ruff==0.17.4", "aiohttp>=3.9,<4"]
+coordinator = ["aiohttp>=3.9,<4"]
+
+[project.scripts]
+nanobot-teams = "nanobot_teams.__main__:main"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src"]
+testpaths = ["tests"]
