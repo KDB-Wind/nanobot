@@ -46,15 +46,15 @@ queryable from the coordinator and visible in the workbench.
   column marking peer tasks with sender -> recipient and hop, localized
   in every supported locale.
 
+### Fixed
+
+- Manual cron runs now carry independent invocation identities. Scheduled retries keep the same slot identity, so a manual run cannot consume the next scheduled task.
+- Inbox-enabled `serve` starts the agent consumer and shares one `ExternalInbox` across the agent, HTTP routes, and wake pump. Replies now start a durable continuation and clear the wake obligation.
+
 ### Verified
 
-- The four-bot probe (`acceptance/peer_comms_probe.py`) runs the real
-  chain green with real models: planner -> research -> (send_to_bot) ->
-  writer -> reply delivered to research's inbox (validate 200, deliver
-  202, receipt injected and the conversation woken) -> research's summary
-  carries the writer's marker. Unauthorized edges, the fifth hop, and
-  duplicate keys answer with typed rejections; killing the coordinator
-  mid-flight converges to exactly one completed task after restart.
+- The corrected four-bot probe verifies a real continuation after the initial research run finishes. The reply contains a random value available only in the writer's workspace. Evidence joins the task, remote run, receipt, accepting turn, and persisted continuation. The crash scenario kills the coordinator after the real inbox commits but before its HTTP acknowledgement. Recovery preserves one task, remote run, receipt, history injection, and continuation.
+- Browser acceptance derives its seven-check total from named results in `summary.json`. The stop check operates on the submitted task's own row.
 - Real usage evidence: research recorded 4 requests with 25,344
   cache-read tokens (94.0% hit rate, 100% coverage) during the live run.
 

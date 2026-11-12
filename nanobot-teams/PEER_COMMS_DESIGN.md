@@ -20,6 +20,8 @@ P1 交付物。契约来源：[PEER_COMMS_GOAL.md](PEER_COMMS_GOAL.md) §4 领�
 
 ### ADR-001：serve 增加可选 runs inbox
 
+2026-11-11 审核补正。inbox-enabled `serve` 必须同时运行 `InboxWakePump.run_forever()` 和 `AgentLoop.run()`。HTTP 路由、pump 和 AgentLoop 共享同一个 `ExternalInbox`。只有发布者不能让空闲会话继续，AgentLoop 未绑定 inbox 也不能消费唤醒义务。关闭顺序是停 pump、关闭 RunService、取消并等待 consumer、关闭 loop 和存储。验收要求原始 run 先结束，随后回执被唯一注入、wake_due 清零，并留下独立续跑的接受 turn id 和持久化回复。
+
 - **变更面**：`serve` 装配处（`cli/commands.py` → `api/server.py`），当 `api.runs.enabled and api.runs.inbox_enabled` 时，在 serve 的同一 aiohttp app 上：构造 `ExternalInbox(session_manager.state)`、`register_inbox_routes(app, inbox, runs_cfg)`（与 runs 路由同 app 同端口，无 sidecar 端口冲突）、`set_teams_async_meta_hook`（capability 铸造，`gateway_runtime.py:153-182` 同款）、接入 `InboxWakePump`（`session/inbox_wake.py`）到 loop 生命周期。
 - **默认关闭**：`inbox_enabled` 现默认 False（`config/schema.py:395`），不变。
 - **向后兼容**：不配置 inbox 的部署装配路径与今天逐字节等价；capabilities 语义从"照抄配置"变为"如实宣告"。
