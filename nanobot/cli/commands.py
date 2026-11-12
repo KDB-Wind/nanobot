@@ -445,13 +445,13 @@ def serve(
     )
 
     inbox_pump: Any | None = None
+    inbox_tasks: tuple[asyncio.Task[None], ...] = ()
     if api_cfg.runs.enabled and api_cfg.runs.inbox_enabled and runs_service is not None:
         from nanobot.cli.serve_inbox import mount_serve_inbox
 
         inbox_pump = mount_serve_inbox(
             api_app,
-            session_manager=session_manager,
-            bus=bus,
+            agent_loop=agent_loop,
             runs_config=api_cfg.runs,
         )
         console.print(
@@ -460,6 +460,7 @@ def serve(
         )
 
     async def on_startup(_app: Any) -> None:
+        nonlocal inbox_tasks
         await mcp_provider.connect()
         # Record per-bot usage exactly like the gateway does, so worker homes
         # carry their own llm_usage.sqlite3 for the coordinator's reader.
@@ -477,14 +478,15 @@ def serve(
                     len(interrupted),
                 )
         if inbox_pump is not None:
-            _app["serve_inbox_wake"] = asyncio.create_task(
-                inbox_pump.run_forever(), name="nanobot-inbox-wake"
+            inbox_tasks = (
+                asyncio.create_task(inbox_pump.run_forever(), name="nanobot-inbox-wake"),
+                asyncio.create_task(agent_loop.run(), name="nanobot-inbox-agent"),
             )
 
     async def on_cleanup(_app: Any) -> None:
         try:
-            wake_task = _app.get("serve_inbox_wake")
-            if wake_task is not None:
+            if inbox_tasks:
+                wake_task = inbox_tasks[0]
                 wake_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await wake_task
@@ -494,11 +496,18 @@ def serve(
                     await runs_service.aclose()
             finally:
                 try:
-                    await agent_loop.aclose()
+                    if inbox_tasks:
+                        agent_task = inbox_tasks[1]
+                        agent_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await agent_task
                 finally:
-                    if runs_store is not None:
-                        runs_store.close()
-                    await mcp_provider.aclose()
+                    try:
+                        await agent_loop.aclose()
+                    finally:
+                        if runs_store is not None:
+                            runs_store.close()
+                        await mcp_provider.aclose()
 
     api_app.on_startup.append(on_startup)
     api_app.on_cleanup.append(on_cleanup)

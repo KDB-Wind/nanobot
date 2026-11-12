@@ -39,6 +39,9 @@ def inbox_runs_config() -> ApiRunsConfig:
 async def inbox_app(tmp_path):
     if not HAS_AIOHTTP:  # pragma: no cover
         pytest.skip("aiohttp not installed")
+    from unittest.mock import Mock
+
+    from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.cli.serve_inbox import mount_serve_inbox
     from nanobot.runs.service import RunService
@@ -52,16 +55,16 @@ async def inbox_app(tmp_path):
     service = RunService(store, FakeExecutor())
     await service.start()
     session_manager = SessionManager(tmp_path / "home")
+    agent_loop = Mock(spec=AgentLoop, sessions=session_manager, bus=MessageBus())
     app = create_app(
-        object(),
+        agent_loop,
         api_key="",
         runs_service=service,
         runs_config=inbox_runs_config(),
     )
     pump = mount_serve_inbox(
         app,
-        session_manager=session_manager,
-        bus=MessageBus(),
+        agent_loop=agent_loop,
         runs_config=inbox_runs_config(),
     )
     assert isinstance(pump, InboxWakePump)
@@ -214,8 +217,11 @@ async def test_serve_inbox_continues_an_idle_peer_session(tmp_path, monkeypatch)
         async with asyncio.timeout(4):
             while True:
                 saved = await state.read(session.key)
-                replies = [m for m in saved.messages if m.get("role") == "assistant"]
-                if replies:
+                replies = [
+                    m for m in saved.messages
+                    if m.get("role") == "assistant" and not m.get("external_delivery_id")
+                ]
+                if replies and "pending_user_turn_owner" not in saved.metadata:
                     break
                 await asyncio.sleep(0.01)
         assert [m["content"] for m in replies] == ["WAKE_ACK result-token"]
@@ -224,3 +230,7 @@ async def test_serve_inbox_continues_an_idle_peer_session(tmp_path, monkeypatch)
         assert "pending_user_turn_owner" not in saved.metadata
     finally:
         await client.close()
+    assert not any(
+        task.get_name() in {"nanobot-inbox-wake", "nanobot-inbox-agent"}
+        for task in asyncio.all_tasks()
+    )

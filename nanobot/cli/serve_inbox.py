@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from aiohttp import web
 
-from nanobot.bus.queue import MessageBus
+from nanobot.agent.loop import AgentLoop
 from nanobot.config.schema import ApiRunsConfig
 from nanobot.session.inbox_wake import InboxWakePump
 from nanobot.session.manager import SessionManager
@@ -32,8 +32,7 @@ async def _session_alive(session_manager: SessionManager, session_key: str) -> b
 def mount_serve_inbox(
     app: web.Application,
     *,
-    session_manager: SessionManager,
-    bus: MessageBus,
+    agent_loop: AgentLoop,
     runs_config: ApiRunsConfig,
 ) -> InboxWakePump:
     """Mount the agent-inbox routes and return the wake pump to run."""
@@ -42,7 +41,9 @@ def mount_serve_inbox(
     from nanobot.cli.gateway_runtime import mint_teams_meta
     from nanobot.session.external_inbox import ExternalInbox
 
+    session_manager = agent_loop.sessions
     external_inbox = ExternalInbox(session_manager.state)
+    agent_loop.external_inbox = external_inbox
     register_inbox_routes(app, external_inbox, runs_config)
 
     def _teams_meta_provider(_server_name: str):
@@ -52,6 +53,6 @@ def mount_serve_inbox(
 
     return InboxWakePump(
         external_inbox,
-        bus.publish_inbound,
+        agent_loop.bus.publish_inbound,
         lambda session_key: _session_alive(session_manager, session_key),
     )
