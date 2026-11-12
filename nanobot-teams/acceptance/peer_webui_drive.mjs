@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { execSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 
 const [url, shotsDir, packageJson, coordPort, wsToken, stopBot] = process.argv.slice(2);
 const require = createRequire(packageJson);
@@ -43,11 +43,12 @@ async function openWorkbench() {
   }
 }
 
-let failures = 0;
+const checks = [];
 const check = (name, ok) => {
+  checks.push({ name, passed: Boolean(ok) });
   console.log(`${ok ? "PASS" : "FAIL"} ${name}`);
-  if (!ok) failures += 1;
 };
+let error = null;
 
 try {
   await page.addInitScript(() => {
@@ -94,8 +95,8 @@ try {
   await page.setViewportSize({ width: 420, height: 820 });
   await page.waitForTimeout(500);
   await page.screenshot({ path: shotsDir + "/03-narrow.png", fullPage: true });
-  check("narrow viewport stays usable",
-    (await page.locator("[data-teams-usage]").count()) === 1);
+  check("narrow viewport displays the usage panel",
+    await page.locator("[data-teams-usage]").isVisible());
 
   if (stopBot) {
     // The lab killed this worker, so a task addressed to it never leaves the
@@ -110,10 +111,12 @@ try {
     await input.locator("xpath=preceding-sibling::select[1]").selectOption(stopBot);
     await input.fill("Summarise the archive in twenty paragraphs.");
     await input.locator("xpath=following-sibling::button[1]").click();
-    const stop = page.locator("[data-stop-workflow]").first();
-    await stop.waitFor({ timeout: 60_000 });
+    await page.waitForFunction(() =>
+      /task_[0-9a-f-]+/.test(document.querySelector("[data-submit-state]")?.textContent || ""));
     const submitted = (await page.locator("[data-submit-state]").textContent()) || "";
     const taskId = (submitted.match(/task_[0-9a-f-]+/) || [null])[0];
+    const stop = page.locator(`tr[data-task-id="${taskId}"] [data-stop-workflow]`);
+    await stop.waitFor({ timeout: 60_000 });
     await page.screenshot({ path: shotsDir + "/05-stop-before.png", fullPage: true });
     await stop.click();
     const stopped = await page
@@ -159,9 +162,23 @@ try {
     await page.screenshot({ path: shotsDir + "/04-offline.png", fullPage: true });
     check("offline state surfaces an error without crashing", sawError);
   }
+} catch (caught) {
+  error = String(caught);
+  console.error(error);
 } finally {
   await browser.close();
 }
 
-console.log(failures === 0 ? "PASS peer_webui_drive" : `FAIL ${failures}`);
-process.exit(failures === 0 ? 0 : 1);
+const passed = checks.filter((result) => result.passed).length;
+const summary = {
+  suite: "peer_webui_drive",
+  status: error === null && passed === checks.length ? "pass" : "fail",
+  total: checks.length,
+  passed,
+  failed: checks.length - passed,
+  checks,
+  error,
+};
+writeFileSync(shotsDir + "/summary.json", JSON.stringify(summary, null, 2) + "\n");
+console.log("SUMMARY " + JSON.stringify(summary));
+process.exit(summary.status === "pass" ? 0 : 1);

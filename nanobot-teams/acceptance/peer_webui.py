@@ -3,15 +3,18 @@
 Boots the four-bot topology with the planner gateway serving the WebUI
 (token-free websocket for the lab), seeds one writer run and one research
 run so usage and a peer task exist, then drives a real browser and saves
-screenshots to review/peer-comms/ui/. Exit 0 only when the drive passes.
+screenshots and a check summary outside the source tree. Exit 0 only when
+the drive passes.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -22,11 +25,19 @@ sys.path.insert(0, str(ROOT))
 import peer_comms_probe as probe  # noqa: E402
 
 WEBUI = probe.WT / "webui"
-SHOTS = probe.EVIDENCE / "ui"
 
 
 def main() -> int:
-    SHOTS.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output-dir", type=Path,
+        default=os.environ.get("PEER_WEBUI_OUTPUT_DIR"),
+        help="Directory for screenshots and summary.json. Defaults to a temporary directory.",
+    )
+    args = parser.parse_args()
+    shots = args.output_dir or Path(tempfile.mkdtemp(prefix="nanobot-peer-webui-"))
+    shots.mkdir(parents=True, exist_ok=True)
+    print(f"Browser evidence: {shots.resolve()}", flush=True)
     lab = probe.PeerLab("p7ui")
     lab.ws_requires_token = False  # browser labs connect without pairing
     rc = 1
@@ -74,7 +85,7 @@ def main() -> int:
             [
                 "node", str(ROOT / "peer_webui_drive.mjs"),
                 f"http://127.0.0.1:{lab.planner_ws_port}",
-                str(SHOTS),
+                str(shots.resolve()),
                 str(WEBUI / "package.json"),
                 str(lab.coord_port),
                 lab.ws_token,

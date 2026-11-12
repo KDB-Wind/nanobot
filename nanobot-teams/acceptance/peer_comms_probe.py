@@ -34,11 +34,20 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+
+from peer_evidence import (
+    ContinuationWatcher,
+    ReplyAckGate,
+    continuation_evidence,
+    one_database,
+    read_rows,
+)
 
 WT = Path(__file__).resolve().parents[2]
 TEAMS = WT / "nanobot-teams"
@@ -49,7 +58,10 @@ else:
     PY_TEAMS = TEAMS / ".venv/bin/python"
     NANOBOT = WT / ".venv-nanobot/bin/nanobot"
 
-EVIDENCE = TEAMS / "review/peer-comms"
+PY_TEAMS = Path(os.environ.get("PEER_TEAMS_PYTHON", str(PY_TEAMS)))
+NANOBOT = Path(os.environ.get("PEER_NANOBOT", str(NANOBOT)))
+EVIDENCE = Path(os.environ.get("PEER_EVIDENCE_DIR",
+                               str(Path(tempfile.gettempdir()) / "nanobot-peer-evidence")))
 SSE_HEARTBEAT = 15.0
 
 
@@ -139,8 +151,7 @@ class PeerLab:
 
     def __init__(self, name: str) -> None:
         self.name = name
-        self.tmp = TEAMS / "acceptance/.peer-comms" / f"{name}-{secrets.token_hex(4)}"
-        self.tmp.mkdir(parents=True, exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix=f"nanobot-{name}-"))
         self.coord_port = free_port()
         self.planner_ws_port = free_port()
         self.planner_api_port = free_port()
@@ -171,6 +182,11 @@ class PeerLab:
         marker = secrets.token_hex(4).upper()
         self.marker = f"PEERMARKER-{marker}"
         self.env = dict(os.environ)
+        self.env["PYTHONPATH"] = os.pathsep.join(
+            [str(WT), str(TEAMS / "src"), self.env.get("PYTHONPATH", "")]
+        )
+        self.reply_gate = ReplyAckGate(f"http://127.0.0.1:{self.worker_ports['research']}")
+        self.continuation_watchers: list[ContinuationWatcher] = []
         self.env.update({
             "PEER_COORD_ADMIN": self.admin_token,
             "PEER_COORD_PLANNER": self.planner_token,
@@ -296,7 +312,7 @@ class PeerLab:
     # -- processes ---------------------------------------------------------
 
     def spawn(self, name: str, argv: list[str]) -> subprocess.Popen:
-        handle = open(self.tmp / f"{name}.log", "w", encoding="utf-8")
+        handle = open(self.tmp / f"{name}.log", "a", encoding="utf-8")
         proc = subprocess.Popen(argv, cwd=str(self.tmp), env=self.env,
                                 stdout=handle, stderr=subprocess.STDOUT)
         self.procs.append(proc)
@@ -369,6 +385,9 @@ class PeerLab:
         return False
 
     def teardown(self) -> None:
+        for watcher in self.continuation_watchers:
+            watcher.close()
+        self.reply_gate.close()
         for proc in self.procs:
             proc.kill()
         for proc, handle in self.logs:
@@ -412,7 +431,8 @@ class PeerLab:
                       "endpoint": f"http://127.0.0.1:{port}",
                       "secret_env": f"PEER_BOT_{bot.upper()}_KEY",
                       "coord_secret_env": f"PEER_COORD_TOKEN_{bot.upper()}",
-                      "inbox_url": f"http://127.0.0.1:{port}",
+                      "inbox_url": (self.reply_gate.url if bot == "research"
+                                    else f"http://127.0.0.1:{port}"),
                       "inbox_principal_id": "teams-coordinator",
                       "inbox_key_env": f"PEER_BOT_{bot.upper()}_KEY"},
             )
@@ -536,103 +556,139 @@ class PeerLab:
         return ev
 
     def scenario_live_chain(self) -> dict:
-        """The real chain: planner -> research -> (send_to_bot) -> writer ->
-        reply returns to research's inbox and wakes it -> research's run
-        summarizes (E2E-01..04/10)."""
-        ev: dict = {"scenario": "live_chain", "steps": []}
+        return self._reply_continuation(crash=False)
+
+    def _stop_coordinator(self) -> None:
+        assert self.coord_proc is not None
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.coord_proc.pid)],
+                           capture_output=True, check=False)
+        else:
+            self.coord_proc.kill()
+        self.coord_proc.wait(timeout=15)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", self.coord_port), timeout=0.2):
+                    time.sleep(0.1)
+            except OSError:
+                return
+        raise RuntimeError("killed coordinator still has a listening process")
+
+    def _reply_continuation(self, *, crash: bool) -> dict:
+        ev: dict = {"scenario": "crash_restart" if crash else "live_chain", "steps": []}
+        workflow = str(uuid.uuid4())
+        secret = "WRITER-" + secrets.token_hex(16)
+        filename = f"reply-{workflow}.txt"
+        (self.tmp / "writer" / "workspace" / filename).write_text(secret, encoding="utf-8")
+        (self.tmp / "research" / "workspace" / "AGENTS.md").write_text(
+            "For an automated async task report, answer exactly WAKE_ACK followed by "
+            "the writer's secret from that report. Do not call tools for such a report. "
+            "For an initial delegation request, call send_to_bot once, then answer WAITING. "
+            "Never poll get_async_task or read task results.\n", encoding="utf-8",
+        )
+        self.reply_gate.arm(workflow, lose_ack=crash)
         status, payload = http_json(
             "POST", self.coord_url("/v1/teams/tasks"), token=self.planner_token,
-            body={
-                "project": "peer",
-                "bot": "research",
-                "input": (
-                    "You must delegate exactly one task. Call send_to_bot with "
-                    f"recipient 'writer' and the input: 'Reply with exactly {self.marker} "
-                    "and nothing else.' Then poll get_async_task for that task "
-                    "until it reaches a terminal state and you can read its "
-                    "result. Finish by repeating the writer's exact reply."
-                ),
-                "operation_key": str(uuid.uuid4()),
-            },
+            body={"project": "peer", "bot": "research", "workflow": workflow,
+                  "input": "Delegate exactly once to writer using send_to_bot. Tell writer "
+                  f"to read {filename} in its workspace and reply with only its content. "
+                  "Do not read the file yourself. After dispatch, immediately finish with "
+                  "WAITING. Do not poll or retrieve any task result. The async report "
+                  "will start a separate continuation later.",
+                  "operation_key": str(uuid.uuid4())},
         )
         ev["steps"].append({"step": "planner submits research task", "status": status,
                             "task_id": payload.get("task_id") if isinstance(payload, dict) else None})
-        if status not in (200, 201, 202):
-            ev["status"] = "fail"
-            ev["reason"] = f"planner submit HTTP {status}"
-            return ev
-        research_task = payload["task_id"]
-
-        # Earlier scenarios leave their own peer tasks behind; only a task
-        # created after this submission belongs to the live chain.
-        status, before = http_json(
-            "GET", self.coord_url("/v1/teams/tasks?limit=100"),
-            token=self.admin_token,
-        )
-        known = {t["task_id"] for t in before.get("tasks", [])} if status == 200 else set()
-
-        deadline = time.monotonic() + 480.0
-        peer_task_id = None
+        if status != 201:
+            return {**ev, "status": "fail", "reason": f"planner submit HTTP {status}"}
+        research_id = payload["task_id"]
+        deadline = time.monotonic() + 480
+        peer = None
+        research = None
         while time.monotonic() < deadline:
-            status, listing = http_json(
-                "GET", self.coord_url("/v1/teams/tasks?limit=100"),
-                token=self.admin_token,
-            )
-            peers = [t for t in listing.get("tasks", [])
-                     if t.get("kind") == "peer"
-                     and t.get("task_id") not in known
-                     and t.get("caller_principal") == "bot:research"
-                     and t.get("bot_id") == "writer"] if status == 200 else []
+            _, listing = http_json("GET", self.coord_url(
+                f"/v1/teams/tasks?workflow={workflow}&limit=100"), token=self.admin_token)
+            peers = [t for t in listing.get("tasks", []) if t.get("kind") == "peer"
+                     and t.get("caller_principal") == "bot:research" and t.get("bot_id") == "writer"]
+            if len(peers) > 1:
+                return {**ev, "status": "fail", "reason": "research dispatched multiple peer tasks"}
             if peers:
-                peer_task_id = peers[0]["task_id"]
+                peer = peers[0]
+            _, research = http_json("GET", self.coord_url(f"/v1/teams/tasks/{research_id}"),
+                                    token=self.admin_token)
+            if peer and research.get("run_state") == "succeeded":
                 break
-            time.sleep(3.0)
-        ev["steps"].append({"step": "research dispatched peer task",
-                            "peer_task_id": peer_task_id})
-        if peer_task_id is None:
-            ev["status"] = "fail"
-            ev["reason"] = "research never created a peer task via send_to_bot"
-            return ev
-
-        peer_delivery = None
-        research_state = None
+            time.sleep(0.1)
+        if peer is None or not research or research.get("run_state") != "succeeded":
+            return {**ev, "status": "fail", "reason": "initial research run did not finish after dispatch"}
+        peer_id = peer["task_id"]
+        _, initial_result = http_json("GET", self.coord_url(f"/v1/teams/tasks/{research_id}/result"),
+                                      token=self.admin_token)
+        if secret in str(initial_result.get("result_text", "")):
+            return {**ev, "status": "fail", "reason": "initial run already knew writer-only secret"}
+        ev["steps"].append({"step": "initial run finished before reply admission",
+                            "task_id": research_id, "run_state": research["run_state"],
+                            "peer_task_id": peer_id, "workflow_id": workflow})
+        watcher = ContinuationWatcher(self.tmp / "research", peer_id, secret)
+        self.continuation_watchers.append(watcher)
+        self.reply_gate.delivery_allowed.set()
+        crashed = False
+        turn_id = ""
+        evidence: dict = {}
         while time.monotonic() < deadline:
-            status, peer = http_json(
-                "GET", self.coord_url(f"/v1/teams/tasks/{peer_task_id}"),
-                token=self.admin_token,
+            if self.reply_gate.error:
+                return {**ev, "status": "fail", "reason": self.reply_gate.error}
+            if crash and not crashed and self.reply_gate.receipt_committed.is_set():
+                committed = continuation_evidence(self.tmp / "research", peer_id, secret)
+                if committed.get("receipt_count") != 1:
+                    return {**ev, "status": "fail", "reason": "ack gate had no durable receipt"}
+                self._stop_coordinator()
+                ev["steps"].append({"step": "coordinator killed after inbox commit before acknowledgement",
+                                    "delivery_id": committed["delivery_id"], "receipt_count": 1,
+                                    "exit_code": self.coord_proc.returncode})
+                self.reply_gate.ack_allowed.set()
+                self.spawn_coordinator(self.coord_config)
+                if not self.wait_port(self.coord_port):
+                    return {**ev, "status": "fail", "reason": "coordinator did not restart"}
+                crashed = True
+            try:
+                evidence = continuation_evidence(self.tmp / "research", peer_id, secret)
+            except (ValueError, OSError):
+                evidence = {}
+            turn_id = evidence.get("accepting_turn_id") or watcher.turn_id or turn_id
+            completed = (
+                evidence.get("state") == "injected" and evidence.get("wake_due") == 0
+                and evidence.get("injection_count") == 1 and evidence.get("continuation_count") == 1
+                and evidence.get("generation_matches") and not evidence.get("turn_pending")
+                and turn_id
             )
-            peer_delivery = peer.get("delivery_state") if isinstance(peer, dict) else None
-            status2, research = http_json(
-                "GET", self.coord_url(f"/v1/teams/tasks/{research_task}"),
-                token=self.admin_token,
-            )
-            research_state = research.get("run_state") if isinstance(research, dict) else None
-            if peer_delivery in ("persisted", "injected", "card_only", "orphaned", "failed")                     and research_state in ("succeeded", "failed", "cancelled", "interrupted"):
-                break
-            time.sleep(3.0)
-        ev["steps"].append({"step": "chain states", "peer_delivery": peer_delivery,
-                            "research_run": research_state})
-        if peer_delivery not in ("persisted", "injected"):
-            ev["status"] = "fail"
-            ev["reason"] = (f"writer reply did not reach research inbox "
-                            f"(peer delivery_state={peer_delivery})")
-            return ev
-        if research_state != "succeeded":
-            ev["status"] = "fail"
-            ev["reason"] = f"research run_state={research_state}"
-            return ev
-        status, result = http_json(
-            "GET", self.coord_url(f"/v1/teams/tasks/{research_task}/result"),
-            token=self.admin_token,
-        )
-        body_text = result.get("result_text", "") if isinstance(result, dict) else ""
-        ev["steps"].append({"step": "research result", "status": status,
-                            "contains_marker": self.marker in body_text})
-        if status != 200 or self.marker not in body_text:
-            ev["status"] = "fail"
-            ev["reason"] = "research summary does not carry the writer's marker"
-            return ev
-        ev["status"] = "pass"
+            if completed and (not crash or (crashed and len(self.reply_gate.attempts) >= 2)):
+                _, peer = http_json("GET", self.coord_url(f"/v1/teams/tasks/{peer_id}"), token=self.admin_token)
+                if peer.get("delivery_state") == "injected":
+                    break
+            time.sleep(0.05)
+        else:
+            return {**ev, "status": "fail", "reason": "no completed reply-driven continuation",
+                    "continuation": evidence, "accepting_turn_id": turn_id,
+                    "delivery_attempts": len(self.reply_gate.attempts)}
+        coordinator_db = self.tmp / "coord" / "coordinator.sqlite3"
+        task_count = read_rows(coordinator_db, "SELECT COUNT(*) FROM tasks WHERE caller_principal=? "
+                               "AND operation_key=?", ("bot:research", peer["operation_key"]))[0][0]
+        run_db = one_database(self.tmp / "writer", "runs.sqlite3")
+        runs = read_rows(run_db, "SELECT run_id, state FROM runs WHERE task_id=?", (peer_id,))
+        evidence["accepting_turn_id"] = turn_id
+        evidence["task_count"] = task_count
+        evidence["remote_run_count"] = len(runs)
+        evidence["remote_run_id"] = runs[0]["run_id"] if len(runs) == 1 else None
+        evidence["delivery_attempts"] = len(self.reply_gate.attempts)
+        evidence["distinct_delivery_ids"] = len(set(self.reply_gate.attempts))
+        ev["steps"].append({"step": "durable reply and completed continuation", **evidence})
+        unique = (task_count == 1 and len(runs) == 1 and runs[0]["state"] == "succeeded"
+                  and evidence["receipt_count"] == 1 and evidence["distinct_delivery_ids"] == 1)
+        ev["status"] = "pass" if unique else "fail"
+        if not unique:
+            ev["reason"] = "recovery did not preserve unique task, run, receipt and injection"
         return ev
 
     def scenario_unauthorized(self, dispatch_ok: bool) -> dict:
@@ -718,80 +774,10 @@ class PeerLab:
         return ev
 
     def scenario_crash_restart(self, dispatch_ok: bool) -> dict:
-        ev: dict = {"scenario": "crash_restart", "steps": []}
         if not dispatch_ok:
-            ev["status"] = "blocked"
-            ev["reason"] = "peer dispatch unavailable; prerequisite red in peer_dispatch"
-            return ev
-        status, payload = self.peer_send(
-            "research", "writer", token=self.bot_coord_tokens["research"],
-            input_text=f"Count slowly from 1 to 5, then reply with {self.marker}.",
-        )
-        if status not in (200, 201, 202):
-            ev["status"] = "fail"
-            ev["reason"] = f"dispatch HTTP {status}"
-            return ev
-        task_id = payload["task_id"]
-        # Wait until the task exists, then hard-kill the coordinator and
-        # restart it on the same control dir. The dispatch/delivery outboxes
-        # decide the crash point; no sleep-based race.
-        time.sleep(1.0)
-        assert self.coord_proc is not None
-        self.coord_proc.kill()
-        self.coord_proc.wait(timeout=10)
-        ev["steps"].append({"step": "coordinator killed after accept"})
-        self.spawn_coordinator(self.coord_config)
-        if not self.wait_port(self.coord_port):
-            ev["status"] = "fail"
-            ev["reason"] = "coordinator did not come back"
-            return ev
-        ev["steps"].append({"step": "coordinator restarted"})
-        # Reconcile as the sending bot: lookup is caller-scoped idempotency.
-        lookup_status, lookup = http_json(
-            "GET",
-            self.coord_url(
-                f"/v1/teams/tasks/lookup?operation_key={payload['operation_key']}"
-            ),
-            token=self.bot_coord_tokens["research"],
-        )
-        tasks = [lookup] if (
-            lookup_status == 200 and isinstance(lookup, dict)
-            and lookup.get("task_id") == task_id
-        ) else []
-        ev["steps"].append({"step": "task survives restart",
-                            "lookup_status": lookup_status,
-                            "match_count": len(tasks)})
-        if len(tasks) != 1:
-            ev["status"] = "fail"
-            ev["reason"] = f"{len(tasks)} tasks after restart (want exactly 1)"
-            return ev
-        # This crash task carries no capability (the probe cannot mint one),
-        # so convergence means: the single task runs to a terminal state with
-        # its result queryable — exactly once, never re-dispatched.
-        deadline = time.monotonic() + 240.0
-        run_state = None
-        result_available = False
-        while time.monotonic() < deadline:
-            status, task = http_json(
-                "GET", self.coord_url(f"/v1/teams/tasks/{task_id}"),
-                token=self.admin_token,
-            )
-            run_state = task.get("run_state") if isinstance(task, dict) else None
-            result_available = bool(
-                task.get("result_available") if isinstance(task, dict) else False
-            )
-            if run_state in ("succeeded", "failed", "cancelled", "interrupted"):
-                break
-            time.sleep(2.0)
-        ev["steps"].append({"step": "run converges after restart",
-                            "run_state": run_state,
-                            "result_available": result_available})
-        if run_state != "succeeded" or not result_available:
-            ev["status"] = "fail"
-            ev["reason"] = f"run_state={run_state} result_available={result_available}"
-            return ev
-        ev["status"] = "pass"
-        return ev
+            return {"scenario": "crash_restart", "status": "blocked",
+                    "reason": "peer dispatch unavailable"}
+        return self._reply_continuation(crash=True)
 
     def scenario_events_shape(self) -> dict:
         ev: dict = {"scenario": "events_shape", "steps": []}
@@ -820,54 +806,54 @@ class PeerLab:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--keep", action="store_true",
-                        help="keep the temp topology directory for inspection")
+    parser.add_argument("--keep", action="store_true", help="retain the isolated bot homes")
+    parser.add_argument("--evidence-dir", type=Path, default=EVIDENCE)
+    parser.add_argument("--only", action="append", choices=(
+        "peer_dispatch", "unauthorized", "hop_guard", "idempotent_key", "crash_restart",
+        "events_shape", "live_chain", "usage_stats"), help="run only selected scenarios")
     args = parser.parse_args()
-
-    EVIDENCE.mkdir(parents=True, exist_ok=True)
-    lab = PeerLab("p2")
+    args.evidence_dir.mkdir(parents=True, exist_ok=True)
+    lab = PeerLab("peer")
     results: list[dict] = []
     try:
         lab.start()
-        results.append(lab.register_bots())
-        dispatch = lab.scenario_peer_dispatch()
-        send_step = next(
-            (s for s in dispatch.get("steps", [])
-             if s.get("step", "").startswith("peer send")),
-            {},
-        )
-        # The dispatch pipeline working is the prerequisite for the dependent
-        # scenarios; the P5 inbox-return gate may still be red.
-        dispatch_ok = send_step.get("status") in (200, 201, 202)
-        results.append(dispatch)
-        results.append(lab.scenario_unauthorized(dispatch_ok))
-        results.append(lab.scenario_hop_guard(dispatch_ok))
-        results.append(lab.scenario_idempotent_key(dispatch_ok))
-        results.append(lab.scenario_crash_restart(dispatch_ok))
-        results.append(lab.scenario_events_shape())
-        results.append(lab.scenario_live_chain())
-        results.append(lab.scenario_usage_stats())
-    except SystemExit as exc:
-        results.append({"scenario": "boot", "status": "fail", "reason": str(exc)})
+        registration = lab.register_bots()
+        results.append(registration)
+        selected = args.only or ["peer_dispatch", "unauthorized", "hop_guard", "idempotent_key",
+                                 "crash_restart", "events_shape", "live_chain", "usage_stats"]
+        dispatch_ok = registration["status"] == "pass"
+        for name in selected:
+            scenario = getattr(lab, "scenario_" + name)
+            result = scenario(dispatch_ok) if name in {
+                "unauthorized", "hop_guard", "idempotent_key", "crash_restart"
+            } else scenario()
+            results.append(result)
+            print(json.dumps(result, ensure_ascii=False), flush=True)
+            if name == "peer_dispatch":
+                dispatch_ok = result["status"] == "pass"
+    except (SystemExit, Exception) as exc:
+        results.append({"scenario": "runtime", "status": "fail", "reason": str(exc)})
     finally:
         lab.teardown()
         if args.keep:
             results.append({"scenario": "meta", "topology_dir": str(lab.tmp)})
+        else:
+            import shutil
 
+            shutil.rmtree(lab.tmp)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    out = EVIDENCE / f"p2-probe-{stamp}.jsonl"
+    out = args.evidence_dir / f"peer-probe-{stamp}.jsonl"
     with open(out, "w", encoding="utf-8") as handle:
         for row in results:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-    passed = sum(1 for r in results if r.get("status") == "pass")
-    failed = sum(1 for r in results if r.get("status") == "fail")
-    blocked = sum(1 for r in results if r.get("status") == "blocked")
-    print(json.dumps({
-        "probe": "peer_comms", "passed": passed, "failed": failed,
-        "blocked": blocked, "evidence": str(out),
-        "verdict": "GREEN" if failed == 0 and blocked == 0 and passed > 0 else "RED",
-    }))
-    return 0 if failed == 0 and blocked == 0 and passed > 0 else 1
+    passed = sum(r.get("status") == "pass" for r in results)
+    failed = sum(r.get("status") == "fail" for r in results)
+    blocked = sum(r.get("status") == "blocked" for r in results)
+    green = failed == 0 and blocked == 0 and passed > 0
+    print(json.dumps({"probe": "peer_comms", "passed": passed, "failed": failed,
+                      "blocked": blocked, "evidence": str(out),
+                      "verdict": "GREEN" if green else "RED"}))
+    return 0 if green else 1
 
 
 if __name__ == "__main__":
